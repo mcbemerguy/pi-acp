@@ -275,7 +275,6 @@ export class PiAcpAgent implements ACPAgent {
 
     const models = await getModelState(session.proc, { state, availableModels })
     const configOptions = await getSessionConfigOptions(session.proc, { state, availableModels })
-    const modes = await getThinkingState(session.proc, { state })
 
     const quietStartup = getQuietStartup(params.cwd)
     const updateNotice = buildUpdateNotice()
@@ -306,7 +305,6 @@ export class PiAcpAgent implements ACPAgent {
       sessionId: session.sessionId,
       models,
       configOptions,
-      modes,
       _meta: {
         piAcp: {
           startupInfo: preludeText || null
@@ -961,12 +959,10 @@ export class PiAcpAgent implements ACPAgent {
 
     const models = await getModelState(proc)
     const configOptions = await getSessionConfigOptions(proc)
-    const modes = await getThinkingState(proc)
 
     const response = {
       models,
       configOptions,
-      modes,
       _meta: {
         piAcp: {
           startupInfo: null
@@ -1197,45 +1193,6 @@ async function getSessionConfigOptions(
   })
 
   return configOptions
-}
-
-async function getThinkingState(
-  proc: PiRpcProcess,
-  pre?: { state?: any | null }
-): Promise<{
-  availableModes: Array<{
-    id: string
-    name: string
-    description?: string | null
-  }>
-  currentModeId: string
-}> {
-  // Ask pi for current thinking level.
-  let current: ThinkingLevel = 'medium'
-
-  const state =
-    pre?.state ??
-    (await (async () => {
-      try {
-        return (await proc.getState()) as any
-      } catch {
-        return null
-      }
-    })())
-
-  const tl = typeof state?.thinkingLevel === 'string' ? state.thinkingLevel : null
-  if (tl && isThinkingLevel(tl)) current = tl
-
-  const available: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh']
-
-  return {
-    currentModeId: current,
-    availableModes: available.map(id => ({
-      id,
-      name: `Thinking: ${id}`,
-      description: null
-    }))
-  }
 }
 
 async function getModelState(
