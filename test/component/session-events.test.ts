@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
@@ -125,7 +125,29 @@ test('PiAcpSession: emits tool locations from pi path args', async () => {
 
   assert.equal(conn.updates.length, 1)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
-  assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: `${process.cwd()}/src/acp/session.ts` }])
+  assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: resolve(process.cwd(), 'src/acp/session.ts') }])
+})
+
+test('PiAcpSession: emits agent_message_chunk for extension UI notify requests', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'extension_ui_request', id: 'ui1', method: 'notify', notifyType: 'warning', message: 'working' })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 1)
+  assert.equal(conn.updates[0]!.update.sessionUpdate, 'agent_message_chunk')
+  assert.equal((conn.updates[0]!.update as any).content.text, '[warning] working')
 })
 
 test('PiAcpSession: emits agent_message_chunk for auto_retry_start with attempt/maxAttempts and rounded delay', async () => {
@@ -453,6 +475,24 @@ test('PiAcpSession: prompt resolves end_turn on agent_end', async () => {
   assert.equal(reason, 'end_turn')
 })
 
+test('PiAcpSession: prompt resolves when an extension command returns without agent_end', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const reason = await session.prompt('/cache-watch status')
+  assert.equal(reason, 'end_turn')
+  assert.equal(proc.prompts.length, 1)
+})
+
 test('PiAcpSession: re-emits startup info as the first chunk of the first prompt', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -551,6 +591,34 @@ test('PiAcpSession: queues concurrent prompt and starts it after agent_end', asy
 
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'turn_end' })
+  proc.emit({ type: 'agent_end' })
+
+  const r2 = await second
+  assert.equal(r2, 'end_turn')
+})
+
+test('PiAcpSession: queued prompt starts after command-only prompt completes', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const first = session.prompt('/cache-watch status')
+  const second = session.prompt('two')
+
+  const r1 = await first
+  assert.equal(r1, 'end_turn')
+  assert.equal(proc.prompts.length, 2)
+  assert.equal(proc.prompts[1]!.message, 'two')
+
+  proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'agent_end' })
 
   const r2 = await second

@@ -31,6 +31,7 @@ type PiRpcCommand =
   | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
   | { type: 'abort'; id?: string }
   | { type: 'get_state'; id?: string }
+  | { type: 'extension_ui_response'; id: string; cancelled?: boolean; value?: unknown; confirmed?: boolean }
   // Model
   | { type: 'get_available_models'; id?: string }
   | { type: 'set_model'; id?: string; provider: string; modelId: string }
@@ -135,7 +136,7 @@ export class PiRpcProcess {
     const child = spawn(cmd, args, {
       cwd: params.cwd,
       stdio: 'pipe',
-      env: process.env,
+      env: { ...process.env, PI_ACP: '1', PI_ACP_RPC: '1' },
       shell: shouldUseShellForPiCommand(cmd)
     })
 
@@ -235,6 +236,13 @@ export class PiRpcProcess {
     if (!res.success) throw new Error(`pi abort failed: ${res.error ?? JSON.stringify(res.data)}`)
   }
 
+  respondExtensionUi(
+    id: string,
+    response: { cancelled?: boolean; value?: unknown; confirmed?: boolean } = { cancelled: true }
+  ): void {
+    this.writeLine({ type: 'extension_ui_response', id, ...response })
+  }
+
   async getState(): Promise<unknown> {
     const res = await this.request({ type: 'get_state' })
     if (!res.success) throw new Error(`pi get_state failed: ${res.error ?? JSON.stringify(res.data)}`)
@@ -318,13 +326,11 @@ export class PiRpcProcess {
     const id = crypto.randomUUID()
     const withId = { ...cmd, id }
 
-    const line = JSON.stringify(withId) + '\n'
-
     return new Promise<PiRpcResponse>((resolve, reject) => {
       this.pending.set(id, { resolve, reject })
 
       try {
-        this.child.stdin.write(line, err => {
+        this.writeLine(withId, err => {
           if (err) {
             this.pending.delete(id)
             reject(err)
@@ -335,5 +341,9 @@ export class PiRpcProcess {
         reject(e)
       }
     })
+  }
+
+  private writeLine(msg: PiRpcCommand, cb?: (err?: Error | null) => void): void {
+    this.child.stdin.write(`${JSON.stringify(msg)}\n`, cb)
   }
 }
