@@ -65,10 +65,6 @@ For real validation, test with an ACP client (e.g. Zed external agent).
 - After making code edits, run formatting before finishing the task. Use `npm run format` when it is safe to format the whole worktree; otherwise use the narrowest safe formatter command for the files you touched.
 - If formatting is skipped or fails, say so explicitly in the final response.
 
-## Source control
-
-- **DO NOT** commit unless explicitly asked!
-
 ## Client information
 
 - Current ACP client is Zed

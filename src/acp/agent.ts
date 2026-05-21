@@ -15,8 +15,11 @@ import {
   type PromptRequest,
   type PromptResponse,
   type SessionInfo,
+  type SetSessionConfigOptionRequest,
+  type SetSessionConfigOptionResponse,
   type SetSessionModeRequest,
   type SetSessionModeResponse,
+  type SessionConfigOption,
   type StopReason
 } from '@agentclientprotocol/sdk'
 import { getAuthMethods } from './auth.js'
@@ -93,6 +96,24 @@ function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableC
   }
 
   return out
+}
+
+export async function discoverAvailableCommands(
+  proc: Pick<PiRpcProcess, 'getCommands'>,
+  fileCommands: ReturnType<typeof loadSlashCommands>,
+  enableSkillCommands: boolean
+): Promise<AvailableCommand[]> {
+  try {
+    const pi = (await proc.getCommands()) as unknown
+    const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
+      enableSkillCommands,
+      includeExtensionCommands: true
+    })
+
+    return mergeCommands(commands, builtinAvailableCommands())
+  } catch {
+    return mergeCommands(toAvailableCommands(fileCommands), builtinAvailableCommands())
+  }
 }
 import { fileURLToPath } from 'node:url'
 
@@ -246,7 +267,8 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     const models = await getModelState(session.proc, { state, availableModels })
-    const thinking = await getThinkingState(session.proc, { state })
+    const configOptions = await getSessionConfigOptions(session.proc, { state, availableModels })
+    const modes = await getThinkingState(session.proc, { state })
 
     const quietStartup = getQuietStartup(params.cwd)
     const updateNotice = buildUpdateNotice()
@@ -276,7 +298,8 @@ export class PiAcpAgent implements ACPAgent {
     const response = {
       sessionId: session.sessionId,
       models,
-      modes: thinking,
+      configOptions,
+      modes,
       _meta: {
         piAcp: {
           startupInfo: preludeText || null
@@ -293,30 +316,13 @@ export class PiAcpAgent implements ACPAgent {
     // So we must send this *after* the session/new response has been delivered.
     setTimeout(() => {
       void (async () => {
-        try {
-          const pi = (await session.proc.getCommands()) as any
-          const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
-            enableSkillCommands,
-            includeExtensionCommands: false
-          })
-
-          await this.conn.sessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'available_commands_update',
-              availableCommands: mergeCommands(commands, builtinAvailableCommands())
-            }
-          })
-          return
-        } catch {
-          // Fall back to file-based prompt templates (legacy behavior).
-        }
+        const availableCommands = await discoverAvailableCommands(session.proc, fileCommands, enableSkillCommands)
 
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'available_commands_update',
-            availableCommands: mergeCommands(toAvailableCommands(fileCommands), builtinAvailableCommands())
+            availableCommands
           }
         })
       })()
@@ -947,11 +953,13 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     const models = await getModelState(proc)
-    const thinking = await getThinkingState(proc)
+    const configOptions = await getSessionConfigOptions(proc)
+    const modes = await getThinkingState(proc)
 
     const response = {
       models,
-      modes: thinking,
+      configOptions,
+      modes,
       _meta: {
         piAcp: {
           startupInfo: null
@@ -962,30 +970,13 @@ export class PiAcpAgent implements ACPAgent {
     // Advertise slash commands after the response so the client knows the session exists.
     setTimeout(() => {
       void (async () => {
-        try {
-          const pi = (await proc.getCommands()) as any
-          const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
-            enableSkillCommands,
-            includeExtensionCommands: false
-          })
-
-          await this.conn.sessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'available_commands_update',
-              availableCommands: mergeCommands(commands, builtinAvailableCommands())
-            }
-          })
-          return
-        } catch {
-          // fall back
-        }
+        const availableCommands = await discoverAvailableCommands(proc, fileCommands, enableSkillCommands)
 
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'available_commands_update',
-            availableCommands: mergeCommands(toAvailableCommands(fileCommands), builtinAvailableCommands())
+            availableCommands
           }
         })
       })()
@@ -1028,6 +1019,27 @@ export class PiAcpAgent implements ACPAgent {
     await session.proc.setModel(provider, modelId)
   }
 
+  async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
+    const session = this.sessions.get(params.sessionId)
+    const configId = String(params.configId).trim()
+    const value = String(params.value).trim()
+
+    if (configId === 'model') {
+      await setPiModelFromAcpValue(session.proc, value)
+      return { configOptions: await getSessionConfigOptions(session.proc) }
+    }
+
+    if (configId === 'thought_level' || configId === 'mode') {
+      if (!isThinkingLevel(value)) {
+        throw RequestError.invalidParams(`Unknown ${configId}: ${value}`)
+      }
+      await session.proc.setThinkingLevel(value)
+      return { configOptions: await getSessionConfigOptions(session.proc) }
+    }
+
+    throw RequestError.invalidParams(`Unknown session config option: ${configId}`)
+  }
+
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
     const session = this.sessions.get(params.sessionId)
 
@@ -1053,6 +1065,131 @@ export class PiAcpAgent implements ACPAgent {
 
 function isThinkingLevel(x: string): x is ThinkingLevel {
   return x === 'off' || x === 'minimal' || x === 'low' || x === 'medium' || x === 'high' || x === 'xhigh'
+}
+
+async function getPiState(proc: PiRpcProcess, pre?: { state?: any | null }): Promise<any | null> {
+  return (
+    pre?.state ??
+    (await (async () => {
+      try {
+        return (await proc.getState()) as any
+      } catch {
+        return null
+      }
+    })())
+  )
+}
+
+async function getPiAvailableModels(proc: PiRpcProcess, pre?: { availableModels?: any | null }): Promise<any | null> {
+  return (
+    pre?.availableModels ??
+    (await (async () => {
+      try {
+        return (await proc.getAvailableModels()) as any
+      } catch {
+        return null
+      }
+    })())
+  )
+}
+
+function acpModelValue(provider: string, id: string): string {
+  return `${provider}/${id}`
+}
+
+async function setPiModelFromAcpValue(proc: PiRpcProcess, value: string): Promise<void> {
+  let provider: string | null = null
+  let modelId: string | null = null
+
+  if (value.includes('/')) {
+    const [p, ...rest] = value.split('/')
+    provider = p
+    modelId = rest.join('/')
+  } else {
+    modelId = value
+  }
+
+  if (!provider) {
+    const data = (await proc.getAvailableModels()) as any
+    const models: any[] = Array.isArray(data?.models) ? data.models : []
+    const found = models.find(m => String(m?.id) === modelId)
+    if (found) {
+      provider = String(found.provider)
+      modelId = String(found.id)
+    }
+  }
+
+  if (!provider || !modelId) {
+    throw RequestError.invalidParams(`Unknown modelId: ${value}`)
+  }
+
+  await proc.setModel(provider, modelId)
+}
+
+async function getSessionConfigOptions(
+  proc: PiRpcProcess,
+  pre?: { state?: any | null; availableModels?: any | null }
+): Promise<SessionConfigOption[]> {
+  const configOptions: SessionConfigOption[] = []
+  const data = await getPiAvailableModels(proc, pre)
+  const state = await getPiState(proc, pre)
+  const modelOptions: Array<{ value: string; name: string; description: string | null }> = []
+  const seenModels = new Set<string>()
+
+  const models: any[] = Array.isArray(data?.models) ? data.models : []
+  for (const m of models) {
+    const provider = String(m?.provider ?? '').trim()
+    const id = String(m?.id ?? '').trim()
+    if (!provider || !id) continue
+    const value = acpModelValue(provider, id)
+    if (seenModels.has(value)) continue
+    seenModels.add(value)
+    const name = String(m?.name ?? id).trim() || id
+    modelOptions.push({ value, name: `${provider}/${name}`, description: null })
+  }
+
+  let currentModelValue = ''
+  const model = state?.model
+  if (model && typeof model === 'object') {
+    const provider = String((model as any).provider ?? '').trim()
+    const id = String((model as any).id ?? '').trim()
+    if (provider && id) currentModelValue = acpModelValue(provider, id)
+  }
+
+  if (currentModelValue && !seenModels.has(currentModelValue)) {
+    modelOptions.unshift({ value: currentModelValue, name: currentModelValue, description: null })
+    seenModels.add(currentModelValue)
+  }
+
+  if (!currentModelValue) currentModelValue = modelOptions[0]?.value ?? ''
+
+  if (modelOptions.length > 0 && currentModelValue) {
+    configOptions.push({
+      type: 'select',
+      id: 'model',
+      name: 'Model',
+      category: 'model',
+      currentValue: currentModelValue,
+      options: modelOptions
+    })
+  }
+
+  const tl =
+    typeof state?.thinkingLevel === 'string' && isThinkingLevel(state.thinkingLevel) ? state.thinkingLevel : 'medium'
+  configOptions.push({
+    type: 'select',
+    id: 'thought_level',
+    name: 'Thinking level',
+    category: 'thought_level',
+    currentValue: tl,
+    options: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].map(value => ({
+      value,
+      name: value,
+      description: null
+    }))
+  })
+
+  return configOptions
 }
 
 async function getThinkingState(

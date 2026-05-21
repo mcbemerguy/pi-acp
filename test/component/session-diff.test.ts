@@ -40,7 +40,9 @@ test('PiAcpSession: emits ACP diff content for edit tool when file changes', asy
 
   await new Promise(r => setTimeout(r, 0))
 
-  const end = conn.updates.find(u => (u.update as any).toolCallId === 't1' && u.update.sessionUpdate === 'tool_call_update')
+  const end = conn.updates.find(
+    u => (u.update as any).toolCallId === 't1' && u.update.sessionUpdate === 'tool_call_update'
+  )
   assert.ok(end, 'expected tool_call_update for edit completion')
 
   const content = (end!.update as any).content as any[]

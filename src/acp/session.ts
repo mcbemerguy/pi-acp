@@ -179,8 +179,8 @@ export class PiAcpSession {
   readonly mcpServers: McpServer[]
 
   private startupInfo: string | null = null
-  private startupInfoSentOutOfTurn = false
-  private startupInfoSentInPrompt = false
+  private startupInfoSent = false
+  private currentAgentMessageId: string | null = null
 
   readonly proc: PiRpcProcess
   private readonly conn: AgentSideConnection
@@ -231,8 +231,7 @@ export class PiAcpSession {
 
   setStartupInfo(text: string) {
     this.startupInfo = text
-    this.startupInfoSentOutOfTurn = false
-    this.startupInfoSentInPrompt = false
+    this.startupInfoSent = false
   }
 
   /**
@@ -241,21 +240,20 @@ export class PiAcpSession {
    * callers can invoke this shortly after session/new returns.
    */
   sendStartupInfoIfPending(): void {
-    if (this.startupInfoSentOutOfTurn || !this.startupInfo) return
-    this.startupInfoSentOutOfTurn = true
-
-    this.emit({
-      sessionUpdate: 'agent_message_chunk',
-      content: { type: 'text', text: this.startupInfo }
-    })
+    this.sendStartupInfoOnce()
   }
 
   private sendStartupInfoOnFirstPromptIfPending(): void {
-    if (this.startupInfoSentInPrompt || !this.startupInfo) return
-    this.startupInfoSentInPrompt = true
+    this.sendStartupInfoOnce()
+  }
+
+  private sendStartupInfoOnce(): void {
+    if (this.startupInfoSent || !this.startupInfo) return
+    this.startupInfoSent = true
 
     this.emit({
       sessionUpdate: 'agent_message_chunk',
+      messageId: crypto.randomUUID(),
       content: { type: 'text', text: this.startupInfo }
     })
   }
@@ -350,6 +348,7 @@ export class PiAcpSession {
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
     this.inAgentLoop = false
+    this.currentAgentMessageId = crypto.randomUUID()
 
     this.pendingTurn = { resolve: t.resolve, reject: t.reject }
 
@@ -377,6 +376,7 @@ export class PiAcpSession {
 
         this.pendingTurn = null
         this.inAgentLoop = false
+        this.currentAgentMessageId = null
 
         // If the prompt failed, do not automatically proceed—pi may be unhealthy.
         // But we still clear the queueDepth metadata.
@@ -400,6 +400,7 @@ export class PiAcpSession {
         if (ame?.type === 'text_delta' && typeof ame.delta === 'string') {
           this.emit({
             sessionUpdate: 'agent_message_chunk',
+            messageId: this.currentAgentMessageId ?? crypto.randomUUID(),
             content: { type: 'text', text: ame.delta } satisfies ContentBlock
           })
           break
@@ -653,6 +654,7 @@ export class PiAcpSession {
           this.pendingTurn?.resolve(reason)
           this.pendingTurn = null
           this.inAgentLoop = false
+          this.currentAgentMessageId = null
 
           // Start next queued prompt, if any.
           const next = this.turnQueue.shift()

@@ -37,7 +37,6 @@ export class FakePiRpcProcess {
     this.abortCount += 1
   }
 
-
   async getState(): Promise<any> {
     return {}
   }
