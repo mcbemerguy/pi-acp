@@ -1,4 +1,5 @@
 import type { ContentBlock, SessionUpdate, ToolCallContent } from '@agentclientprotocol/sdk'
+import { createHash } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -36,6 +37,11 @@ type StepPlan = {
   status: 'pending' | 'in_progress' | 'completed'
 }
 
+type ChildMessageIdentity = {
+  sourceKey: string
+  hasExplicitId: boolean
+}
+
 export function isWorkflowCommandPrompt(message: string): boolean {
   return /^\s*\/workflow:[^\s]+(?:\s|$)/.test(message)
 }
@@ -47,6 +53,8 @@ export class WorkflowEventMapper {
   private readonly steps = new Map<string, StepPlan>()
   private readonly childTools = new Set<string>()
   private readonly childTextDeltas = new Set<string>()
+  private readonly pendingNoIdTextDeltas = new Set<string>()
+  private readonly noIdMessageSequences = new Map<string, number>()
 
   constructor(cwd: string) {
     this.cwd = cwd
@@ -240,16 +248,15 @@ export class WorkflowEventMapper {
     if (!assistantMessageEvent || !delta) return []
 
     const meta = metaFromRecord(record)
-    const messageId = childMessageId(runId, stepId, meta.childSessionId, event, assistantMessageEvent)
-    const fallbackMessageId = childMessageId(runId, stepId, meta.childSessionId, {})
+    const identity = this.childMessageIdentity(runId, stepId, meta.childSessionId, event, assistantMessageEvent)
 
     if (assistantMessageEvent.type === 'text_delta') {
-      this.childTextDeltas.add(messageId)
-      this.childTextDeltas.add(fallbackMessageId)
+      this.childTextDeltas.add(identity.sourceKey)
+      if (!identity.hasExplicitId) this.pendingNoIdTextDeltas.add(identity.sourceKey)
       return [
         {
           sessionUpdate: 'agent_message_chunk',
-          messageId,
+          messageId: stableUuid(identity.sourceKey),
           content: { type: 'text', text: delta } satisfies ContentBlock,
           _meta: { piWorkflow: meta }
         }
@@ -280,19 +287,55 @@ export class WorkflowEventMapper {
     if (!text) return []
 
     const meta = metaFromRecord(record)
-    const messageId = childMessageId(runId, stepId, meta.childSessionId, event)
-    const fallbackMessageId = childMessageId(runId, stepId, meta.childSessionId, {})
-    if (this.childTextDeltas.has(messageId) || this.childTextDeltas.has(fallbackMessageId)) return []
-    this.childTextDeltas.add(messageId)
+    const identity = this.childMessageIdentity(runId, stepId, meta.childSessionId, event)
+    if (this.childTextDeltas.has(identity.sourceKey)) return []
+
+    const pendingNoIdIdentity = this.currentNoIdChildMessageIdentity(runId, stepId, meta.childSessionId)
+    if (this.pendingNoIdTextDeltas.has(pendingNoIdIdentity.sourceKey)) {
+      this.pendingNoIdTextDeltas.delete(pendingNoIdIdentity.sourceKey)
+      this.advanceNoIdChildMessageSequence(runId, stepId, meta.childSessionId)
+      return []
+    }
+
+    this.childTextDeltas.add(identity.sourceKey)
+    if (!identity.hasExplicitId) this.advanceNoIdChildMessageSequence(runId, stepId, meta.childSessionId)
 
     return [
       {
         sessionUpdate: 'agent_message_chunk',
-        messageId,
+        messageId: stableUuid(identity.sourceKey),
         content: { type: 'text', text } satisfies ContentBlock,
         _meta: { piWorkflow: meta }
       }
     ]
+  }
+
+  private childMessageIdentity(
+    runId: string,
+    stepId: string,
+    childSessionId: string | undefined,
+    event: Record<string, unknown>,
+    assistantMessageEvent?: Record<string, unknown>
+  ): ChildMessageIdentity {
+    const explicitId = childMessageExplicitId(event, assistantMessageEvent)
+    if (explicitId)
+      return { sourceKey: childMessageSourceKey(runId, stepId, childSessionId, explicitId), hasExplicitId: true }
+    return this.currentNoIdChildMessageIdentity(runId, stepId, childSessionId)
+  }
+
+  private currentNoIdChildMessageIdentity(
+    runId: string,
+    stepId: string,
+    childSessionId: string | undefined
+  ): ChildMessageIdentity {
+    const baseKey = childMessageNoIdBaseKey(runId, stepId, childSessionId)
+    const sequence = this.noIdMessageSequences.get(baseKey) ?? 0
+    return { sourceKey: `${baseKey}:seq:${sequence}`, hasExplicitId: false }
+  }
+
+  private advanceNoIdChildMessageSequence(runId: string, stepId: string, childSessionId: string | undefined): void {
+    const baseKey = childMessageNoIdBaseKey(runId, stepId, childSessionId)
+    this.noIdMessageSequences.set(baseKey, (this.noIdMessageSequences.get(baseKey) ?? 0) + 1)
   }
 
   private planUpdate(): SessionUpdate | null {
@@ -505,20 +548,38 @@ function assistantText(message: Record<string, unknown> | undefined): string {
   return ''
 }
 
-function childMessageId(
-  runId: string,
-  stepId: string,
-  childSessionId: string | undefined,
+function childMessageExplicitId(
   event: Record<string, unknown>,
   assistantMessageEvent?: Record<string, unknown>
-): string {
-  const explicitId =
+): string | undefined {
+  return (
     stringField(event.messageId) ??
     (isObject(event.message) ? stringField(event.message.id) : undefined) ??
     (isObject(assistantMessageEvent?.partial) ? stringField(assistantMessageEvent.partial.id) : undefined)
-  return ['workflow', runId, 'step', stepId, 'child', childSessionId ?? 'unknown', 'message', explicitId ?? 'current']
+  )
+}
+
+function childMessageSourceKey(
+  runId: string,
+  stepId: string,
+  childSessionId: string | undefined,
+  messageId: string
+): string {
+  return ['workflow', runId, 'step', stepId, 'child', childSessionId ?? 'unknown', 'message', messageId]
     .map(encodeIdPart)
     .join(':')
+}
+
+function childMessageNoIdBaseKey(runId: string, stepId: string, childSessionId: string | undefined): string {
+  return childMessageSourceKey(runId, stepId, childSessionId, 'current')
+}
+
+function stableUuid(value: string): string {
+  const bytes = createHash('sha1').update(value).digest().subarray(0, 16)
+  bytes[6] = (bytes[6] & 0x0f) | 0x50
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = bytes.toString('hex')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
 
 function encodeIdPart(value: string): string {

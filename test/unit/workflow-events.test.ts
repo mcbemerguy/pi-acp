@@ -177,7 +177,7 @@ test('WorkflowEventMapper projects child assistant text deltas and avoids duplic
 
   assert.equal(delta.length, 1)
   assert.equal(delta[0]!.sessionUpdate, 'agent_message_chunk')
-  assert.equal((delta[0] as any).messageId, 'workflow:r1:step:code:child:child:message:current')
+  assert.match((delta[0] as any).messageId, /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
   assert.equal((delta[0] as any).content.text, 'hello ')
   assert.deepEqual((delta[0] as any)._meta.piWorkflow.stepId, 'code')
   assert.equal(end.length, 0)
@@ -201,7 +201,59 @@ test('WorkflowEventMapper emits child message_end text when no delta was seen', 
 
   assert.equal(updates.length, 1)
   assert.equal(updates[0]!.sessionUpdate, 'agent_message_chunk')
+  assert.match(
+    (updates[0] as any).messageId,
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+  )
   assert.equal((updates[0] as any).content.text, 'final text')
+})
+
+test('WorkflowEventMapper only suppresses the next message_end after no-id text deltas', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+  const delta = mapper.map({
+    type: 'child_pi_event',
+    timestamp: 't1',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'code',
+    childSessionId: 'child',
+    childEventType: 'message_update',
+    event: {
+      type: 'message_update',
+      assistantMessageEvent: { type: 'text_delta', delta: 'streamed' }
+    }
+  })
+  const streamedEnd = mapper.map({
+    type: 'child_pi_event',
+    timestamp: 't2',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'code',
+    childSessionId: 'child',
+    childEventType: 'message_end',
+    event: {
+      type: 'message_end',
+      message: { id: 'msg-1', role: 'assistant', content: [{ type: 'text', text: 'streamed final' }] }
+    }
+  })
+  const fallbackEnd = mapper.map({
+    type: 'child_pi_event',
+    timestamp: 't3',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'code',
+    childSessionId: 'child',
+    childEventType: 'message_end',
+    event: {
+      type: 'message_end',
+      message: { id: 'msg-2', role: 'assistant', content: [{ type: 'text', text: 'fallback final' }] }
+    }
+  })
+
+  assert.equal(delta.length, 1)
+  assert.equal(streamedEnd.length, 0)
+  assert.equal(fallbackEnd.length, 1)
+  assert.equal((fallbackEnd[0] as any).content.text, 'fallback final')
 })
 
 test('WorkflowEventMapper projects child thinking deltas as ACP thought chunks', () => {
