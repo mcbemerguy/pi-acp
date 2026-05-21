@@ -34,6 +34,7 @@ import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slas
 import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
+import { PI_EXTENSION_UI_EVENT_METHOD } from './extension-ui.js'
 import { isAbsolute } from 'node:path'
 import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
@@ -184,6 +185,12 @@ export class PiAcpAgent implements ACPAgent {
           // **UNSTABLE** ACP capability used by Zed's codex-acp adapter.
           // Enables a native session picker in clients that support it.
           list: {}
+        },
+        _meta: {
+          piAcp: {
+            extensionUiEvents: true,
+            extensionUiEventMethod: PI_EXTENSION_UI_EVENT_METHOD
+          }
         }
       }
     }

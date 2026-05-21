@@ -2,12 +2,28 @@ import type { AgentSideConnection } from '@agentclientprotocol/sdk'
 import type { PiRpcEvent } from '../../src/pi-rpc/process.js'
 
 type SessionUpdateMsg = Parameters<AgentSideConnection['sessionUpdate']>[0]
+type ExtNotificationMsg = { method: string; params: Record<string, unknown> }
 
 export class FakeAgentSideConnection {
   readonly updates: SessionUpdateMsg[] = []
+  readonly extNotifications: ExtNotificationMsg[] = []
+  readonly sent: Array<
+    { type: 'sessionUpdate'; msg: SessionUpdateMsg } | { type: 'extNotification'; msg: ExtNotificationMsg }
+  > = []
+  extNotificationDelayMs = 0
+  extNotificationBlocker: Promise<void> | null = null
 
   async sessionUpdate(msg: SessionUpdateMsg): Promise<void> {
     this.updates.push(msg)
+    this.sent.push({ type: 'sessionUpdate', msg })
+  }
+
+  async extNotification(method: string, params: Record<string, unknown>): Promise<void> {
+    if (this.extNotificationBlocker) await this.extNotificationBlocker
+    if (this.extNotificationDelayMs > 0) await new Promise(resolve => setTimeout(resolve, this.extNotificationDelayMs))
+    const msg = { method, params }
+    this.extNotifications.push(msg)
+    this.sent.push({ type: 'extNotification', msg })
   }
 }
 
@@ -16,6 +32,10 @@ export class FakePiRpcProcess {
 
   // spies
   readonly prompts: Array<{ message: string; attachments: unknown[] }> = []
+  readonly extensionUiResponses: Array<{
+    id: string
+    response: { cancelled?: boolean; value?: unknown; confirmed?: boolean }
+  }> = []
   abortCount = 0
 
   onEvent(handler: (ev: PiRpcEvent) => void): () => void {
@@ -35,6 +55,13 @@ export class FakePiRpcProcess {
 
   async abort(): Promise<void> {
     this.abortCount += 1
+  }
+
+  respondExtensionUi(
+    id: string,
+    response: { cancelled?: boolean; value?: unknown; confirmed?: boolean } = { cancelled: true }
+  ): void {
+    this.extensionUiResponses.push({ id, response })
   }
 
   async getState(): Promise<any> {

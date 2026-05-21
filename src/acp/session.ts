@@ -15,7 +15,7 @@ import { toolResultToText } from './translate/pi-tools.js'
 import { toToolCallLocations, toToolKind } from './translate/tool-metadata.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import { isWorkflowCommandPrompt, WorkflowEventMonitor } from './workflow-events.js'
-import { formatExtensionUiRequest, isDialogExtensionUiMethod } from './extension-ui.js'
+import { normalizeExtensionUiRequest, isDialogExtensionUiMethod, PI_EXTENSION_UI_EVENT_METHOD } from './extension-ui.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -169,8 +169,7 @@ export class PiAcpSession {
   readonly mcpServers: McpServer[]
 
   private startupInfo: string | null = null
-  private startupInfoPreSent = false
-  private startupInfoPromptSent = false
+  private startupInfoSent = false
   private currentAgentMessageId: string | null = null
 
   readonly proc: PiRpcProcess
@@ -200,9 +199,7 @@ export class PiAcpSession {
   // Compatible format may need to be implemented in pi in the future.
   private editSnapshots = new Map<string, { path: string; oldText: string }>()
 
-  // Ensure `session/update` notifications are sent in order and can be awaited
-  // before completing a `session/prompt` request.
-  private lastEmit: Promise<void> = Promise.resolve()
+  private lastSend: Promise<void> = Promise.resolve()
 
   constructor(opts: {
     sessionId: string
@@ -230,29 +227,12 @@ export class PiAcpSession {
 
   setStartupInfo(text: string) {
     this.startupInfo = text
-    this.startupInfoPreSent = false
-    this.startupInfoPromptSent = false
+    this.startupInfoSent = false
   }
 
-  /**
-   * Best-effort attempt to send startup info outside of a prompt turn.
-   * Some clients (e.g. Zed) may only render agent messages once the UI is ready;
-   * callers can invoke this shortly after session/new returns.
-   */
   sendStartupInfoIfPending(): void {
-    if (this.startupInfoPreSent) return
-    this.startupInfoPreSent = true
-    this.sendStartupInfo()
-  }
-
-  private sendStartupInfoOnFirstPromptIfPending(): void {
-    if (this.startupInfoPromptSent) return
-    this.startupInfoPromptSent = true
-    this.sendStartupInfo()
-  }
-
-  private sendStartupInfo(): void {
-    if (!this.startupInfo) return
+    if (!this.startupInfo || this.startupInfoSent) return
+    this.startupInfoSent = true
     this.emit({
       sessionUpdate: 'agent_message_chunk',
       content: { type: 'text', text: this.startupInfo }
@@ -260,9 +240,7 @@ export class PiAcpSession {
   }
 
   async prompt(message: string, images: unknown[] = []): Promise<StopReason> {
-    // Keep a prompt-path fallback because some clients may ignore the best-effort
-    // pre-prompt notification sent right after session/new.
-    this.sendStartupInfoOnFirstPromptIfPending()
+    this.sendStartupInfoIfPending()
 
     // pi RPC mode disables slash command expansion, so we do it here.
     const expandedMessage = expandSlashCommand(message, this.fileCommands)
@@ -327,23 +305,25 @@ export class PiAcpSession {
     return this.cancelRequested
   }
 
+  private enqueueSend(send: () => Promise<void>): void {
+    this.lastSend = this.lastSend.then(send).catch(() => {})
+  }
+
   private emit(update: SessionUpdate): void {
-    // Serialize update delivery.
-    this.lastEmit = this.lastEmit
-      .then(() =>
-        this.conn.sessionUpdate({
-          sessionId: this.sessionId,
-          update
-        })
-      )
-      .catch(() => {
-        // Ignore notification errors (client may have gone away). We still want
-        // prompt completion.
+    this.enqueueSend(() =>
+      this.conn.sessionUpdate({
+        sessionId: this.sessionId,
+        update
       })
+    )
+  }
+
+  private emitCustomNotification(method: string, params: Record<string, unknown>): void {
+    this.enqueueSend(() => this.conn.extNotification(method, params))
   }
 
   private async flushEmits(): Promise<void> {
-    await this.lastEmit
+    await this.lastSend
   }
 
   private startTurn(t: QueuedTurn): void {
@@ -687,15 +667,9 @@ export class PiAcpSession {
   private handleExtensionUiRequest(ev: PiRpcEvent): void {
     const method = String((ev as any).method ?? '')
     const id = typeof (ev as any).id === 'string' ? ((ev as any).id as string) : undefined
-    const text = formatExtensionUiRequest(ev)
+    const payload = normalizeExtensionUiRequest(this.sessionId, ev)
 
-    if (text) {
-      this.emit({
-        sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text } satisfies ContentBlock,
-        _meta: { piAcp: { extensionUiMethod: method, extensionUiRequestId: id } }
-      })
-    }
+    if (payload) this.emitCustomNotification(PI_EXTENSION_UI_EVENT_METHOD, payload)
 
     if (id && isDialogExtensionUiMethod(method)) {
       ;(this.proc as any).respondExtensionUi?.(id, { cancelled: true })

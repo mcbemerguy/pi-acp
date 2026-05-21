@@ -1,43 +1,85 @@
 import type { PiRpcEvent } from '../pi-rpc/process.js'
+import { stripAnsi } from '../shared/ansi.js'
+
+export const PI_EXTENSION_UI_EVENT_METHOD = '_pi/extension_ui_event'
+
+type ExtensionUiPayload = Record<string, unknown>
 
 export function isDialogExtensionUiMethod(method: string): boolean {
   return method === 'select' || method === 'input' || method === 'editor' || method === 'confirm'
 }
 
-export function formatExtensionUiRequest(ev: PiRpcEvent): string {
+function cleanString(value: unknown): string | undefined {
+  return typeof value === 'string' ? stripAnsi(value) : undefined
+}
+
+function cleanStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string').map(stripAnsi) : []
+}
+
+function addString(target: ExtensionUiPayload, key: string, value: unknown): void {
+  const cleaned = cleanString(value)
+  if (cleaned !== undefined) target[key] = cleaned
+}
+
+export function normalizeExtensionUiRequest(sessionId: string, ev: PiRpcEvent): ExtensionUiPayload | null {
   const method = String((ev as any).method ?? '')
+  if (!method) return null
+
+  const id = cleanString((ev as any).id)
+  const payload: ExtensionUiPayload = { sessionId, method }
+  if (id) payload.id = id
+
   switch (method) {
-    case 'notify': {
-      const level = String((ev as any).notifyType ?? 'info')
-      const message = typeof (ev as any).message === 'string' ? ((ev as any).message as string) : ''
-      return message ? `[${level}] ${message}` : ''
+    case 'notify':
+      payload.event = 'notify'
+      addString(payload, 'notifyType', (ev as any).notifyType)
+      addString(payload, 'level', (ev as any).notifyType)
+      addString(payload, 'message', (ev as any).message)
+      return payload
+
+    case 'setStatus':
+      payload.event = 'status'
+      addString(payload, 'statusKey', (ev as any).statusKey)
+      addString(payload, 'statusText', (ev as any).statusText)
+      if (!('statusText' in payload)) payload.cleared = true
+      return payload
+
+    case 'setWidget':
+      payload.event = 'widget'
+      addString(payload, 'widgetKey', (ev as any).widgetKey)
+      addString(payload, 'widgetPlacement', (ev as any).widgetPlacement)
+      payload.widgetLines = cleanStringArray((ev as any).widgetLines)
+      return payload
+
+    case 'setTitle':
+      payload.event = 'title'
+      addString(payload, 'title', (ev as any).title)
+      return payload
+
+    case 'set_editor_text': {
+      payload.event = 'editor_text'
+      const text = cleanString((ev as any).text)
+      payload.hasText = text !== undefined
+      if (text !== undefined) payload.textLength = text.length
+      return payload
     }
-    case 'setStatus': {
-      const key = typeof (ev as any).statusKey === 'string' ? ` ${String((ev as any).statusKey)}` : ''
-      const statusText = typeof (ev as any).statusText === 'string' ? String((ev as any).statusText) : '(cleared)'
-      return `Status${key}: ${statusText}`
-    }
-    case 'setWidget': {
-      const key = typeof (ev as any).widgetKey === 'string' ? ` ${String((ev as any).widgetKey)}` : ''
-      const lines = Array.isArray((ev as any).widgetLines)
-        ? (ev as any).widgetLines.filter((line: unknown) => typeof line === 'string')
-        : []
-      return lines.length ? `Widget${key}:\n${lines.join('\n')}` : `Widget${key} updated.`
-    }
-    case 'setTitle': {
-      const title = typeof (ev as any).title === 'string' ? String((ev as any).title) : ''
-      return title ? `Title: ${title}` : ''
-    }
-    case 'set_editor_text':
-      return 'Extension requested editor text update.'
+
     case 'select':
     case 'input':
     case 'editor':
-    case 'confirm': {
-      const title = typeof (ev as any).title === 'string' ? `: ${String((ev as any).title)}` : ''
-      return `Extension UI dialog ${method}${title} is not supported in this ACP adapter and was cancelled.`
-    }
+    case 'confirm':
+      payload.event = 'dialog_cancelled'
+      payload.dialogType = method
+      payload.cancelled = true
+      addString(payload, 'title', (ev as any).title)
+      addString(payload, 'message', (ev as any).message)
+      addString(payload, 'placeholder', (ev as any).placeholder)
+      if (Array.isArray((ev as any).options)) payload.optionCount = (ev as any).options.length
+      return payload
+
     default:
-      return method ? `Extension UI request ignored: ${method}` : ''
+      payload.event = 'ignored'
+      return payload
   }
 }

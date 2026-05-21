@@ -128,7 +128,7 @@ test('PiAcpSession: emits tool locations from pi path args', async () => {
   assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: resolve(process.cwd(), 'src/acp/session.ts') }])
 })
 
-test('PiAcpSession: emits agent_message_chunk for extension UI notify requests', async () => {
+test('PiAcpSession: emits extension UI notify requests as sanitized custom notifications', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -141,13 +141,135 @@ test('PiAcpSession: emits agent_message_chunk for extension UI notify requests',
     fileCommands: []
   })
 
-  proc.emit({ type: 'extension_ui_request', id: 'ui1', method: 'notify', notifyType: 'warning', message: 'working' })
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'ui1',
+    method: 'notify',
+    notifyType: 'warning',
+    message: '\u001b[31mworking\u001b[0m'
+  })
 
   await new Promise(r => setTimeout(r, 0))
 
-  assert.equal(conn.updates.length, 1)
-  assert.equal(conn.updates[0]!.update.sessionUpdate, 'agent_message_chunk')
-  assert.equal((conn.updates[0]!.update as any).content.text, '[warning] working')
+  assert.equal(conn.updates.length, 0)
+  assert.deepEqual(conn.extNotifications, [
+    {
+      method: '_pi/extension_ui_event',
+      params: {
+        sessionId: 's1',
+        method: 'notify',
+        id: 'ui1',
+        event: 'notify',
+        notifyType: 'warning',
+        level: 'warning',
+        message: 'working'
+      }
+    }
+  ])
+})
+
+test('PiAcpSession: emits extension UI status clears as custom notifications without transcript text', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'extension_ui_request', id: 'ui2', method: 'setStatus', statusKey: 'cache-watch' })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 0)
+  assert.deepEqual(conn.extNotifications, [
+    {
+      method: '_pi/extension_ui_event',
+      params: {
+        sessionId: 's1',
+        method: 'setStatus',
+        id: 'ui2',
+        event: 'status',
+        statusKey: 'cache-watch',
+        cleared: true
+      }
+    }
+  ])
+})
+
+test('PiAcpSession: auto-cancels unsupported extension UI dialogs without transcript text', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'extension_ui_request', id: 'dialog1', method: 'confirm', title: '\u001b[33mProceed?\u001b[0m' })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 0)
+  assert.deepEqual(proc.extensionUiResponses, [{ id: 'dialog1', response: { cancelled: true } }])
+  assert.deepEqual(conn.extNotifications, [
+    {
+      method: '_pi/extension_ui_event',
+      params: {
+        sessionId: 's1',
+        method: 'confirm',
+        id: 'dialog1',
+        event: 'dialog_cancelled',
+        dialogType: 'confirm',
+        cancelled: true,
+        title: 'Proceed?'
+      }
+    }
+  ])
+})
+
+test('PiAcpSession: waits for extension UI custom notifications before resolving prompt', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  let releaseNotification!: () => void
+  conn.extNotificationBlocker = new Promise(resolve => {
+    releaseNotification = resolve
+  })
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'extension_ui_request', id: 'ui1', method: 'notify', message: 'working' })
+  proc.emit({ type: 'agent_end' })
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(resolved, false)
+  releaseNotification()
+
+  const reason = await p
+  assert.equal(reason, 'end_turn')
+  assert.equal(conn.extNotifications.length, 1)
 })
 
 test('PiAcpSession: emits agent_message_chunk for auto_retry_start with attempt/maxAttempts and rounded delay', async () => {
@@ -493,7 +615,7 @@ test('PiAcpSession: prompt resolves when an extension command returns without ag
   assert.equal(proc.prompts.length, 1)
 })
 
-test('PiAcpSession: re-emits startup info as the first chunk of the first prompt', async () => {
+test('PiAcpSession: emits startup info once when timer path runs before first prompt', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -517,16 +639,55 @@ test('PiAcpSession: re-emits startup info as the first chunk of the first prompt
 
   assert.equal(proc.prompts.length, 1)
   assert.equal(proc.prompts[0]!.message, 'hello')
-  assert.equal(conn.updates[0]!.update.sessionUpdate, 'agent_message_chunk')
-  assert.deepEqual(conn.updates[0]!.update, {
-    sessionUpdate: 'agent_message_chunk',
-    content: { type: 'text', text: notice }
+  assert.deepEqual(
+    conn.updates.filter(u => u.update.sessionUpdate === 'agent_message_chunk').map(u => u.update),
+    [
+      {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: notice }
+      }
+    ]
+  )
+
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'turn_end' })
+  proc.emit({ type: 'agent_end' })
+
+  const reason = await p
+  assert.equal(reason, 'end_turn')
+})
+
+test('PiAcpSession: emits startup info once when first-prompt fallback runs before timer path', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
   })
-  assert.equal(conn.updates[1]!.update.sessionUpdate, 'agent_message_chunk')
-  assert.deepEqual(conn.updates[1]!.update, {
-    sessionUpdate: 'agent_message_chunk',
-    content: { type: 'text', text: notice }
-  })
+
+  const notice = 'Context: project ready.'
+
+  session.setStartupInfo(notice)
+  const p = session.prompt('hello')
+  session.sendStartupInfoIfPending()
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(proc.prompts.length, 1)
+  assert.equal(proc.prompts[0]!.message, 'hello')
+  assert.deepEqual(
+    conn.updates.filter(u => u.update.sessionUpdate === 'agent_message_chunk').map(u => u.update),
+    [
+      {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: notice }
+      }
+    ]
+  )
 
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'turn_end' })

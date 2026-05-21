@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import * as readline from 'node:readline'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
+import { stripAnsi } from '../shared/ansi.js'
 
 export class PiRpcSpawnError extends Error {
   /** Underlying spawn error code, e.g. ENOENT, EACCES */
@@ -12,19 +13,6 @@ export class PiRpcSpawnError extends Error {
     this.code = opts?.code
     ;(this as any).cause = opts?.cause
   }
-}
-
-const ESC = String.fromCharCode(0x1b)
-const CSI = String.fromCharCode(0x9b)
-
-const ANSI_ESCAPE_REGEX = new RegExp(
-  `[${ESC}${CSI}][[\\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]`,
-  'g'
-)
-
-function stripAnsi(s: string): string {
-  // Basic ANSI escape stripping (colors, cursor movement, etc.)
-  return s.replace(ANSI_ESCAPE_REGEX, '')
 }
 
 type PiRpcCommand =
