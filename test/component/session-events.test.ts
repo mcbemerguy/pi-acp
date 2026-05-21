@@ -621,7 +621,7 @@ test('PiAcpSession: omits edit tool line when oldText matches multiple times', a
   assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: filePath }])
 })
 
-test('PiAcpSession: prompt resolves end_turn on agent_end', async () => {
+test('PiAcpSession: prompt resolves end_turn on agent_end, not prompt ack', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -634,7 +634,15 @@ test('PiAcpSession: prompt resolves end_turn on agent_end', async () => {
     fileCommands: []
   })
 
-  const p = session.prompt('hello')
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(resolved, false)
+
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'turn_end' })
   proc.emit({ type: 'agent_end' })
@@ -655,7 +663,9 @@ test('PiAcpSession: prompt resolves when an extension command returns without ag
     fileCommands: []
   })
 
-  const reason = await session.prompt('/cache-watch status')
+  const p = session.prompt('/cache-watch status')
+  await new Promise(r => setTimeout(r, 125))
+  const reason = await p
   assert.equal(reason, 'end_turn')
   assert.equal(proc.prompts.length, 1)
 })

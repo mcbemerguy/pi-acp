@@ -192,6 +192,8 @@ export class PiAcpSession {
   // The overall agent loop completes when `agent_end` is emitted.
   private inAgentLoop = false
   private completingTurn = false
+  private sawAgentActivity = false
+  private promptAckFallbackTimer: NodeJS.Timeout | null = null
   private currentWorkflowMonitor: WorkflowEventMonitor | null = null
 
   // For ACP diff support: capture file contents before edits, then emit ToolCallContent {type:"diff"}.
@@ -330,6 +332,11 @@ export class PiAcpSession {
     this.cancelRequested = false
     this.inAgentLoop = false
     this.completingTurn = false
+    this.sawAgentActivity = false
+    if (this.promptAckFallbackTimer) {
+      clearTimeout(this.promptAckFallbackTimer)
+      this.promptAckFallbackTimer = null
+    }
     this.currentAgentMessageId = crypto.randomUUID()
     this.currentWorkflowMonitor = isWorkflowCommandPrompt(t.message)
       ? new WorkflowEventMonitor(this.cwd, update => this.emit(update))
@@ -347,7 +354,12 @@ export class PiAcpSession {
     this.proc
       .prompt(t.message, t.images)
       .then(() => {
-        if (!this.inAgentLoop) this.completeTurn(this.cancelRequested ? 'cancelled' : 'end_turn')
+        this.promptAckFallbackTimer = setTimeout(() => {
+          this.promptAckFallbackTimer = null
+          if (!this.inAgentLoop && !this.sawAgentActivity) {
+            this.completeTurn(this.cancelRequested ? 'cancelled' : 'end_turn')
+          }
+        }, 100)
       })
       .catch(err => {
         const authErr = maybeAuthRequiredError(err)
@@ -370,9 +382,15 @@ export class PiAcpSession {
       if (opts.reject) pending.reject(opts.reject)
       else pending.resolve(reason)
 
+      if (this.promptAckFallbackTimer) {
+        clearTimeout(this.promptAckFallbackTimer)
+        this.promptAckFallbackTimer = null
+      }
+
       this.pendingTurn = null
       this.inAgentLoop = false
       this.completingTurn = false
+      this.sawAgentActivity = false
       this.currentAgentMessageId = null
 
       const proceedQueue = opts.proceedQueue ?? true
@@ -397,6 +415,7 @@ export class PiAcpSession {
 
     switch (type) {
       case 'message_update': {
+        this.sawAgentActivity = true
         const ame = (ev as any).assistantMessageEvent
 
         // Stream assistant text.
@@ -480,6 +499,7 @@ export class PiAcpSession {
       }
 
       case 'tool_execution_start': {
+        this.sawAgentActivity = true
         const toolCallId = String((ev as any).toolCallId ?? crypto.randomUUID())
         const toolName = String((ev as any).toolName ?? 'tool')
         const args = (ev as any).args
@@ -644,6 +664,7 @@ export class PiAcpSession {
       }
 
       case 'agent_start': {
+        this.sawAgentActivity = true
         this.inAgentLoop = true
         break
       }

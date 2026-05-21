@@ -244,7 +244,7 @@ export class WorkflowEventMapper {
     updates.push({
       sessionUpdate: 'tool_call_update',
       toolCallId,
-      status: childType === 'tool_execution_end' ? (Boolean(event.isError) ? 'failed' : 'completed') : 'in_progress',
+      status: childType === 'tool_execution_end' ? (event.isError ? 'failed' : 'completed') : 'in_progress',
       content,
       rawOutput: withWorkflowMeta(result, meta),
       _meta: { piWorkflow: meta }
