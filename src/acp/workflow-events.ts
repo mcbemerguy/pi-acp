@@ -46,6 +46,7 @@ export class WorkflowEventMapper {
   private readonly runs = new Set<string>()
   private readonly steps = new Map<string, StepPlan>()
   private readonly childTools = new Set<string>()
+  private readonly childTextDeltas = new Set<string>()
 
   constructor(cwd: string) {
     this.cwd = cwd
@@ -155,39 +156,12 @@ export class WorkflowEventMapper {
     const stepId = stringField(record.stepId)
     if (!stepId) return []
 
-    const status = stepToolStatus(record, type)
     const toolCallId = stepToolId(runId, stepId)
-    const meta = metaFromRecord(record)
     const stepContent = stepTitle(record, stepId)
-    const hadStep = this.steps.has(toolCallId)
     this.steps.set(toolCallId, { id: toolCallId, content: stepContent, status: planStatus(record, type) })
 
-    const updates: SessionUpdate[] = []
-    if (type === 'step_start' || !hadStep) {
-      updates.push({
-        sessionUpdate: 'tool_call',
-        toolCallId,
-        title: stepContent,
-        kind: 'other',
-        status,
-        rawInput: withWorkflowMeta(stepRaw(record), meta),
-        _meta: { piWorkflow: meta }
-      })
-    } else {
-      updates.push({
-        sessionUpdate: 'tool_call_update',
-        toolCallId,
-        title: stepContent,
-        status,
-        content: stepUpdateContent(record),
-        rawOutput: withWorkflowMeta(stepRaw(record), meta),
-        _meta: { piWorkflow: meta }
-      })
-    }
-
     const plan = this.planUpdate()
-    if (plan) updates.push(plan)
-    return updates
+    return plan ? [plan] : []
   }
 
   private mapChildPiEvent(record: Record<string, unknown>, runId: string): SessionUpdate[] {
@@ -195,6 +169,9 @@ export class WorkflowEventMapper {
     const stepId = stringField(record.stepId)
     const event = isObject(record.event) ? record.event : undefined
     if (!childType || !stepId || !event) return []
+
+    if (childType === 'message_update') return this.mapChildMessageUpdate(record, runId, stepId, event)
+    if (childType === 'message_end') return this.mapChildMessageEnd(record, runId, stepId, event)
     if (!childType.startsWith('tool_execution_')) return []
 
     const childToolCallId = stringField(event.toolCallId)
@@ -250,6 +227,72 @@ export class WorkflowEventMapper {
       _meta: { piWorkflow: meta }
     })
     return updates
+  }
+
+  private mapChildMessageUpdate(
+    record: Record<string, unknown>,
+    runId: string,
+    stepId: string,
+    event: Record<string, unknown>
+  ): SessionUpdate[] {
+    const assistantMessageEvent = isObject(event.assistantMessageEvent) ? event.assistantMessageEvent : undefined
+    const delta = stringField(assistantMessageEvent?.delta)
+    if (!assistantMessageEvent || !delta) return []
+
+    const meta = metaFromRecord(record)
+    const messageId = childMessageId(runId, stepId, meta.childSessionId, event, assistantMessageEvent)
+    const fallbackMessageId = childMessageId(runId, stepId, meta.childSessionId, {})
+
+    if (assistantMessageEvent.type === 'text_delta') {
+      this.childTextDeltas.add(messageId)
+      this.childTextDeltas.add(fallbackMessageId)
+      return [
+        {
+          sessionUpdate: 'agent_message_chunk',
+          messageId,
+          content: { type: 'text', text: delta } satisfies ContentBlock,
+          _meta: { piWorkflow: meta }
+        }
+      ]
+    }
+
+    if (assistantMessageEvent.type === 'thinking_delta') {
+      return [
+        {
+          sessionUpdate: 'agent_thought_chunk',
+          content: { type: 'text', text: delta } satisfies ContentBlock,
+          _meta: { piWorkflow: meta }
+        }
+      ]
+    }
+
+    return []
+  }
+
+  private mapChildMessageEnd(
+    record: Record<string, unknown>,
+    runId: string,
+    stepId: string,
+    event: Record<string, unknown>
+  ): SessionUpdate[] {
+    const message = isObject(event.message) ? event.message : undefined
+    const text = assistantText(message)
+    if (!text) return []
+
+    const meta = metaFromRecord(record)
+    const messageId = childMessageId(runId, stepId, meta.childSessionId, event)
+    const fallbackMessageId = childMessageId(runId, stepId, meta.childSessionId, {})
+    if (this.childTextDeltas.has(messageId) || this.childTextDeltas.has(fallbackMessageId)) return []
+    this.childTextDeltas.add(messageId)
+
+    return [
+      {
+        sessionUpdate: 'agent_message_chunk',
+        messageId,
+        content: { type: 'text', text } satisfies ContentBlock,
+        _meta: { piWorkflow: meta }
+      }
+    ]
   }
 
   private planUpdate(): SessionUpdate | null {
@@ -442,11 +485,6 @@ function isFailedStatus(record: Record<string, unknown>): boolean {
   return status === 'failed' || status === 'error' || Boolean(record.error)
 }
 
-function stepToolStatus(record: Record<string, unknown>, type: string): 'in_progress' | 'completed' | 'failed' {
-  if (type === 'step_end') return isFailedStatus(record) ? 'failed' : 'completed'
-  return 'in_progress'
-}
-
 function planStatus(record: Record<string, unknown>, type: string): 'pending' | 'in_progress' | 'completed' {
   if (type === 'step_end') return 'completed'
   const status = stringField(record.status)?.toLowerCase()
@@ -459,22 +497,30 @@ function stepTitle(record: Record<string, unknown>, stepId: string): string {
   return stepType ? `Workflow step: ${stepId} (${stepType})` : `Workflow step: ${stepId}`
 }
 
-function stepRaw(record: Record<string, unknown>): Record<string, unknown> {
-  return {
-    stepId: stringField(record.stepId),
-    stepType: stringField(record.stepType),
-    status: stringField(record.status),
-    activity: stringField(record.activity),
-    currentTool: stringField(record.currentTool),
-    childSessionId: stringField(record.childSessionId),
-    childSessionPath: stringField(record.childSessionPath),
-    error: stringField(record.error)
+function assistantText(message: Record<string, unknown> | undefined): string {
+  if (!message || message.role !== 'assistant' || !Array.isArray(message.content)) return ''
+  for (const part of message.content) {
+    if (isObject(part) && part.type === 'text' && typeof part.text === 'string') return part.text
   }
+  return ''
 }
 
-function stepUpdateContent(record: Record<string, unknown>): ToolCallContent[] | undefined {
-  const parts = [stringField(record.activity), stringField(record.currentTool), stringField(record.childSessionId)]
-    .filter(Boolean)
-    .join('\n')
-  return parts ? [{ type: 'content', content: { type: 'text', text: parts } }] : undefined
+function childMessageId(
+  runId: string,
+  stepId: string,
+  childSessionId: string | undefined,
+  event: Record<string, unknown>,
+  assistantMessageEvent?: Record<string, unknown>
+): string {
+  const explicitId =
+    stringField(event.messageId) ??
+    (isObject(event.message) ? stringField(event.message.id) : undefined) ??
+    (isObject(assistantMessageEvent?.partial) ? stringField(assistantMessageEvent.partial.id) : undefined)
+  return ['workflow', runId, 'step', stepId, 'child', childSessionId ?? 'unknown', 'message', explicitId ?? 'current']
+    .map(encodeIdPart)
+    .join(':')
+}
+
+function encodeIdPart(value: string): string {
+  return encodeURIComponent(value)
 }

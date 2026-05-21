@@ -15,7 +15,7 @@ test('isWorkflowCommandPrompt recognizes detached workflow slash commands', () =
   assert.equal(isWorkflowCommandPrompt('hello /workflow:review'), false)
 })
 
-test('WorkflowEventMapper maps workflow run and step events to ACP updates', () => {
+test('WorkflowEventMapper maps workflow run events and step plan updates to ACP updates', () => {
   const mapper = new WorkflowEventMapper('/repo')
   const updates = [
     ...mapper.map({
@@ -69,20 +69,14 @@ test('WorkflowEventMapper maps workflow run and step events to ACP updates', () 
   assert.equal((updates[0] as any).toolCallId, 'workflow:r1')
   assert.equal((updates[0] as any).status, 'in_progress')
 
-  const stepStart = updates.find(
-    update => update.sessionUpdate === 'tool_call' && (update as any).toolCallId === 'workflow:r1:step:code'
-  ) as any
-  assert.ok(stepStart)
-  assert.equal(stepStart.title, 'Workflow step: code (agent)')
-  assert.equal(stepStart.status, 'in_progress')
-
-  const stepEnd = updates.find(
-    update =>
-      update.sessionUpdate === 'tool_call_update' &&
-      (update as any).toolCallId === 'workflow:r1:step:code' &&
-      (update as any).status === 'completed'
-  ) as any
-  assert.ok(stepEnd)
+  assert.equal(
+    updates.some(
+      update =>
+        (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') &&
+        (update as any).toolCallId === 'workflow:r1:step:code'
+    ),
+    false
+  )
 
   const plans = updates.filter(update => update.sessionUpdate === 'plan') as any[]
   assert.ok(plans.length >= 1)
@@ -150,6 +144,85 @@ test('WorkflowEventMapper maps distinct child tool updates that share a timestam
     true
   )
   assert.equal(duplicate.length, 0)
+})
+
+test('WorkflowEventMapper projects child assistant text deltas and avoids duplicate message_end fallback', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+  const delta = mapper.map({
+    type: 'child_pi_event',
+    timestamp: 't1',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'code',
+    childSessionId: 'child',
+    childEventType: 'message_update',
+    event: {
+      type: 'message_update',
+      assistantMessageEvent: { type: 'text_delta', delta: 'hello ' }
+    }
+  })
+  const end = mapper.map({
+    type: 'child_pi_event',
+    timestamp: 't2',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'code',
+    childSessionId: 'child',
+    childEventType: 'message_end',
+    event: {
+      type: 'message_end',
+      message: { id: 'msg-1', role: 'assistant', content: [{ type: 'text', text: 'hello world' }] }
+    }
+  })
+
+  assert.equal(delta.length, 1)
+  assert.equal(delta[0]!.sessionUpdate, 'agent_message_chunk')
+  assert.equal((delta[0] as any).messageId, 'workflow:r1:step:code:child:child:message:current')
+  assert.equal((delta[0] as any).content.text, 'hello ')
+  assert.deepEqual((delta[0] as any)._meta.piWorkflow.stepId, 'code')
+  assert.equal(end.length, 0)
+})
+
+test('WorkflowEventMapper emits child message_end text when no delta was seen', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+  const updates = mapper.map({
+    type: 'child_pi_event',
+    timestamp: 't1',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'code',
+    childSessionId: 'child',
+    childEventType: 'message_end',
+    event: {
+      type: 'message_end',
+      message: { id: 'msg-1', role: 'assistant', content: [{ type: 'text', text: 'final text' }] }
+    }
+  })
+
+  assert.equal(updates.length, 1)
+  assert.equal(updates[0]!.sessionUpdate, 'agent_message_chunk')
+  assert.equal((updates[0] as any).content.text, 'final text')
+})
+
+test('WorkflowEventMapper projects child thinking deltas as ACP thought chunks', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+  const updates = mapper.map({
+    type: 'child_pi_event',
+    timestamp: 't1',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'code',
+    childSessionId: 'child',
+    childEventType: 'message_update',
+    event: {
+      type: 'message_update',
+      assistantMessageEvent: { type: 'thinking_delta', delta: 'thinking' }
+    }
+  })
+
+  assert.equal(updates.length, 1)
+  assert.equal(updates[0]!.sessionUpdate, 'agent_thought_chunk')
+  assert.equal((updates[0] as any).content.text, 'thinking')
 })
 
 test('WorkflowEventMapper maps child tool events with correlated stable IDs', () => {
