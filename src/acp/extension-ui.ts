@@ -41,7 +41,11 @@ export async function handleExtensionUiRequest(params: {
   proc: ExtensionUiResponder
 }): Promise<void> {
   const request = parseDialogRequest(params.event)
-  if (!request) return
+  if (!request) {
+    const id = coerceId((params.event as { id?: unknown }).id)
+    if (id) await params.proc.sendExtensionUiResponse(id, { cancelled: true })
+    return
+  }
 
   try {
     switch (request.method) {
@@ -178,7 +182,10 @@ async function handleEditor(
   request: DialogRequest,
   event: PiRpcEvent
 ): Promise<void> {
-  const existingText = asString((event as { text?: unknown }).text) ?? asString((event as { value?: unknown }).value)
+  const existingText =
+    asString((event as { prefill?: unknown }).prefill) ??
+    asString((event as { text?: unknown }).text) ??
+    asString((event as { value?: unknown }).value)
   const prompt = existingText ? `${request.prompt}\n\n${existingText}` : request.prompt
   const response = await conn.extMethod(ASK_QUESTION_METHOD, {
     toolCallId: request.id,

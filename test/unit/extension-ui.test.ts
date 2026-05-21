@@ -117,6 +117,8 @@ test('PiAcpSession: never deadlocks Pi on unsupported, malformed, or failing ext
   conn.queueExtensionResponse(new Error('client does not support questions'))
 
   proc.emit({ type: 'extension_ui_request', id: 'unsupported', method: 'datepicker', title: 'Pick a date' })
+  proc.emit({ type: 'extension_ui_request', id: 'missing-method', title: 'Choose' })
+  proc.emit({ type: 'extension_ui_request', id: 'invalid-method', method: 42, title: 'Choose' })
   proc.emit({ type: 'extension_ui_request', id: 'malformed', method: 'select', title: 'Choose', options: ['A'] })
   proc.emit({ type: 'extension_ui_request', id: 'failing', method: 'input', title: 'Type' })
 
@@ -124,6 +126,8 @@ test('PiAcpSession: never deadlocks Pi on unsupported, malformed, or failing ext
 
   assert.deepEqual(proc.extensionUiResponses, [
     { id: 'unsupported', payload: { cancelled: true } },
+    { id: 'missing-method', payload: { cancelled: true } },
+    { id: 'invalid-method', payload: { cancelled: true } },
     { id: 'malformed', payload: { cancelled: true } },
     { id: 'failing', payload: { cancelled: true } }
   ])
@@ -138,6 +142,35 @@ test('PiAcpSession: confirm failures unblock Pi with confirmed false', async () 
   await flushAsyncHandlers()
 
   assert.deepEqual(proc.extensionUiResponses, [{ id: 'confirm-1', payload: { confirmed: false } }])
+})
+
+test('PiAcpSession: editor requests include Pi prefill text when asking the client', async () => {
+  const { conn, proc } = makeSession()
+  conn.queueExtensionResponse({ answers: { value: 'edited text' } })
+
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'editor-1',
+    method: 'editor',
+    title: 'Edit answer',
+    prefill: 'existing text',
+    text: 'stale text'
+  })
+
+  await flushAsyncHandlers()
+
+  assert.deepEqual(conn.extensionRequests[0]!.params, {
+    toolCallId: 'editor-1',
+    title: 'Edit answer',
+    questions: [
+      {
+        id: 'value',
+        prompt: 'Edit answer\n\nexisting text',
+        allowMultiple: false
+      }
+    ]
+  })
+  assert.deepEqual(proc.extensionUiResponses, [{ id: 'editor-1', payload: { value: 'edited text' } }])
 })
 
 test('PiAcpSession: extension UI requests do not resolve prompt turns before agent_end', async () => {

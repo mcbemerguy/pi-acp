@@ -26,6 +26,7 @@ Expect some minor breaking changes.
   - Adds a small set of built-in commands for headless/editor usage
   - Supports skill commands (if enabled in pi settings, they appear as `/skill:skill-name` in the ACP client)
 - Skills are loaded by pi directly and are available in ACP sessions
+- Translates Pi RPC dialog requests (`select`, `input`, `confirm`, best-effort `editor`) to the Cursor-compatible ACP extension method `cursor/ask_question` for clients that support blocking user questions
 - (Zed) `pi-acp` emits “startup info” block into the session (pi version, context, skills, prompts, extensions - similar to `pi` in the terminal). You can disable it by setting `quietStartup: true` in pi settings (`~/.pi/agent/settings.json` or `<project>/.pi/settings.json`). When `quietStartup` is enabled, `pi-acp` will still emit a 'New version available' message if the installed pi version is outdated.
 - (Zed) Session history is supported in Zed starting with [`v0.225.0`](https://zed.dev/releases/preview/0.225.0). Session loading / history maps to pi's session files. Sessions can be resumed both in `pi` and in the ACP client.
 
@@ -129,6 +130,43 @@ You can add the environment variable in the Zed settings with:
     }
   }
 ```
+
+### Interactive questions and `ask_user_questions`
+
+Pi has three supported interactive question paths:
+
+1. In-process UI bridge hosts can handle the canonical `ask_user_questions` interaction directly.
+2. Local terminal Pi sessions render the built-in TUI questionnaire.
+3. ACP/RPC sessions use Pi's standard RPC dialog requests. `pi-acp` marks child Pi processes with `PI_ACP_RPC=1`, then translates blocking dialog requests to `conn.extMethod("cursor/ask_question", payload)` for compatible ACP clients such as T3Code Custom ACP.
+
+The ACP bridge is transport support only. `ask_user_questions` remains opt-in and is not added to default Pi tool caps. To smoke-test it through an ACP client, explicitly expose the tool, for example with `PI_DELEGATED_TOOL_CAP=ask_user_questions` in the ACP server environment.
+
+`pi-acp` sends these `cursor/ask_question` payloads:
+
+- `select`: `{ toolCallId, title, questions: [{ id: "selection", prompt, options: [{ id: "0", label }, ...], allowMultiple: false }] }`
+- `input` / `editor`: `{ toolCallId, title, questions: [{ id: "value", prompt, allowMultiple: false }] }` (text-entry prompt; compatible clients should not synthesize an `OK` option as the text answer)
+- `confirm`: `{ toolCallId, title, questions: [{ id: "confirmed", prompt, options: [{ id: "yes", label: "Yes" }, { id: "no", label: "No" }], allowMultiple: false }] }`
+
+Responses are normalized from `answers[questionId]`, then the first answer value, then top-level `value` / `answer`. Select option ids are mapped back to labels; exact labels and unknown non-empty strings are passed through so clients can return custom answers. Malformed responses, errors, and unsupported methods cancel the dialog to avoid deadlocking Pi.
+
+#### T3Code Custom ACP smoke path
+
+T3Code's Custom ACP provider defaults to `askQuestionEnabled: true` and `askQuestionMethod: cursor/ask_question`, which matches `pi-acp`.
+
+Practical local smoke configuration:
+
+1. Build the adapter: `cd .local/pi-acp && npm run build`.
+2. Start T3Code: `cd .local/t3code && bun run dev`.
+3. Add or edit a Custom ACP provider in T3Code settings:
+   - Command: `node`
+   - Arguments: `/home/marcosb/.pi/.local/pi-acp/dist/index.js`
+   - Environment:
+     - `PI_ACP_PI_COMMAND=/home/marcosb/.pi/bin/pi`
+     - `PI_CODING_AGENT_DIR=/home/marcosb/.pi/agent`
+     - `PI_DELEGATED_TOOL_CAP=ask_user_questions`
+4. Start a Custom ACP thread and ask the agent to call `ask_user_questions` with a small single-select question. Expected flow: Pi emits an RPC `select`, `pi-acp` sends `cursor/ask_question`, T3Code shows a blocking user-input prompt, the chosen/custom answer returns as `{ answers: { selection: "..." } }`, and Pi resumes the tool call.
+
+If this cannot be smoke-tested manually, the unverified boundary is the browser click/submit step inside T3Code. Unit coverage verifies the adapter payloads and T3Code request/response shapes on both sides of that boundary.
 
 ### Slash commands
 
