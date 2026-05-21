@@ -15,6 +15,7 @@ import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/proces
 import { SessionStore } from './session-store.js'
 import { toolResultToText } from './translate/pi-tools.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
+import { handleExtensionUiRequest } from './extension-ui.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -393,6 +394,11 @@ export class PiAcpSession {
     const type = String((ev as any).type ?? '')
 
     switch (type) {
+      case 'extension_ui_request': {
+        void handleExtensionUiRequest({ event: ev, conn: this.conn, proc: this.proc }).catch(() => {})
+        break
+      }
+
       case 'message_update': {
         const ame = (ev as any).assistantMessageEvent
 

@@ -71,6 +71,13 @@ type SpawnParams = {
   sessionPath?: string
 }
 
+export function buildPiRpcSpawnEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return {
+    ...env,
+    PI_ACP_RPC: '1'
+  }
+}
+
 export class PiRpcProcess {
   private readonly child: ChildProcessWithoutNullStreams
   private readonly pending = new Map<string, { resolve: (v: PiRpcResponse) => void; reject: (e: unknown) => void }>()
@@ -135,7 +142,7 @@ export class PiRpcProcess {
     const child = spawn(cmd, args, {
       cwd: params.cwd,
       stdio: 'pipe',
-      env: process.env,
+      env: buildPiRpcSpawnEnv(),
       shell: shouldUseShellForPiCommand(cmd)
     })
 
@@ -233,6 +240,21 @@ export class PiRpcProcess {
   async abort(): Promise<void> {
     const res = await this.request({ type: 'abort' })
     if (!res.success) throw new Error(`pi abort failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  sendExtensionUiResponse(id: string, payload: Record<string, unknown>): Promise<void> {
+    const line = JSON.stringify({ type: 'extension_ui_response', id, ...payload }) + '\n'
+
+    return new Promise<void>((resolve, reject) => {
+      try {
+        this.child.stdin.write(line, err => {
+          if (err) reject(err)
+          else resolve()
+        })
+      } catch (e) {
+        reject(e)
+      }
+    })
   }
 
   async getState(): Promise<unknown> {
