@@ -49,7 +49,11 @@ export function normalizeExtensionUiRequest(sessionId: string, ev: PiRpcEvent): 
       payload.event = 'widget'
       addString(payload, 'widgetKey', (ev as any).widgetKey)
       addString(payload, 'widgetPlacement', (ev as any).widgetPlacement)
-      payload.widgetLines = cleanStringArray((ev as any).widgetLines)
+      if (Array.isArray((ev as any).widgetLines)) {
+        payload.widgetLines = cleanStringArray((ev as any).widgetLines)
+      } else {
+        payload.cleared = true
+      }
       return payload
 
     case 'setTitle':

@@ -201,6 +201,51 @@ test('PiAcpSession: emits extension UI status clears as custom notifications wit
   ])
 })
 
+test('PiAcpSession: preserves extension UI widget clear semantics in custom notifications', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'extension_ui_request', id: 'ui3', method: 'setWidget', widgetKey: 'tasks' })
+  proc.emit({ type: 'extension_ui_request', id: 'ui4', method: 'setWidget', widgetKey: 'tasks', widgetLines: [] })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 0)
+  assert.deepEqual(conn.extNotifications, [
+    {
+      method: '_pi/extension_ui_event',
+      params: {
+        sessionId: 's1',
+        method: 'setWidget',
+        id: 'ui3',
+        event: 'widget',
+        widgetKey: 'tasks',
+        cleared: true
+      }
+    },
+    {
+      method: '_pi/extension_ui_event',
+      params: {
+        sessionId: 's1',
+        method: 'setWidget',
+        id: 'ui4',
+        event: 'widget',
+        widgetKey: 'tasks',
+        widgetLines: []
+      }
+    }
+  ])
+})
+
 test('PiAcpSession: auto-cancels unsupported extension UI dialogs without transcript text', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
