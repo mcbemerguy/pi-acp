@@ -343,8 +343,9 @@ export class WorkflowEventMonitor {
       }
       if (stat.size === tail.offset) return
       const data = readFileSync(tail.filePath)
-      text = data.subarray(tail.offset).toString('utf8')
-      tail.offset = stat.size
+      const endOffset = Math.min(stat.size, data.byteLength)
+      text = data.subarray(tail.offset, endOffset).toString('utf8')
+      tail.offset = endOffset
     } catch {
       return
     }
@@ -394,19 +395,18 @@ function stringField(value: unknown): string | undefined {
 }
 
 function eventDedupeKey(record: Record<string, unknown>): string {
-  const event = isObject(record.event) ? record.event : undefined
-  return JSON.stringify({
-    type: record.type,
-    timestamp: record.timestamp,
-    runId: record.runId,
-    workflowId: record.workflowId,
-    stepId: record.stepId,
-    status: record.status,
-    activity: record.activity,
-    currentTool: record.currentTool,
-    childEventType: record.childEventType,
-    childToolCallId: event?.toolCallId
-  })
+  return stableStringify(record)
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(item => stableStringify(item)).join(',')}]`
+  if (isObject(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map(key => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(value)
 }
 
 function workflowToolId(runId: string): string {

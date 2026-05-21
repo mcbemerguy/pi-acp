@@ -101,6 +101,57 @@ test('WorkflowEventMapper maps workflow run and step events to ACP updates', () 
   assert.equal(link.content.uri, pathToFileURL('/runs/r1/audit.md').href)
 })
 
+test('WorkflowEventMapper maps distinct child tool updates that share a timestamp', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+  const base = {
+    type: 'child_pi_event',
+    timestamp: 'same-ms',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'code',
+    childSessionId: 'child',
+    childEventType: 'tool_execution_update'
+  }
+
+  const first = mapper.map({
+    ...base,
+    event: {
+      type: 'tool_execution_update',
+      toolCallId: 'tool-1',
+      toolName: 'bash',
+      partialResult: { content: [{ type: 'text', text: 'one' }] }
+    }
+  })
+  const second = mapper.map({
+    ...base,
+    event: {
+      type: 'tool_execution_update',
+      toolCallId: 'tool-1',
+      toolName: 'bash',
+      partialResult: { content: [{ type: 'text', text: 'two' }] }
+    }
+  })
+  const duplicate = mapper.map({
+    ...base,
+    event: {
+      type: 'tool_execution_update',
+      toolCallId: 'tool-1',
+      toolName: 'bash',
+      partialResult: { content: [{ type: 'text', text: 'two' }] }
+    }
+  })
+
+  assert.equal(
+    first.some(update => update.sessionUpdate === 'tool_call_update'),
+    true
+  )
+  assert.equal(
+    second.some(update => update.sessionUpdate === 'tool_call_update'),
+    true
+  )
+  assert.equal(duplicate.length, 0)
+})
+
 test('WorkflowEventMapper maps child tool events with correlated stable IDs', () => {
   const mapper = new WorkflowEventMapper('/repo')
   const updates = [
