@@ -375,11 +375,13 @@ test('WorkflowEventMapper renders audit summary without raw Markdown-sensitive W
     update => update.sessionUpdate === 'agent_message_chunk' && (update as any).content.type === 'resource_link'
   ) as any
 
+  const auditUri = pathToFileURL(auditPath).href
+
   assert.ok(summary)
-  assert.equal(summary.content.text, 'Workflow wf failed. Audit attached.')
+  assert.equal(summary.content.text, `Workflow wf failed. Audit: ${auditUri}`)
   assert.equal(summary.content.text.includes(auditPath), false)
   assert.ok(link)
-  assert.equal(link.content.uri, pathToFileURL(auditPath).href)
+  assert.equal(link.content.uri, auditUri)
 })
 
 test('WorkflowEventMapper maps child bash tools to ACP execute kind', () => {
