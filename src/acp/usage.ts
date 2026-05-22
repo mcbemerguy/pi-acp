@@ -73,7 +73,7 @@ export function usageUpdateFromPiSessionStats(stats: unknown): SessionUpdate | u
   const context = nestedRecord(stats, 'context') ?? nestedRecord(stats, 'contextWindow')
   const model = nestedRecord(stats, 'model')
 
-  const used = firstPositiveInt(
+  const used = firstNonNegativeInt(
     context?.used,
     context?.usedTokens,
     stats.usedTokens,
