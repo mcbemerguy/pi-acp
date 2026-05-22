@@ -33,6 +33,7 @@ import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-setti
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { PI_EXTENSION_UI_EVENT_METHOD } from './extension-ui.js'
+import { usageFromPiSessionStats } from './usage.js'
 import {
   getSessionConfigOptions,
   isThinkingLevel,
@@ -86,6 +87,14 @@ function builtinAvailableCommands(): AvailableCommand[] {
       description: 'Show pi changelog'
     }
   ]
+}
+
+async function getSessionStatsIfAvailable(session: { proc: Pick<PiRpcProcess, 'getSessionStats'> }): Promise<unknown> {
+  try {
+    return await session.proc.getSessionStats()
+  } catch {
+    return undefined
+  }
 }
 
 function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableCommand[] {
@@ -392,27 +401,29 @@ export class PiAcpAgent implements ACPAgent {
       }
 
       if (cmd === 'session') {
-        const stats = (await session.proc.getSessionStats()) as any
+        const stats = (await session.proc.getSessionStats()) as unknown
+        session.publishUsageUpdateFromStats(stats)
+        const statsRecord = stats && typeof stats === 'object' ? (stats as Record<string, unknown>) : null
 
         const lines: string[] = []
-        if (stats?.sessionId) lines.push(`Session: ${stats.sessionId}`)
-        if (stats?.sessionFile) lines.push(`Session file: ${stats.sessionFile}`)
-        if (typeof stats?.totalMessages === 'number') lines.push(`Messages: ${stats.totalMessages}`)
+        if (typeof statsRecord?.sessionId === 'string') lines.push(`Session: ${statsRecord.sessionId}`)
+        if (typeof statsRecord?.sessionFile === 'string') lines.push(`Session file: ${statsRecord.sessionFile}`)
+        if (typeof statsRecord?.totalMessages === 'number') lines.push(`Messages: ${statsRecord.totalMessages}`)
 
-        if (typeof stats?.cost === 'number') lines.push(`Cost: ${stats.cost}`)
+        if (typeof statsRecord?.cost === 'number') lines.push(`Cost: ${statsRecord.cost}`)
 
-        const t = stats?.tokens
-        if (t && typeof t === 'object') {
+        const t = statsRecord?.tokens
+        if (t && typeof t === 'object' && !Array.isArray(t)) {
+          const tokens = t as Record<string, unknown>
           const parts: string[] = []
-          if (typeof t.input === 'number') parts.push(`in ${t.input}`)
-          if (typeof t.output === 'number') parts.push(`out ${t.output}`)
-          if (typeof t.cacheRead === 'number') parts.push(`cache read ${t.cacheRead}`)
-          if (typeof t.cacheWrite === 'number') parts.push(`cache write ${t.cacheWrite}`)
-          if (typeof t.total === 'number') parts.push(`total ${t.total}`)
+          if (typeof tokens.input === 'number') parts.push(`in ${tokens.input}`)
+          if (typeof tokens.output === 'number') parts.push(`out ${tokens.output}`)
+          if (typeof tokens.cacheRead === 'number') parts.push(`cache read ${tokens.cacheRead}`)
+          if (typeof tokens.cacheWrite === 'number') parts.push(`cache write ${tokens.cacheWrite}`)
+          if (typeof tokens.total === 'number') parts.push(`total ${tokens.total}`)
           if (parts.length) lines.push(`Tokens: ${parts.join(', ')}`)
         }
 
-        // Fallback if stats shape changes.
         const text = lines.length ? lines.join('\n') : `Session stats:\n${JSON.stringify(stats, null, 2)}`
 
         await this.conn.sessionUpdate({
@@ -799,13 +810,16 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     const result = await session.prompt(message, images)
+    const stats = await getSessionStatsIfAvailable(session)
+    if (stats !== undefined) session.publishUsageUpdateFromStats(stats)
+    const usage = usageFromPiSessionStats(stats)
 
     // ACP StopReason does not include "error"; if pi fails we map to end_turn for now,
     // unless we know this was a cancellation.
     const stopReason: StopReason =
       result === 'error' ? (session.wasCancelRequested() ? 'cancelled' : 'end_turn') : result
 
-    return { stopReason }
+    return { stopReason, ...(usage ? { usage } : {}) }
   }
 
   async cancel(params: CancelNotification): Promise<void> {

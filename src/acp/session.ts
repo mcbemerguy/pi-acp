@@ -22,6 +22,7 @@ import {
   normalizeExtensionUiRequest,
   PI_EXTENSION_UI_EVENT_METHOD
 } from './extension-ui.js'
+import { usageUpdateFromPiSessionStats } from './usage.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -328,6 +329,11 @@ export class PiAcpSession {
 
   wasCancelRequested(): boolean {
     return this.cancelRequested
+  }
+
+  publishUsageUpdateFromStats(stats: unknown): void {
+    const update = usageUpdateFromPiSessionStats(stats)
+    if (update) this.emit(update)
   }
 
   private enqueueSend(send: () => Promise<void>): void {
