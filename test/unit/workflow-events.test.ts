@@ -353,3 +353,47 @@ test('WorkflowEventMonitor tails new run artifacts and tolerates malformed parti
   assert.ok(updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:r1'))
   rmSync(root, { recursive: true, force: true })
 })
+
+test('WorkflowEventMapper renders audit summary without raw Markdown-sensitive Windows path', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+  const auditPath = String.raw`C:\Users\marcos.bemerguy\.pi\agent\workflow-runs\r1\audit.md`
+  const updates = mapper.map({
+    type: 'run_end',
+    timestamp: 't1',
+    runId: 'r1',
+    workflowId: 'wf',
+    auditPath,
+    status: 'failed'
+  })
+
+  const summary = updates.find(
+    update => update.sessionUpdate === 'agent_message_chunk' && (update as any).content.type === 'text'
+  ) as any
+  const link = updates.find(
+    update => update.sessionUpdate === 'agent_message_chunk' && (update as any).content.type === 'resource_link'
+  ) as any
+
+  assert.ok(summary)
+  assert.equal(summary.content.text, 'Workflow wf failed. Audit attached.')
+  assert.equal(summary.content.text.includes(auditPath), false)
+  assert.ok(link)
+  assert.equal(link.content.uri, pathToFileURL(auditPath).href)
+})
+
+test('WorkflowEventMapper maps child bash tools to ACP execute kind', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+  const updates = mapper.map({
+    type: 'child_pi_event',
+    timestamp: 't1',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'code',
+    childSessionId: 'child',
+    childEventType: 'tool_execution_start',
+    event: { type: 'tool_execution_start', toolCallId: 'tool-1', toolName: 'bash', args: { cmd: 'npm test' } }
+  })
+
+  assert.equal(updates[0]!.sessionUpdate, 'tool_call')
+  assert.equal((updates[0] as any).title, 'bash')
+  assert.equal((updates[0] as any).kind, 'execute')
+})

@@ -2,17 +2,15 @@ import type { ToolCallLocation, ToolKind } from '@agentclientprotocol/sdk'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 
 export function toToolKind(toolName: string): ToolKind {
-  switch (toolName) {
-    case 'read':
-      return 'read'
-    case 'write':
-    case 'edit':
-      return 'edit'
-    case 'bash':
-      return 'other'
-    default:
-      return 'other'
-  }
+  const normalized = toolName.toLowerCase()
+
+  if (normalized === 'read') return 'read'
+  if (normalized === 'write' || normalized === 'edit') return 'edit'
+  if (normalized === 'bash') return 'execute'
+  if (normalized === 'grep' || normalized === 'find') return 'search'
+  if (normalized.startsWith('web_fetch') || normalized.startsWith('browser_fetch')) return 'fetch'
+
+  return 'other'
 }
 
 export function toToolCallLocations(args: unknown, cwd: string, line?: number): ToolCallLocation[] | undefined {

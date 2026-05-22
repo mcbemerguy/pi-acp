@@ -901,3 +901,68 @@ test('PiAcpSession: expands /command before sending to pi', async () => {
   const reason = await p
   assert.equal(reason, 'end_turn')
 })
+
+test('PiAcpSession: defers unnamed streamed tool calls and corrects metadata on execution start', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_delta',
+      toolCall: { id: 't1', partialArgs: '{"pattern":"x"}' }
+    }
+  })
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'grep', args: { pattern: 'x' } })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 1)
+  assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
+  assert.equal((conn.updates[0]!.update as any).toolCallId, 't1')
+  assert.equal((conn.updates[0]!.update as any).title, 'grep')
+  assert.equal((conn.updates[0]!.update as any).kind, 'search')
+  assert.equal((conn.updates[0]!.update as any).status, 'in_progress')
+})
+
+test('PiAcpSession: execution start updates streamed tool title and kind', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_start',
+      toolCall: { id: 't1', function: { name: 'read' }, partialArgs: '{"path":"a.txt"}' }
+    }
+  })
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'bash', args: { cmd: 'ls' } })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 2)
+  assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
+  assert.equal((conn.updates[0]!.update as any).title, 'read')
+  assert.equal((conn.updates[0]!.update as any).kind, 'read')
+  assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
+  assert.equal((conn.updates[1]!.update as any).title, 'bash')
+  assert.equal((conn.updates[1]!.update as any).kind, 'execute')
+})

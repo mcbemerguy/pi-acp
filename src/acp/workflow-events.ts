@@ -138,7 +138,7 @@ export class WorkflowEventMapper {
     })
 
     const auditPath = stringField(record.auditPath)
-    const summary = `Workflow ${workflowId} ${status === 'failed' ? 'failed' : 'completed'}${auditPath ? `. Audit: ${auditPath}` : '.'}`
+    const summary = `Workflow ${workflowId} ${status === 'failed' ? 'failed' : 'completed'}${auditPath ? '. Audit attached.' : '.'}`
     updates.push({
       sessionUpdate: 'agent_message_chunk',
       content: { type: 'text', text: summary } satisfies ContentBlock,

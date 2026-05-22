@@ -60,6 +60,17 @@ function findUniqueLineNumber(text: string, needle: string): number | undefined 
   return line
 }
 
+function toolCallName(toolCall: unknown): string | undefined {
+  const value = toolCall as {
+    name?: unknown
+    toolName?: unknown
+    function?: { name?: unknown }
+  } | null
+
+  const name = value?.name ?? value?.toolName ?? value?.function?.name
+  return typeof name === 'string' && name.trim() ? name : undefined
+}
+
 export class SessionManager {
   private sessions = new Map<string, PiAcpSession>()
   private readonly store = new SessionStore()
@@ -456,7 +467,7 @@ export class PiAcpSession {
             (ame as any)?.partial?.content?.[(ame as any)?.contentIndex ?? 0]
 
           const toolCallId = String((toolCall as any)?.id ?? '')
-          const toolName = String((toolCall as any)?.name ?? 'tool')
+          const toolName = toolCallName(toolCall)
 
           if (toolCallId) {
             const rawInput =
@@ -478,22 +489,23 @@ export class PiAcpSession {
             const status = existingStatus ?? 'pending'
 
             if (!existingStatus) {
-              this.currentToolCalls.set(toolCallId, 'pending')
-              this.emit({
-                sessionUpdate: 'tool_call',
-                toolCallId,
-                title: toolName,
-                kind: toToolKind(toolName),
-                status,
-                locations,
-                rawInput
-              })
+              if (toolName) {
+                this.currentToolCalls.set(toolCallId, 'pending')
+                this.emit({
+                  sessionUpdate: 'tool_call',
+                  toolCallId,
+                  title: toolName,
+                  kind: toToolKind(toolName),
+                  status,
+                  locations,
+                  rawInput
+                })
+              }
             } else {
-              // Best-effort: keep rawInput updated while args are streaming.
-              // Keep the existing status (pending or in_progress).
               this.emit({
                 sessionUpdate: 'tool_call_update',
                 toolCallId,
+                ...(toolName ? { title: toolName, kind: toToolKind(toolName) } : {}),
                 status,
                 locations,
                 rawInput
@@ -551,6 +563,8 @@ export class PiAcpSession {
           this.emit({
             sessionUpdate: 'tool_call_update',
             toolCallId,
+            title: toolName,
+            kind: toToolKind(toolName),
             status: 'in_progress',
             locations,
             rawInput: args
