@@ -123,10 +123,17 @@ import { fileURLToPath } from 'node:url'
 
 const pkg = readNearestPackageJson(import.meta.url)
 
+function shouldReplayLoadSessionHistory(params: InitializeRequest): boolean {
+  const clientName = (params.clientInfo?.name ?? '').trim().toLowerCase()
+
+  return clientName !== 't3-code' && clientName !== 't3code'
+}
+
 export class PiAcpAgent implements ACPAgent {
   private readonly conn: AgentSideConnection
   private readonly sessions = new SessionManager()
   private readonly store = new SessionStore()
+  private replayLoadSessionHistory = true
 
   dispose(): void {
     this.sessions.disposeAll()
@@ -163,6 +170,7 @@ export class PiAcpAgent implements ACPAgent {
     // We currently only support ACP protocol version 1.
     const supportedVersion = 1
     const requested = params.protocolVersion
+    this.replayLoadSessionHistory = shouldReplayLoadSessionHistory(params)
 
     return {
       protocolVersion: requested === supportedVersion ? requested : supportedVersion,
@@ -892,69 +900,69 @@ export class PiAcpAgent implements ACPAgent {
       sessionFile
     })
 
-    // Replay full conversation history.
-    const data = (await proc.getMessages()) as any
-    const messages = Array.isArray(data?.messages) ? data.messages : []
+    if (this.replayLoadSessionHistory) {
+      const data = (await proc.getMessages()) as any
+      const messages = Array.isArray(data?.messages) ? data.messages : []
 
-    for (const m of messages) {
-      const role = String(m?.role ?? '')
+      for (const m of messages) {
+        const role = String(m?.role ?? '')
 
-      if (role === 'user') {
-        const text = normalizePiMessageText(m?.content)
-        if (text) {
+        if (role === 'user') {
+          const text = normalizePiMessageText(m?.content)
+          if (text) {
+            await this.conn.sessionUpdate({
+              sessionId: session.sessionId,
+              update: {
+                sessionUpdate: 'user_message_chunk',
+                content: { type: 'text', text }
+              }
+            })
+          }
+        }
+
+        if (role === 'assistant') {
+          const text = normalizePiAssistantText(m?.content)
+          if (text) {
+            await this.conn.sessionUpdate({
+              sessionId: session.sessionId,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text }
+              }
+            })
+          }
+        }
+
+        if (role === 'toolResult') {
+          const toolName = String((m as any)?.toolName ?? 'tool')
+          const toolCallId = String((m as any)?.toolCallId ?? crypto.randomUUID())
+          const isError = Boolean((m as any)?.isError)
+
           await this.conn.sessionUpdate({
             sessionId: session.sessionId,
             update: {
-              sessionUpdate: 'user_message_chunk',
-              content: { type: 'text', text }
+              sessionUpdate: 'tool_call',
+              toolCallId,
+              title: toolName,
+              kind: toolName === 'read' ? 'read' : toolName === 'write' || toolName === 'edit' ? 'edit' : 'other',
+              status: 'completed',
+              rawInput: null,
+              rawOutput: m
             }
           })
-        }
-      }
 
-      if (role === 'assistant') {
-        const text = normalizePiAssistantText(m?.content)
-        if (text) {
+          const text = toolResultToText(m)
           await this.conn.sessionUpdate({
             sessionId: session.sessionId,
             update: {
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text }
+              sessionUpdate: 'tool_call_update',
+              toolCallId,
+              status: isError ? 'failed' : 'completed',
+              content: text ? [{ type: 'content', content: { type: 'text', text } }] : null,
+              rawOutput: m
             }
           })
         }
-      }
-
-      if (role === 'toolResult') {
-        const toolName = String((m as any)?.toolName ?? 'tool')
-        const toolCallId = String((m as any)?.toolCallId ?? crypto.randomUUID())
-        const isError = Boolean((m as any)?.isError)
-
-        // Create a synthetic ACP tool call to render historic tool usage.
-        await this.conn.sessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: 'tool_call',
-            toolCallId,
-            title: toolName,
-            kind: toolName === 'read' ? 'read' : toolName === 'write' || toolName === 'edit' ? 'edit' : 'other',
-            status: 'completed',
-            rawInput: null,
-            rawOutput: m
-          }
-        })
-
-        const text = toolResultToText(m)
-        await this.conn.sessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: 'tool_call_update',
-            toolCallId,
-            status: isError ? 'failed' : 'completed',
-            content: text ? [{ type: 'content', content: { type: 'text', text } }] : null,
-            rawOutput: m
-          }
-        })
       }
     }
 
