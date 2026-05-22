@@ -1,5 +1,7 @@
 import { AgentSideConnection, ndJsonStream } from '@agentclientprotocol/sdk'
+import { StringDecoder } from 'node:string_decoder'
 import { PiAcpAgent } from './acp/agent.js'
+import { normalizeAcpInputLine } from './acp/t3code-compat.js'
 import { getPiCommand, shouldUseShellForPiCommand } from './pi-rpc/command.js'
 // Terminal Auth entrypoint. The ACP client launches the agent with `--terminal-login`.
 if (process.argv.includes('--terminal-login')) {
@@ -41,8 +43,25 @@ const input = new WritableStream<Uint8Array>({
 
 const output = new ReadableStream<Uint8Array>({
   start(controller) {
-    process.stdin.on('data', (chunk: Buffer) => controller.enqueue(new Uint8Array(chunk)))
-    process.stdin.on('end', () => controller.close())
+    let buffered = ''
+    const decoder = new StringDecoder('utf8')
+    const encoder = new TextEncoder()
+
+    const enqueueLine = (line: string) => {
+      controller.enqueue(encoder.encode(`${normalizeAcpInputLine(line)}\n`))
+    }
+
+    process.stdin.on('data', (chunk: Buffer) => {
+      buffered += decoder.write(chunk)
+      const lines = buffered.split(/\r?\n/)
+      buffered = lines.pop() ?? ''
+      for (const line of lines) enqueueLine(line)
+    })
+    process.stdin.on('end', () => {
+      buffered += decoder.end()
+      if (buffered) enqueueLine(buffered)
+      controller.close()
+    })
     process.stdin.on('error', err => controller.error(err))
   }
 })
