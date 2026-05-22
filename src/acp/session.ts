@@ -3,9 +3,7 @@ import type {
   ContentBlock,
   McpServer,
   SessionUpdate,
-  ToolCallContent,
-  ToolCallLocation,
-  ToolKind
+  ToolCallContent
 } from '@agentclientprotocol/sdk'
 import { RequestError } from '@agentclientprotocol/sdk'
 import { maybeAuthRequiredError } from './auth-required.js'
@@ -14,8 +12,15 @@ import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
 import { SessionStore } from './session-store.js'
 import { toolResultToText } from './translate/pi-tools.js'
+import { toToolCallLocations, toToolKind } from './translate/tool-metadata.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
-import { handleExtensionUiRequest } from './extension-ui.js'
+import { isWorkflowCommandPrompt, WorkflowEventMonitor } from './workflow-events.js'
+import {
+  handleExtensionUiRequest,
+  isDialogExtensionUiMethod,
+  normalizeExtensionUiRequest,
+  PI_EXTENSION_UI_EVENT_METHOD
+} from './extension-ui.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -55,17 +60,6 @@ function findUniqueLineNumber(text: string, needle: string): number | undefined 
   return line
 }
 
-function toToolCallLocations(args: unknown, cwd: string, line?: number): ToolCallLocation[] | undefined {
-  const path =
-    typeof (args as { path?: unknown } | null | undefined)?.path === 'string'
-      ? (args as { path: string }).path
-      : undefined
-  if (!path) return undefined
-
-  const resolvedPath = isAbsolute(path) ? path : resolvePath(cwd, path)
-  return [{ path: resolvedPath, ...(typeof line === 'number' ? { line } : {}) }]
-}
-
 export class SessionManager {
   private sessions = new Map<string, PiAcpSession>()
   private readonly store = new SessionStore()
@@ -88,7 +82,7 @@ export class SessionManager {
     const s = this.sessions.get(sessionId)
     if (!s) return
     try {
-      s.proc.dispose?.()
+      s.dispose()
     } catch {
       // ignore
     }
@@ -180,8 +174,8 @@ export class PiAcpSession {
   readonly mcpServers: McpServer[]
 
   private startupInfo: string | null = null
-  private startupInfoSentOutOfTurn = false
-  private startupInfoSentInPrompt = false
+  private startupInfoSent = false
+  private currentAgentMessageId: string | null = null
 
   readonly proc: PiRpcProcess
   private readonly conn: AgentSideConnection
@@ -202,15 +196,17 @@ export class PiAcpSession {
   // pi can emit multiple `turn_end` events for a single user prompt (e.g. after tool_use).
   // The overall agent loop completes when `agent_end` is emitted.
   private inAgentLoop = false
+  private completingTurn = false
+  private sawAgentActivity = false
+  private promptAckFallbackTimer: NodeJS.Timeout | null = null
+  private currentWorkflowMonitor: WorkflowEventMonitor | null = null
 
   // For ACP diff support: capture file contents before edits, then emit ToolCallContent {type:"diff"}.
   // This is due to pi sending diff as a string as opposed to ACP expected diff format.
   // Compatible format may need to be implemented in pi in the future.
   private editSnapshots = new Map<string, { path: string; oldText: string }>()
 
-  // Ensure `session/update` notifications are sent in order and can be awaited
-  // before completing a `session/prompt` request.
-  private lastEmit: Promise<void> = Promise.resolve()
+  private lastSend: Promise<void> = Promise.resolve()
 
   constructor(opts: {
     sessionId: string
@@ -230,31 +226,20 @@ export class PiAcpSession {
     this.proc.onEvent(ev => this.handlePiEvent(ev))
   }
 
+  dispose(): void {
+    this.currentWorkflowMonitor?.dispose()
+    this.currentWorkflowMonitor = null
+    this.proc.dispose?.()
+  }
+
   setStartupInfo(text: string) {
     this.startupInfo = text
-    this.startupInfoSentOutOfTurn = false
-    this.startupInfoSentInPrompt = false
+    this.startupInfoSent = false
   }
 
-  /**
-   * Best-effort attempt to send startup info outside of a prompt turn.
-   * Some clients (e.g. Zed) may only render agent messages once the UI is ready;
-   * callers can invoke this shortly after session/new returns.
-   */
   sendStartupInfoIfPending(): void {
-    if (this.startupInfoSentOutOfTurn || !this.startupInfo) return
-    this.startupInfoSentOutOfTurn = true
-
-    this.emit({
-      sessionUpdate: 'agent_message_chunk',
-      content: { type: 'text', text: this.startupInfo }
-    })
-  }
-
-  private sendStartupInfoOnFirstPromptIfPending(): void {
-    if (this.startupInfoSentInPrompt || !this.startupInfo) return
-    this.startupInfoSentInPrompt = true
-
+    if (!this.startupInfo || this.startupInfoSent) return
+    this.startupInfoSent = true
     this.emit({
       sessionUpdate: 'agent_message_chunk',
       content: { type: 'text', text: this.startupInfo }
@@ -262,9 +247,7 @@ export class PiAcpSession {
   }
 
   async prompt(message: string, images: unknown[] = []): Promise<StopReason> {
-    // Keep a prompt-path fallback because some clients may ignore the best-effort
-    // pre-prompt notification sent right after session/new.
-    this.sendStartupInfoOnFirstPromptIfPending()
+    this.sendStartupInfoIfPending()
 
     // pi RPC mode disables slash command expansion, so we do it here.
     const expandedMessage = expandSlashCommand(message, this.fileCommands)
@@ -329,28 +312,41 @@ export class PiAcpSession {
     return this.cancelRequested
   }
 
+  private enqueueSend(send: () => Promise<void>): void {
+    this.lastSend = this.lastSend.then(send).catch(() => {})
+  }
+
   private emit(update: SessionUpdate): void {
-    // Serialize update delivery.
-    this.lastEmit = this.lastEmit
-      .then(() =>
-        this.conn.sessionUpdate({
-          sessionId: this.sessionId,
-          update
-        })
-      )
-      .catch(() => {
-        // Ignore notification errors (client may have gone away). We still want
-        // prompt completion.
+    this.enqueueSend(() =>
+      this.conn.sessionUpdate({
+        sessionId: this.sessionId,
+        update
       })
+    )
+  }
+
+  private emitCustomNotification(method: string, params: Record<string, unknown>): void {
+    this.enqueueSend(() => this.conn.extNotification(method, params))
   }
 
   private async flushEmits(): Promise<void> {
-    await this.lastEmit
+    await this.lastSend
   }
 
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
     this.inAgentLoop = false
+    this.completingTurn = false
+    this.sawAgentActivity = false
+    if (this.promptAckFallbackTimer) {
+      clearTimeout(this.promptAckFallbackTimer)
+      this.promptAckFallbackTimer = null
+    }
+    this.currentAgentMessageId = crypto.randomUUID()
+    this.currentWorkflowMonitor = isWorkflowCommandPrompt(t.message)
+      ? new WorkflowEventMonitor(this.cwd, update => this.emit(update))
+      : null
+    this.currentWorkflowMonitor?.start()
 
     this.pendingTurn = { resolve: t.resolve, reject: t.reject }
 
@@ -360,34 +356,63 @@ export class PiAcpSession {
       _meta: { piAcp: { queueDepth: this.turnQueue.length, running: true } }
     })
 
-    // Kick off pi, but completion is determined by pi events, not the RPC response.
-    // Important: pi may emit multiple `turn_end` events (e.g. when the model requests tools).
-    // The full prompt is finished when we see `agent_end`.
-    this.proc.prompt(t.message, t.images).catch(err => {
-      // If the subprocess errors before we get an `agent_end`, treat as error unless cancelled.
-      // Also ensure we flush any already-enqueued updates first.
-      void this.flushEmits().finally(() => {
-        // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
+    this.proc
+      .prompt(t.message, t.images)
+      .then(() => {
+        this.promptAckFallbackTimer = setTimeout(() => {
+          this.promptAckFallbackTimer = null
+          if (!this.inAgentLoop && !this.sawAgentActivity) {
+            this.completeTurn(this.cancelRequested ? 'cancelled' : 'end_turn')
+          }
+        }, 100)
+      })
+      .catch(err => {
         const authErr = maybeAuthRequiredError(err)
-        if (authErr) {
-          this.pendingTurn?.reject(authErr)
-        } else {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
-          this.pendingTurn?.resolve(reason)
-        }
+        if (authErr) this.completeTurn('error', { reject: authErr, proceedQueue: false })
+        else this.completeTurn(this.cancelRequested ? 'cancelled' : 'error', { proceedQueue: false })
+      })
+  }
 
-        this.pendingTurn = null
-        this.inAgentLoop = false
+  private completeTurn(reason: StopReason, opts: { reject?: unknown; proceedQueue?: boolean } = {}): void {
+    if (!this.pendingTurn || this.completingTurn) return
+    this.completingTurn = true
+    const pending = this.pendingTurn
+    const monitor = this.currentWorkflowMonitor
+    this.currentWorkflowMonitor = null
 
-        // If the prompt failed, do not automatically proceed—pi may be unhealthy.
-        // But we still clear the queueDepth metadata.
+    void (async () => {
+      if (monitor) await monitor.stopAfterPromptResolution()
+      await this.flushEmits()
+
+      if (opts.reject) pending.reject(opts.reject)
+      else pending.resolve(reason)
+
+      if (this.promptAckFallbackTimer) {
+        clearTimeout(this.promptAckFallbackTimer)
+        this.promptAckFallbackTimer = null
+      }
+
+      this.pendingTurn = null
+      this.inAgentLoop = false
+      this.completingTurn = false
+      this.sawAgentActivity = false
+      this.currentAgentMessageId = null
+
+      const proceedQueue = opts.proceedQueue ?? true
+      const next = proceedQueue ? this.turnQueue.shift() : undefined
+      if (next) {
+        this.emit({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
+        })
+        this.startTurn(next)
+      } else {
         this.emit({
           sessionUpdate: 'session_info_update',
           _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
         })
-      })
-      void err
-    })
+      }
+    })()
   }
 
   private handlePiEvent(ev: PiRpcEvent) {
@@ -395,17 +420,19 @@ export class PiAcpSession {
 
     switch (type) {
       case 'extension_ui_request': {
-        void handleExtensionUiRequest({ event: ev, conn: this.conn, proc: this.proc }).catch(() => {})
+        this.handleExtensionUiRequest(ev)
         break
       }
 
       case 'message_update': {
+        this.sawAgentActivity = true
         const ame = (ev as any).assistantMessageEvent
 
         // Stream assistant text.
         if (ame?.type === 'text_delta' && typeof ame.delta === 'string') {
           this.emit({
             sessionUpdate: 'agent_message_chunk',
+            ...(this.currentAgentMessageId ? { messageId: this.currentAgentMessageId } : {}),
             content: { type: 'text', text: ame.delta } satisfies ContentBlock
           })
           break
@@ -482,6 +509,7 @@ export class PiAcpSession {
       }
 
       case 'tool_execution_start': {
+        this.sawAgentActivity = true
         const toolCallId = String((ev as any).toolCallId ?? crypto.randomUUID())
         const toolName = String((ev as any).toolName ?? 'tool')
         const args = (ev as any).args
@@ -641,6 +669,7 @@ export class PiAcpSession {
       }
 
       case 'agent_start': {
+        this.sawAgentActivity = true
         this.inAgentLoop = true
         break
       }
@@ -652,29 +681,7 @@ export class PiAcpSession {
       }
 
       case 'agent_end': {
-        // Ensure all updates derived from pi events are delivered before we resolve
-        // the ACP `session/prompt` request.
-        void this.flushEmits().finally(() => {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
-          this.pendingTurn?.resolve(reason)
-          this.pendingTurn = null
-          this.inAgentLoop = false
-
-          // Start next queued prompt, if any.
-          const next = this.turnQueue.shift()
-          if (next) {
-            this.emit({
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
-            })
-            this.startTurn(next)
-          } else {
-            this.emit({
-              sessionUpdate: 'session_info_update',
-              _meta: { piAcp: { queueDepth: 0, running: false } }
-            })
-          }
-        })
+        this.completeTurn(this.cancelRequested ? 'cancelled' : 'end_turn')
         break
       }
 
@@ -682,6 +689,27 @@ export class PiAcpSession {
         break
     }
   }
+
+  private handleExtensionUiRequest(ev: PiRpcEvent): void {
+    const method = String((ev as any).method ?? '')
+    const id = typeof (ev as any).id === 'string' ? ((ev as any).id as string) : undefined
+    const payload = normalizeExtensionUiRequest(this.sessionId, ev)
+
+    if (payload) this.emitCustomNotification(PI_EXTENSION_UI_EVENT_METHOD, payload)
+
+    if (id && shouldRespondToExtensionUiRequest(method)) {
+      void handleExtensionUiRequest({ event: ev, conn: this.conn, proc: this.proc }).catch(() => {
+        this.proc.sendExtensionUiResponse(id, method === 'confirm' ? { confirmed: false } : { cancelled: true })
+      })
+    }
+  }
+}
+
+function shouldRespondToExtensionUiRequest(method: string): boolean {
+  return (
+    isDialogExtensionUiMethod(method) ||
+    !['notify', 'setStatus', 'setWidget', 'setTitle', 'set_editor_text'].includes(method)
+  )
 }
 
 function formatAutoRetryMessage(ev: PiRpcEvent): string {
@@ -697,21 +725,4 @@ function formatAutoRetryMessage(ev: PiRpcEvent): string {
   if (delayMs > 0 && delaySeconds === 0) delaySeconds = 1
 
   return `Retrying (attempt ${attempt}/${maxAttempts}, waiting ${delaySeconds}s)...`
-}
-
-function toToolKind(toolName: string): ToolKind {
-  switch (toolName) {
-    case 'read':
-      return 'read'
-    case 'write':
-    case 'edit':
-      return 'edit'
-    case 'bash':
-      // Many ACP clients render `execute` tool calls only via the terminal APIs.
-      // Since this adapter lets pi execute locally (no client terminal delegation),
-      // we report bash as `other` so clients show inline text output blocks.
-      return 'other'
-    default:
-      return 'other'
-  }
 }

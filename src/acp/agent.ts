@@ -10,11 +10,12 @@ import {
   type ListSessionsResponse,
   type LoadSessionRequest,
   type LoadSessionResponse,
-  type ModelInfo,
   type NewSessionRequest,
   type PromptRequest,
   type PromptResponse,
   type SessionInfo,
+  type SetSessionConfigOptionRequest,
+  type SetSessionConfigOptionResponse,
   type SetSessionModeRequest,
   type SetSessionModeResponse,
   type StopReason
@@ -31,13 +32,19 @@ import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slas
 import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
+import { PI_EXTENSION_UI_EVENT_METHOD } from './extension-ui.js'
+import {
+  getSessionConfigOptions,
+  isThinkingLevel,
+  MODEL_CONFIG_ID,
+  resolveModelSelection,
+  THINKING_CONFIG_ID
+} from './session-config.js'
 import { isAbsolute } from 'node:path'
 import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
 import { join, dirname, basename } from 'node:path'
 import { spawnSync } from 'node:child_process'
-
-type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 
 function builtinAvailableCommands(): AvailableCommand[] {
   return [
@@ -93,6 +100,24 @@ function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableC
   }
 
   return out
+}
+
+export async function discoverAvailableCommands(
+  proc: Pick<PiRpcProcess, 'getCommands'>,
+  fileCommands: ReturnType<typeof loadSlashCommands>,
+  enableSkillCommands: boolean
+): Promise<AvailableCommand[]> {
+  try {
+    const pi = (await proc.getCommands()) as unknown
+    const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
+      enableSkillCommands,
+      includeExtensionCommands: true
+    })
+
+    return mergeCommands(commands, builtinAvailableCommands())
+  } catch {
+    return mergeCommands(toAvailableCommands(fileCommands), builtinAvailableCommands())
+  }
 }
 import { fileURLToPath } from 'node:url'
 
@@ -160,9 +185,14 @@ export class PiAcpAgent implements ACPAgent {
           embeddedContext: process.env.PI_ACP_ENABLE_EMBEDDED_CONTEXT === 'true'
         },
         sessionCapabilities: {
-          // **UNSTABLE** ACP capability used by Zed's codex-acp adapter.
-          // Enables a native session picker in clients that support it.
+          // Enables a native session picker in clients that support session/list.
           list: {}
+        },
+        _meta: {
+          piAcp: {
+            extensionUiEvents: true,
+            extensionUiEventMethod: PI_EXTENSION_UI_EVENT_METHOD
+          }
         }
       }
     }
@@ -245,8 +275,7 @@ export class PiAcpAgent implements ACPAgent {
       )
     }
 
-    const models = await getModelState(session.proc, { state, availableModels })
-    const thinking = await getThinkingState(session.proc, { state })
+    const configOptions = await getSessionConfigOptions(session.proc, { state, availableModels })
 
     const quietStartup = getQuietStartup(params.cwd)
     const updateNotice = buildUpdateNotice()
@@ -263,20 +292,20 @@ export class PiAcpAgent implements ACPAgent {
           updateNotice
         })
 
-    if (preludeText)
+    if (preludeText) {
       session.setStartupInfo(preludeText)
+    }
 
-      // Policy: within a single ACP connection (one client window), keep only one live pi subprocess.
-      // This avoids leaking subprocesses when clients start new sessions but don't explicitly close old ones.
-      // It does NOT affect other client windows because they run in separate agent processes.
-      //
-      // (Tests sometimes stub out `this.sessions`, so guard the call.)
+    // Policy: within a single ACP connection (one client window), keep only one live pi subprocess.
+    // This avoids leaking subprocesses when clients start new sessions but don't explicitly close old ones.
+    // It does NOT affect other client windows because they run in separate agent processes.
+    //
+    // (Tests sometimes stub out `this.sessions`, so guard the call.)
     ;(this.sessions as any).closeAllExcept?.(session.sessionId)
 
     const response = {
       sessionId: session.sessionId,
-      models,
-      modes: thinking,
+      configOptions,
       _meta: {
         piAcp: {
           startupInfo: preludeText || null
@@ -293,30 +322,13 @@ export class PiAcpAgent implements ACPAgent {
     // So we must send this *after* the session/new response has been delivered.
     setTimeout(() => {
       void (async () => {
-        try {
-          const pi = (await session.proc.getCommands()) as any
-          const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
-            enableSkillCommands,
-            includeExtensionCommands: false
-          })
-
-          await this.conn.sessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'available_commands_update',
-              availableCommands: mergeCommands(commands, builtinAvailableCommands())
-            }
-          })
-          return
-        } catch {
-          // Fall back to file-based prompt templates (legacy behavior).
-        }
+        const availableCommands = await discoverAvailableCommands(session.proc, fileCommands, enableSkillCommands)
 
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'available_commands_update',
-            availableCommands: mergeCommands(toAvailableCommands(fileCommands), builtinAvailableCommands())
+            availableCommands
           }
         })
       })()
@@ -793,7 +805,7 @@ export class PiAcpAgent implements ACPAgent {
     await session.cancel()
   }
 
-  async unstable_listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+  async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
     // ACP: filter by cwd if provided.
     // Zed currently sends `{}` (no cwd), so we default to the last session cwd to
     // emulate pi's `/resume` picker (project-scoped).
@@ -946,12 +958,10 @@ export class PiAcpAgent implements ACPAgent {
       }
     }
 
-    const models = await getModelState(proc)
-    const thinking = await getThinkingState(proc)
+    const configOptions = await getSessionConfigOptions(proc)
 
     const response = {
-      models,
-      modes: thinking,
+      configOptions,
       _meta: {
         piAcp: {
           startupInfo: null
@@ -962,30 +972,13 @@ export class PiAcpAgent implements ACPAgent {
     // Advertise slash commands after the response so the client knows the session exists.
     setTimeout(() => {
       void (async () => {
-        try {
-          const pi = (await proc.getCommands()) as any
-          const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
-            enableSkillCommands,
-            includeExtensionCommands: false
-          })
-
-          await this.conn.sessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'available_commands_update',
-              availableCommands: mergeCommands(commands, builtinAvailableCommands())
-            }
-          })
-          return
-        } catch {
-          // fall back
-        }
+        const availableCommands = await discoverAvailableCommands(proc, fileCommands, enableSkillCommands)
 
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'available_commands_update',
-            availableCommands: mergeCommands(toAvailableCommands(fileCommands), builtinAvailableCommands())
+            availableCommands
           }
         })
       })()
@@ -994,38 +987,29 @@ export class PiAcpAgent implements ACPAgent {
     return response
   }
 
-  async unstable_setSessionModel(params: { sessionId: string; modelId: string }): Promise<void> {
+  async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
     const session = this.sessions.get(params.sessionId)
 
-    // Accept either:
-    //  - "provider/model" (preferred, matches how we advertise)
-    //  - "model" (fallback, we try to resolve via available models)
-    let provider: string | null = null
-    let modelId: string | null = null
-
-    if (params.modelId.includes('/')) {
-      const [p, ...rest] = params.modelId.split('/')
-      provider = p
-      modelId = rest.join('/')
-    } else {
-      modelId = params.modelId
-    }
-
-    if (!provider) {
-      const data = (await session.proc.getAvailableModels()) as any
-      const models: any[] = Array.isArray(data?.models) ? data.models : []
-      const found = models.find(m => String(m?.id) === modelId)
-      if (found) {
-        provider = String(found.provider)
-        modelId = String(found.id)
+    if (params.configId === MODEL_CONFIG_ID) {
+      if (typeof params.value !== 'string') {
+        throw RequestError.invalidParams('Model config value must be a string')
       }
+
+      const { provider, modelId } = await resolveModelSelection(session.proc, params.value)
+      await session.proc.setModel(provider, modelId)
+    } else if (params.configId === THINKING_CONFIG_ID) {
+      if (typeof params.value !== 'string' || !isThinkingLevel(params.value)) {
+        throw RequestError.invalidParams(`Unknown thinking level: ${String(params.value)}`)
+      }
+
+      await session.proc.setThinkingLevel(params.value)
+    } else {
+      throw RequestError.invalidParams(`Unknown configId: ${params.configId}`)
     }
 
-    if (!provider || !modelId) {
-      throw RequestError.invalidParams(`Unknown modelId: ${params.modelId}`)
+    return {
+      configOptions: await getSessionConfigOptions(session.proc)
     }
-
-    await session.proc.setModel(provider, modelId)
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -1038,7 +1022,6 @@ export class PiAcpAgent implements ACPAgent {
 
     await session.proc.setThinkingLevel(mode)
 
-    // Let the client know the current mode changed (keeps the dropdown in sync).
     void this.conn.sessionUpdate({
       sessionId: session.sessionId,
       update: {
@@ -1048,116 +1031,6 @@ export class PiAcpAgent implements ACPAgent {
     })
 
     return {}
-  }
-}
-
-function isThinkingLevel(x: string): x is ThinkingLevel {
-  return x === 'off' || x === 'minimal' || x === 'low' || x === 'medium' || x === 'high' || x === 'xhigh'
-}
-
-async function getThinkingState(
-  proc: PiRpcProcess,
-  pre?: { state?: any | null }
-): Promise<{
-  availableModes: Array<{
-    id: string
-    name: string
-    description?: string | null
-  }>
-  currentModeId: string
-}> {
-  // Ask pi for current thinking level.
-  let current: ThinkingLevel = 'medium'
-
-  const state =
-    pre?.state ??
-    (await (async () => {
-      try {
-        return (await proc.getState()) as any
-      } catch {
-        return null
-      }
-    })())
-
-  const tl = typeof state?.thinkingLevel === 'string' ? state.thinkingLevel : null
-  if (tl && isThinkingLevel(tl)) current = tl
-
-  const available: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh']
-
-  return {
-    currentModeId: current,
-    availableModes: available.map(id => ({
-      id,
-      name: `Thinking: ${id}`,
-      description: null
-    }))
-  }
-}
-
-async function getModelState(
-  proc: PiRpcProcess,
-  pre?: { state?: any | null; availableModels?: any | null }
-): Promise<{
-  availableModels: ModelInfo[]
-  currentModelId: string
-} | null> {
-  // Ask pi for available models.
-  let availableModels: ModelInfo[] = []
-
-  const data =
-    pre?.availableModels ??
-    (await (async () => {
-      try {
-        return (await proc.getAvailableModels()) as any
-      } catch {
-        return null
-      }
-    })())
-
-  const models: any[] = Array.isArray(data?.models) ? data.models : []
-  availableModels = models
-    .map(m => {
-      const provider = String(m?.provider ?? '').trim()
-      const id = String(m?.id ?? '').trim()
-      if (!provider || !id) return null
-
-      const name = String(m?.name ?? id)
-      return {
-        modelId: `${provider}/${id}`,
-        name: `${provider}/${name}`,
-        description: null
-      } satisfies ModelInfo
-    })
-    .filter(Boolean) as ModelInfo[]
-
-  // Ask pi what model is currently active.
-  let currentModelId: string | null = null
-
-  const state =
-    pre?.state ??
-    (await (async () => {
-      try {
-        return (await proc.getState()) as any
-      } catch {
-        return null
-      }
-    })())
-
-  const model = state?.model
-  if (model && typeof model === 'object') {
-    const provider = String((model as any).provider ?? '').trim()
-    const id = String((model as any).id ?? '').trim()
-    if (provider && id) currentModelId = `${provider}/${id}`
-  }
-
-  if (!availableModels.length && !currentModelId) return null
-
-  // Fallback if current model is unknown: use first in list.
-  if (!currentModelId) currentModelId = availableModels[0]?.modelId ?? 'default'
-
-  return {
-    availableModels,
-    currentModelId
   }
 }
 

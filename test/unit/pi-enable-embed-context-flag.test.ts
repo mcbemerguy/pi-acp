@@ -33,3 +33,13 @@ test("PI_ACP_ENABLE_EMBEDDED_CONTEXT: 'false' keeps embeddedContext disabled", a
 test("PI_ACP_ENABLE_EMBEDDED_CONTEXT: 'true' enables embeddedContext", async () => {
   assert.equal(await initializeWithEmbeddedContext('true'), true)
 })
+
+test('PiAcpAgent: advertises Pi ACP extension UI custom notifications in capability metadata', async () => {
+  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
+  const res = await agent.initialize({ protocolVersion: 1 } as any)
+
+  assert.deepEqual(res.agentCapabilities?._meta?.piAcp, {
+    extensionUiEvents: true,
+    extensionUiEventMethod: '_pi/extension_ui_event'
+  })
+})

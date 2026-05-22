@@ -45,7 +45,24 @@ child.stdout.on('data', chunk => {
     }
 
     if (msg?.id === 2 && msg?.result?.sessionId && !sessionId) {
-      sessionId = msg.result.sessionId
+      const result = msg.result
+      const configOptions = Array.isArray(result.configOptions) ? result.configOptions : []
+      const categories = configOptions.map(option => option.category)
+
+      if (Object.prototype.hasOwnProperty.call(result, 'models')) {
+        throw new Error('session/new unexpectedly returned experimental models field')
+      }
+      if (Object.prototype.hasOwnProperty.call(result, 'modes')) {
+        throw new Error('session/new unexpectedly returned experimental modes field')
+      }
+      if (!categories.includes('model')) {
+        throw new Error('session/new did not return model config option')
+      }
+      if (!categories.includes('thought_level')) {
+        throw new Error('session/new did not return thought_level config option')
+      }
+
+      sessionId = result.sessionId
       send({
         jsonrpc: '2.0',
         id: 3,

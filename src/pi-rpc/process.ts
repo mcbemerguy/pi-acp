@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import * as readline from 'node:readline'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
+import { stripAnsi } from '../shared/ansi.js'
 
 export class PiRpcSpawnError extends Error {
   /** Underlying spawn error code, e.g. ENOENT, EACCES */
@@ -14,23 +15,11 @@ export class PiRpcSpawnError extends Error {
   }
 }
 
-const ESC = String.fromCharCode(0x1b)
-const CSI = String.fromCharCode(0x9b)
-
-const ANSI_ESCAPE_REGEX = new RegExp(
-  `[${ESC}${CSI}][[\\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]`,
-  'g'
-)
-
-function stripAnsi(s: string): string {
-  // Basic ANSI escape stripping (colors, cursor movement, etc.)
-  return s.replace(ANSI_ESCAPE_REGEX, '')
-}
-
 type PiRpcCommand =
   | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
   | { type: 'abort'; id?: string }
   | { type: 'get_state'; id?: string }
+  | { type: 'extension_ui_response'; id: string; cancelled?: boolean; value?: unknown; confirmed?: boolean }
   // Model
   | { type: 'get_available_models'; id?: string }
   | { type: 'set_model'; id?: string; provider: string; modelId: string }
@@ -74,6 +63,7 @@ type SpawnParams = {
 export function buildPiRpcSpawnEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   return {
     ...env,
+    PI_ACP: '1',
     PI_ACP_RPC: '1'
   }
 }
@@ -243,11 +233,9 @@ export class PiRpcProcess {
   }
 
   sendExtensionUiResponse(id: string, payload: Record<string, unknown>): Promise<void> {
-    const line = JSON.stringify({ type: 'extension_ui_response', id, ...payload }) + '\n'
-
     return new Promise<void>((resolve, reject) => {
       try {
-        this.child.stdin.write(line, err => {
+        this.writeLine({ type: 'extension_ui_response', id, ...payload }, err => {
           if (err) reject(err)
           else resolve()
         })
@@ -255,6 +243,13 @@ export class PiRpcProcess {
         reject(e)
       }
     })
+  }
+
+  respondExtensionUi(
+    id: string,
+    response: { cancelled?: boolean; value?: unknown; confirmed?: boolean } = { cancelled: true }
+  ): void {
+    this.writeLine({ type: 'extension_ui_response', id, ...response })
   }
 
   async getState(): Promise<unknown> {
@@ -340,13 +335,11 @@ export class PiRpcProcess {
     const id = crypto.randomUUID()
     const withId = { ...cmd, id }
 
-    const line = JSON.stringify(withId) + '\n'
-
     return new Promise<PiRpcResponse>((resolve, reject) => {
       this.pending.set(id, { resolve, reject })
 
       try {
-        this.child.stdin.write(line, err => {
+        this.writeLine(withId, err => {
           if (err) {
             this.pending.delete(id)
             reject(err)
@@ -357,5 +350,9 @@ export class PiRpcProcess {
         reject(e)
       }
     })
+  }
+
+  private writeLine(msg: PiRpcCommand, cb?: (err?: Error | null) => void): void {
+    this.child.stdin.write(`${JSON.stringify(msg)}\n`, cb)
   }
 }

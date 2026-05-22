@@ -13,7 +13,11 @@ test('PiAcpAgent: newSession returns a helpful Internal error when pi is not ins
 
     await assert.rejects(
       () => agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any),
-      (e: any) => e?.code === -32603 && String(e?.message ?? '').toLowerCase().includes('executable not found')
+      (e: any) =>
+        e?.code === -32603 &&
+        String(e?.message ?? '')
+          .toLowerCase()
+          .includes('executable not found')
     )
   } finally {
     if (prevPiCmd == null) delete process.env.PI_ACP_PI_COMMAND

@@ -10,7 +10,7 @@ import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 // We mock PiRpcProcess.spawn so loadSession doesn't actually spawn `pi`.
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 
-test('PiAcpAgent: unstable_listSessions lists pi sessions and loadSession replays history', async () => {
+test('PiAcpAgent: listSessions lists pi sessions and loadSession replays history', async () => {
   // Create a fake PI_CODING_AGENT_DIR with one session.
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-test-'))
   const sessionsDir = join(root, 'sessions', '--tmp--project--')
@@ -62,7 +62,7 @@ test('PiAcpAgent: unstable_listSessions lists pi sessions and loadSession replay
     const agent = new PiAcpAgent(asAgentConn(conn))
 
     // 1) list sessions
-    const listed = await agent.unstable_listSessions({ cwd: null, cursor: null, _meta: null } as any)
+    const listed = await agent.listSessions({ cwd: null, cursor: null, _meta: null } as any)
     assert.ok(listed.sessions.length >= 1)
 
     const s = listed.sessions.find(x => x.sessionId === 'sess-1')
@@ -76,7 +76,7 @@ test('PiAcpAgent: unstable_listSessions lists pi sessions and loadSession replay
     ;(PiRpcProcess as any).spawn = async (params: any) => {
       // ensure loadSession resolves to some jsonl that ends with our expected filename
       assert.ok(typeof params.sessionPath === 'string')
-      assert.ok(params.sessionPath.endsWith('/0000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jsonl'))
+      assert.ok(params.sessionPath.replace(/\\/g, '/').endsWith('/0000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jsonl'))
 
       return {
         onEvent: () => () => {
@@ -88,13 +88,24 @@ test('PiAcpAgent: unstable_listSessions lists pi sessions and loadSession replay
             { role: 'assistant', content: [{ type: 'text', text: 'Hi there!' }] }
           ]
         }),
-        getAvailableModels: async () => ({ models: [] }),
-        getState: async () => ({ thinkingLevel: 'medium' })
+        getAvailableModels: async () => ({ models: [{ provider: 'test', id: 'model', name: 'Model' }] }),
+        getState: async () => ({ thinkingLevel: 'medium', model: { provider: 'test', id: 'model' } })
       } as any
     }
 
     try {
-      await agent.loadSession({ sessionId: 'sess-1', cwd: '/tmp/project', mcpServers: [], _meta: null } as any)
+      const response = await agent.loadSession({
+        sessionId: 'sess-1',
+        cwd: '/tmp/project',
+        mcpServers: [],
+        _meta: null
+      } as any)
+
+      assert.ok(Array.isArray(response.configOptions))
+      assert.equal((response as any).models, undefined)
+      assert.equal((response as any).modes, undefined)
+      assert.equal(response.configOptions?.find(option => option.id === 'model')?.category, 'model')
+      assert.equal(response.configOptions?.find(option => option.id === 'thinking_level')?.category, 'thought_level')
 
       // loadSession should have replayed messages as session/update notifications.
       const texts = conn.updates
