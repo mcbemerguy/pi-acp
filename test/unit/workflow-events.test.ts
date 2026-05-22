@@ -315,6 +315,8 @@ test('WorkflowEventMapper maps child tool events with correlated stable IDs', ()
 
   assert.equal(updates[1]!.sessionUpdate, 'tool_call_update')
   assert.equal((updates[1] as any).toolCallId, 'workflow:r1:step:code:tool:tool-1')
+  assert.equal((updates[1] as any).title, 'read')
+  assert.equal((updates[1] as any).kind, 'read')
   assert.equal((updates[1] as any).status, 'completed')
   assert.equal((updates[1] as any).content[0].content.text, 'done')
 })

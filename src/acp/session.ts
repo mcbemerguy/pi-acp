@@ -3,7 +3,8 @@ import type {
   ContentBlock,
   McpServer,
   SessionUpdate,
-  ToolCallContent
+  ToolCallContent,
+  ToolKind
 } from '@agentclientprotocol/sdk'
 import { RequestError } from '@agentclientprotocol/sdk'
 import { maybeAuthRequiredError } from './auth-required.js'
@@ -42,6 +43,11 @@ type QueuedTurn = {
   images: unknown[]
   resolve: (reason: StopReason) => void
   reject: (err: unknown) => void
+}
+
+type ToolMetadata = {
+  title: string
+  kind: ToolKind
 }
 
 function findUniqueLineNumber(text: string, needle: string): number | undefined {
@@ -203,6 +209,7 @@ export class PiAcpSession {
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
   private currentToolCalls = new Map<string, 'pending' | 'in_progress'>()
+  private currentToolMetadata = new Map<string, ToolMetadata>()
 
   // pi can emit multiple `turn_end` events for a single user prompt (e.g. after tool_use).
   // The overall agent loop completes when `agent_end` is emitted.
@@ -490,22 +497,28 @@ export class PiAcpSession {
 
             if (!existingStatus) {
               if (toolName) {
+                const metadata = { title: toolName, kind: toToolKind(toolName) }
                 this.currentToolCalls.set(toolCallId, 'pending')
+                this.currentToolMetadata.set(toolCallId, metadata)
                 this.emit({
                   sessionUpdate: 'tool_call',
                   toolCallId,
-                  title: toolName,
-                  kind: toToolKind(toolName),
+                  title: metadata.title,
+                  kind: metadata.kind,
                   status,
                   locations,
                   rawInput
                 })
               }
             } else {
+              const metadata = toolName
+                ? { title: toolName, kind: toToolKind(toolName) }
+                : this.currentToolMetadata.get(toolCallId)
+              if (metadata) this.currentToolMetadata.set(toolCallId, metadata)
               this.emit({
                 sessionUpdate: 'tool_call_update',
                 toolCallId,
-                ...(toolName ? { title: toolName, kind: toToolKind(toolName) } : {}),
+                ...(metadata ? { title: metadata.title, kind: metadata.kind } : {}),
                 status,
                 locations,
                 rawInput
@@ -546,14 +559,17 @@ export class PiAcpSession {
 
         const locations = toToolCallLocations(args, this.cwd, line)
 
+        const metadata = { title: toolName, kind: toToolKind(toolName) }
+        this.currentToolMetadata.set(toolCallId, metadata)
+
         // If we already surfaced the tool call while the model streamed it, just transition.
         if (!this.currentToolCalls.has(toolCallId)) {
           this.currentToolCalls.set(toolCallId, 'in_progress')
           this.emit({
             sessionUpdate: 'tool_call',
             toolCallId,
-            title: toolName,
-            kind: toToolKind(toolName),
+            title: metadata.title,
+            kind: metadata.kind,
             status: 'in_progress',
             locations,
             rawInput: args
@@ -563,8 +579,8 @@ export class PiAcpSession {
           this.emit({
             sessionUpdate: 'tool_call_update',
             toolCallId,
-            title: toolName,
-            kind: toToolKind(toolName),
+            title: metadata.title,
+            kind: metadata.kind,
             status: 'in_progress',
             locations,
             rawInput: args
@@ -580,10 +596,12 @@ export class PiAcpSession {
 
         const partial = (ev as any).partialResult
         const text = toolResultToText(partial)
+        const metadata = this.currentToolMetadata.get(toolCallId)
 
         this.emit({
           sessionUpdate: 'tool_call_update',
           toolCallId,
+          ...(metadata ? { title: metadata.title, kind: metadata.kind } : {}),
           status: 'in_progress',
           content: text
             ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
@@ -631,15 +649,19 @@ export class PiAcpSession {
           content = [{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[]
         }
 
+        const metadata = this.currentToolMetadata.get(toolCallId)
+
         this.emit({
           sessionUpdate: 'tool_call_update',
           toolCallId,
+          ...(metadata ? { title: metadata.title, kind: metadata.kind } : {}),
           status: isError ? 'failed' : 'completed',
           content,
           rawOutput: result
         })
 
         this.currentToolCalls.delete(toolCallId)
+        this.currentToolMetadata.delete(toolCallId)
         this.editSnapshots.delete(toolCallId)
         break
       }

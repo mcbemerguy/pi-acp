@@ -1,4 +1,4 @@
-import type { ContentBlock, SessionUpdate, ToolCallContent } from '@agentclientprotocol/sdk'
+import type { ContentBlock, SessionUpdate, ToolCallContent, ToolKind } from '@agentclientprotocol/sdk'
 import { createHash } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
@@ -42,6 +42,11 @@ type ChildMessageIdentity = {
   hasExplicitId: boolean
 }
 
+type ChildToolMetadata = {
+  title: string
+  kind: ToolKind
+}
+
 export function isWorkflowCommandPrompt(message: string): boolean {
   return /^\s*\/workflow:[^\s]+(?:\s|$)/.test(message)
 }
@@ -52,6 +57,7 @@ export class WorkflowEventMapper {
   private readonly runs = new Set<string>()
   private readonly steps = new Map<string, StepPlan>()
   private readonly childTools = new Set<string>()
+  private readonly childToolMetadata = new Map<string, ChildToolMetadata>()
   private readonly childTextDeltas = new Set<string>()
   private readonly pendingNoIdTextDeltas = new Set<string>()
   private readonly noIdMessageSequences = new Map<string, number>()
@@ -194,12 +200,14 @@ export class WorkflowEventMapper {
     const updates: SessionUpdate[] = []
 
     if (childType === 'tool_execution_start') {
+      const metadata = { title: toolName, kind: toToolKind(toolName) }
       this.childTools.add(toolCallId)
+      this.childToolMetadata.set(toolCallId, metadata)
       updates.push({
         sessionUpdate: 'tool_call',
         toolCallId,
-        title: toolName,
-        kind: toToolKind(toolName),
+        title: metadata.title,
+        kind: metadata.kind,
         status: 'in_progress',
         locations,
         rawInput: withWorkflowMeta(args, meta),
@@ -208,13 +216,21 @@ export class WorkflowEventMapper {
       return updates
     }
 
+    let metadata = this.childToolMetadata.get(toolCallId)
+    if (!metadata && toolName !== 'tool') {
+      metadata = { title: toolName, kind: toToolKind(toolName) }
+      this.childToolMetadata.set(toolCallId, metadata)
+    }
+
     if (!this.childTools.has(toolCallId)) {
+      metadata = metadata ?? { title: toolName, kind: toToolKind(toolName) }
       this.childTools.add(toolCallId)
+      this.childToolMetadata.set(toolCallId, metadata)
       updates.push({
         sessionUpdate: 'tool_call',
         toolCallId,
-        title: toolName,
-        kind: toToolKind(toolName),
+        title: metadata.title,
+        kind: metadata.kind,
         status: 'in_progress',
         locations,
         rawInput: withWorkflowMeta(args, meta),
@@ -229,11 +245,13 @@ export class WorkflowEventMapper {
     updates.push({
       sessionUpdate: 'tool_call_update',
       toolCallId,
+      ...(metadata ? { title: metadata.title, kind: metadata.kind } : {}),
       status: childType === 'tool_execution_end' ? (event.isError ? 'failed' : 'completed') : 'in_progress',
       content,
       rawOutput: withWorkflowMeta(result, meta),
       _meta: { piWorkflow: meta }
     })
+    if (childType === 'tool_execution_end') this.childToolMetadata.delete(toolCallId)
     return updates
   }
 

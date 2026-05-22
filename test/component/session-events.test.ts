@@ -99,10 +99,14 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
 
   assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
   assert.equal((conn.updates[1]!.update as any).toolCallId, 't1')
+  assert.equal((conn.updates[1]!.update as any).title, 'bash')
+  assert.equal((conn.updates[1]!.update as any).kind, 'execute')
   assert.equal((conn.updates[1]!.update as any).status, 'in_progress')
 
   assert.equal(conn.updates[2]!.update.sessionUpdate, 'tool_call_update')
   assert.equal((conn.updates[2]!.update as any).toolCallId, 't1')
+  assert.equal((conn.updates[2]!.update as any).title, 'bash')
+  assert.equal((conn.updates[2]!.update as any).kind, 'execute')
   assert.equal((conn.updates[2]!.update as any).status, 'completed')
 })
 
