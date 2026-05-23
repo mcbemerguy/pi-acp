@@ -85,6 +85,14 @@ export class WorkflowEventMapper {
       case 'step_update':
       case 'step_end':
         return this.mapStep(record, runId, type)
+      case 'inline_subworkflow_start':
+        return this.mapStep({ ...record, stepType: 'workflow', status: 'running' }, runId, 'step_start')
+      case 'inline_subworkflow_end':
+        return this.mapStep(
+          { ...record, stepType: 'workflow', status: stringField(record.status) ?? 'completed' },
+          runId,
+          'step_end'
+        )
       case 'child_pi_event':
         return this.mapChildPiEvent(record, runId)
       default:
@@ -134,6 +142,9 @@ export class WorkflowEventMapper {
         _meta: { piWorkflow: meta }
       })
     }
+
+    const finalPlan = this.completeOpenPlanEntries()
+    if (finalPlan) updates.push(finalPlan)
 
     updates.push({
       sessionUpdate: 'tool_call_update',
@@ -355,6 +366,16 @@ export class WorkflowEventMapper {
   private advanceNoIdChildMessageSequence(runId: string, stepId: string, childSessionId: string | undefined): void {
     const baseKey = childMessageNoIdBaseKey(runId, stepId, childSessionId)
     this.noIdMessageSequences.set(baseKey, (this.noIdMessageSequences.get(baseKey) ?? 0) + 1)
+  }
+
+  private completeOpenPlanEntries(): SessionUpdate | null {
+    let changed = false
+    for (const step of this.steps.values()) {
+      if (step.status !== 'in_progress') continue
+      step.status = 'completed'
+      changed = true
+    }
+    return changed ? this.planUpdate() : null
   }
 
   private planUpdate(): SessionUpdate | null {

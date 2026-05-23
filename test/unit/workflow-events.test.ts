@@ -95,6 +95,59 @@ test('WorkflowEventMapper maps workflow run events and step plan updates to ACP 
   assert.equal(link.content.uri, pathToFileURL('/runs/r1/audit.md').href)
 })
 
+test('WorkflowEventMapper maps inline subworkflow completion to a completed plan entry', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+  const updates = [
+    ...mapper.map({
+      type: 'inline_subworkflow_start',
+      timestamp: 't1',
+      runId: 'r1',
+      workflowId: 'wf',
+      stepId: 'review-fix',
+      childWorkflowId: 'review-fix',
+      status: 'running'
+    }),
+    ...mapper.map({
+      type: 'inline_subworkflow_end',
+      timestamp: 't2',
+      runId: 'r1',
+      workflowId: 'wf',
+      stepId: 'review-fix',
+      childWorkflowId: 'review-fix',
+      status: 'completed'
+    })
+  ]
+
+  const plans = updates.filter(update => update.sessionUpdate === 'plan') as any[]
+  assert.equal(plans.at(-1).entries[0].content, 'Workflow step: review-fix (workflow)')
+  assert.equal(plans.at(-1).entries[0].status, 'completed')
+})
+
+test('WorkflowEventMapper completes open plan entries when a workflow run ends', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+  const updates = [
+    ...mapper.map({
+      type: 'step_start',
+      timestamp: 't1',
+      runId: 'r1',
+      workflowId: 'wf',
+      stepId: 'review-fix',
+      stepType: 'workflow',
+      status: 'running'
+    }),
+    ...mapper.map({
+      type: 'run_end',
+      timestamp: 't2',
+      runId: 'r1',
+      workflowId: 'wf',
+      status: 'completed'
+    })
+  ]
+
+  const plans = updates.filter(update => update.sessionUpdate === 'plan') as any[]
+  assert.equal(plans.at(-1).entries[0].status, 'completed')
+})
+
 test('WorkflowEventMapper maps distinct child tool updates that share a timestamp', () => {
   const mapper = new WorkflowEventMapper('/repo')
   const base = {
