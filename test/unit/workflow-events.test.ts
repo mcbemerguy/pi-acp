@@ -4,7 +4,12 @@ import { mkdirSync, rmSync, writeFileSync, appendFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { WorkflowEventMapper, WorkflowEventMonitor, isWorkflowCommandPrompt } from '../../src/acp/workflow-events.js'
+import {
+  WorkflowEventMapper,
+  WorkflowEventMonitor,
+  isWorkflowCommandPrompt,
+  parseWorkflowCommandPrompt
+} from '../../src/acp/workflow-events.js'
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -13,6 +18,14 @@ test('isWorkflowCommandPrompt recognizes detached workflow slash commands', () =
   assert.equal(isWorkflowCommandPrompt('  /workflow:review'), true)
   assert.equal(isWorkflowCommandPrompt('/workflows:review'), false)
   assert.equal(isWorkflowCommandPrompt('hello /workflow:review'), false)
+  assert.deepEqual(parseWorkflowCommandPrompt('/workflow:review -- do it'), {
+    workflowId: 'review',
+    initialTaskMessage: 'do it'
+  })
+  assert.deepEqual(parseWorkflowCommandPrompt('/workflow:review do it'), {
+    workflowId: 'review',
+    initialTaskMessage: 'do it'
+  })
 })
 
 test('WorkflowEventMapper maps workflow run events and step plan updates to ACP updates', () => {
@@ -446,6 +459,78 @@ test('WorkflowEventMonitor tails new run artifacts and tolerates malformed parti
   await monitor.stopAfterPromptResolution()
   assert.equal(updates.filter(update => update.sessionUpdate === 'tool_call').length, 1)
   assert.ok(updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:r1'))
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('WorkflowEventMonitor filters workflow runs by cwd, workflow id, task, and locks to the accepted run', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-filter-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  mkdirSync(workflowRunsDir, { recursive: true })
+  const updates: any[] = []
+  const monitor = new WorkflowEventMonitor('/repo', update => updates.push(update), {
+    workflowRunsDir,
+    pollIntervalMs: 10,
+    graceMs: 30,
+    target: { workflowId: 'plan-discussion', initialTaskMessage: 'task', parentSessionId: 'session-1' }
+  })
+
+  monitor.start()
+
+  const writeRun = (id: string, run: Record<string, unknown>) => {
+    const runDir = join(workflowRunsDir, id)
+    mkdirSync(runDir)
+    writeFileSync(join(runDir, 'run.json'), JSON.stringify(run), 'utf8')
+    writeFileSync(
+      join(runDir, 'events.jsonl'),
+      `${JSON.stringify({ type: 'run_start', timestamp: `t-${id}`, runId: id, workflowId: run.workflowId, rootWorkflowId: run.workflowId, cwd: run.cwd, status: 'running' })}\n`,
+      'utf8'
+    )
+  }
+
+  writeRun('wrong-cwd', {
+    id: 'wrong-cwd',
+    workflowId: 'plan-discussion',
+    cwd: '/other',
+    initialTaskMessage: 'task',
+    parentSessionId: 'session-1'
+  })
+  writeRun('wrong-workflow', {
+    id: 'wrong-workflow',
+    workflowId: 'code-review-fix',
+    cwd: '/repo',
+    initialTaskMessage: 'task',
+    parentSessionId: 'session-1'
+  })
+  writeRun('accepted', {
+    id: 'accepted',
+    workflowId: 'plan-discussion',
+    cwd: '/repo',
+    initialTaskMessage: 'task',
+    parentSessionId: 'session-1'
+  })
+
+  await wait(40)
+
+  writeRun('also-matching-but-late', {
+    id: 'also-matching-but-late',
+    workflowId: 'plan-discussion',
+    cwd: '/repo',
+    initialTaskMessage: 'task',
+    parentSessionId: 'session-1'
+  })
+  appendFileSync(
+    join(workflowRunsDir, 'accepted', 'events.jsonl'),
+    `${JSON.stringify({ type: 'run_end', timestamp: 't-end', runId: 'accepted', workflowId: 'plan-discussion', rootWorkflowId: 'plan-discussion', cwd: '/repo', status: 'completed' })}\n`
+  )
+
+  await monitor.stopAfterPromptResolution()
+  const workflowToolIds = updates
+    .filter(update => update.sessionUpdate === 'tool_call')
+    .map(update => update.toolCallId)
+  assert.deepEqual(workflowToolIds, ['workflow:accepted'])
+  assert.ok(
+    updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:accepted')
+  )
   rmSync(root, { recursive: true, force: true })
 })
 

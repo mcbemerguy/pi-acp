@@ -15,7 +15,7 @@ import { SessionStore } from './session-store.js'
 import { toolResultToText } from './translate/pi-tools.js'
 import { toToolCallLocations, toToolKind } from './translate/tool-metadata.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
-import { isWorkflowCommandPrompt, WorkflowEventMonitor } from './workflow-events.js'
+import { isWorkflowCommandPrompt, parseWorkflowCommandPrompt, WorkflowEventMonitor } from './workflow-events.js'
 import {
   handleExtensionUiRequest,
   isDialogExtensionUiMethod,
@@ -354,8 +354,11 @@ export class PiAcpSession {
       this.promptAckFallbackTimer = null
     }
     this.currentAgentMessageId = crypto.randomUUID()
+    const workflowTarget = parseWorkflowCommandPrompt(t.message)
     this.currentWorkflowMonitor = isWorkflowCommandPrompt(t.message)
-      ? new WorkflowEventMonitor(this.cwd, update => this.emit(update))
+      ? new WorkflowEventMonitor(this.cwd, update => this.emit(update), {
+          target: workflowTarget ? { ...workflowTarget, parentSessionId: this.sessionId } : null
+        })
       : null
     this.currentWorkflowMonitor?.start()
 

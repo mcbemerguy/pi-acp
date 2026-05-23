@@ -1,7 +1,7 @@
 import type { ContentBlock, SessionUpdate, ToolCallContent, ToolKind } from '@agentclientprotocol/sdk'
 import { createHash } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { getAgentDir } from './pi-settings.js'
 import { toolResultToText } from './translate/pi-tools.js'
@@ -9,10 +9,17 @@ import { toToolCallLocations, toToolKind } from './translate/tool-metadata.js'
 
 type EmitSessionUpdate = (update: SessionUpdate) => void
 
+export type WorkflowEventMonitorTarget = {
+  workflowId: string
+  initialTaskMessage?: string
+  parentSessionId?: string
+}
+
 type WorkflowEventMonitorOptions = {
   workflowRunsDir?: string
   pollIntervalMs?: number
   graceMs?: number
+  target?: WorkflowEventMonitorTarget | null
 }
 
 type TailState = {
@@ -49,6 +56,19 @@ type ChildToolMetadata = {
 
 export function isWorkflowCommandPrompt(message: string): boolean {
   return /^\s*\/workflow:[^\s]+(?:\s|$)/.test(message)
+}
+
+export function parseWorkflowCommandPrompt(message: string): WorkflowEventMonitorTarget | null {
+  const match = /^\s*\/workflow:([^\s]+)(?:\s+([\s\S]*))?$/.exec(message)
+  if (!match) return null
+  const workflowId = match[1]?.trim()
+  if (!workflowId) return null
+  const rawArgs = (match[2] ?? '').trim()
+  const initialTaskMessage = rawArgs.startsWith('--') ? rawArgs.slice(2).trimStart() : rawArgs
+  return {
+    workflowId,
+    ...(initialTaskMessage ? { initialTaskMessage } : {})
+  }
 }
 
 export class WorkflowEventMapper {
@@ -393,14 +413,28 @@ export class WorkflowEventMapper {
   }
 }
 
+type WorkflowRunMetadata = {
+  runId?: string
+  workflowId?: string
+  rootWorkflowId?: string
+  cwd?: string
+  initialTaskMessage?: string
+  parentSessionId?: string
+}
+
+type RunMatch = 'accept' | 'reject' | 'unknown'
+
 export class WorkflowEventMonitor {
   private readonly workflowRunsDir: string
   private readonly pollIntervalMs: number
   private readonly graceMs: number
   private readonly emit: EmitSessionUpdate
   private readonly mapper: WorkflowEventMapper
+  private readonly target: WorkflowEventMonitorTarget | null
+  private readonly cwdKey: string
   private readonly knownDirs = new Set<string>()
   private readonly tails = new Map<string, TailState>()
+  private acceptedRunDir: string | null = null
   private interval: NodeJS.Timeout | null = null
   private stopPromise: Promise<void> | null = null
   private stopResolve: (() => void) | null = null
@@ -412,6 +446,8 @@ export class WorkflowEventMonitor {
     this.graceMs = options.graceMs ?? 350
     this.emit = emit
     this.mapper = new WorkflowEventMapper(cwd)
+    this.target = options.target ?? null
+    this.cwdKey = cwdComparableKey(cwd)
   }
 
   start(): void {
@@ -451,10 +487,23 @@ export class WorkflowEventMonitor {
   private discoverRuns(): void {
     for (const dir of listRunDirs(this.workflowRunsDir)) {
       if (this.knownDirs.has(dir)) continue
+      const runDir = join(this.workflowRunsDir, dir)
+      const match = this.matchRunDir(dir, runDir)
+      if (match === 'unknown') continue
       this.knownDirs.add(dir)
-      const eventsPath = join(this.workflowRunsDir, dir, 'events.jsonl')
+      if (match === 'reject') continue
+      this.acceptedRunDir = dir
+      const eventsPath = join(runDir, 'events.jsonl')
       this.tails.set(eventsPath, { filePath: eventsPath, offset: 0, buffer: '', ended: false })
     }
+  }
+
+  private matchRunDir(dir: string, runDir: string): RunMatch {
+    if (this.acceptedRunDir) return dir === this.acceptedRunDir ? 'accept' : 'reject'
+    if (!this.target) return 'accept'
+    const metadata = readWorkflowRunMetadata(runDir)
+    if (!metadata) return 'unknown'
+    return metadataMatchesTarget(metadata, this.target, this.cwdKey)
   }
 
   private readTail(tail: TailState): void {
@@ -511,6 +560,82 @@ function listRunDirs(workflowRunsDir: string): string[] {
   } catch {
     return []
   }
+}
+
+function readWorkflowRunMetadata(runDir: string): WorkflowRunMetadata | null {
+  const runJson = readJsonObject(join(runDir, 'run.json'))
+  if (runJson) {
+    return {
+      runId: stringField(runJson.id),
+      workflowId: stringField(runJson.workflowId),
+      rootWorkflowId: stringField(runJson.rootWorkflowId) ?? stringField(runJson.workflowId),
+      cwd: stringField(runJson.cwd),
+      initialTaskMessage: stringField(runJson.initialTaskMessage),
+      parentSessionId: stringField(runJson.parentSessionId)
+    }
+  }
+  return readMetadataFromEvents(join(runDir, 'events.jsonl'))
+}
+
+function readJsonObject(filePath: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(filePath, 'utf8'))
+    return isObject(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function readMetadataFromEvents(eventsPath: string): WorkflowRunMetadata | null {
+  let text = ''
+  try {
+    text = readFileSync(eventsPath, 'utf8')
+  } catch {
+    return null
+  }
+
+  const metadata: WorkflowRunMetadata = {}
+  for (const line of text.split(/\r?\n/).slice(0, 50)) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    let record: unknown
+    try {
+      record = JSON.parse(trimmed)
+    } catch {
+      continue
+    }
+    if (!isObject(record)) continue
+    metadata.runId ??= stringField(record.runId)
+    metadata.rootWorkflowId ??= stringField(record.rootWorkflowId)
+    metadata.workflowId ??= stringField(record.workflowId)
+    metadata.cwd ??= stringField(record.cwd)
+    metadata.initialTaskMessage ??= stringField(record.initialTaskMessage)
+    metadata.parentSessionId ??= stringField(record.parentSessionId)
+  }
+  return metadata.runId || metadata.workflowId || metadata.rootWorkflowId || metadata.cwd ? metadata : null
+}
+
+function metadataMatchesTarget(
+  metadata: WorkflowRunMetadata,
+  target: WorkflowEventMonitorTarget,
+  cwdKey: string
+): RunMatch {
+  const workflowId = metadata.rootWorkflowId ?? metadata.workflowId
+  if (!workflowId || !metadata.cwd) return 'unknown'
+  if (workflowId !== target.workflowId) return 'reject'
+  if (cwdComparableKey(metadata.cwd) !== cwdKey) return 'reject'
+  if (target.initialTaskMessage !== undefined) {
+    if (metadata.initialTaskMessage === undefined) return 'unknown'
+    if (metadata.initialTaskMessage !== target.initialTaskMessage) return 'reject'
+  }
+  if (target.parentSessionId && metadata.parentSessionId && metadata.parentSessionId !== target.parentSessionId) {
+    return 'reject'
+  }
+  return 'accept'
+}
+
+function cwdComparableKey(cwd: string): string {
+  return resolve(cwd)
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
