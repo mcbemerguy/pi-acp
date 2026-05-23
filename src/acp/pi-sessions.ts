@@ -131,60 +131,14 @@ function pickTitleFromTail(tail: string): string | null {
   return null
 }
 
-function scanSessionInfoNameFromFile(path: string, maxBytes = DEFAULT_INFO_SCAN_BYTES): string | null {
-  const fd = openSync(path, 'r')
+function scanSessionInfoNameFromRecentFileWindow(
+  path: string,
+  maxAdditionalBytes = DEFAULT_INFO_SCAN_BYTES
+): string | null {
   try {
-    const buf = Buffer.alloc(256 * 1024)
-    let leftover = ''
-    let offset = 0
-    let lastName: string | null = null
-
-    while (offset < maxBytes) {
-      const bytesToRead = Math.min(buf.length, maxBytes - offset)
-      const n = readSync(fd, buf, 0, bytesToRead, offset)
-      if (n <= 0) break
-      offset += n
-
-      const chunk = leftover + buf.subarray(0, n).toString('utf8')
-      const lines = chunk.split(/\r?\n/)
-      leftover = lines.pop() ?? ''
-
-      for (const line0 of lines) {
-        const line = line0.trim()
-        if (!line) continue
-        try {
-          const obj = JSON.parse(line) as any
-          if (obj?.type === 'session_info' && typeof obj?.name === 'string' && obj.name.trim()) {
-            lastName = obj.name.trim()
-          }
-        } catch {
-          // ignore
-        }
-      }
-    }
-
-    // Best-effort: parse leftover if it was a full line without trailing newline.
-    const tailLine = leftover.trim()
-    if (tailLine) {
-      try {
-        const obj = JSON.parse(tailLine) as any
-        if (obj?.type === 'session_info' && typeof obj?.name === 'string' && obj.name.trim()) {
-          lastName = obj.name.trim()
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    return lastName
+    return pickTitleFromTail(readTail(path, DEFAULT_TAIL_BYTES + maxAdditionalBytes))
   } catch {
     return null
-  } finally {
-    try {
-      closeSync(fd)
-    } catch {
-      // ignore
-    }
   }
 }
 
@@ -294,9 +248,9 @@ export function listPiSessions(): PiSessionListItem[] {
       // ignore
     }
 
-    // If the session was named early and grew large, it may fall outside of the tail window.
+    // If the session was renamed before the tail window, scan a larger bounded recent window.
     if (!title) {
-      title = scanSessionInfoNameFromFile(file)
+      title = scanSessionInfoNameFromRecentFileWindow(file)
     }
 
     // Fallback for updatedAt when we couldn't parse timestamps from tail.

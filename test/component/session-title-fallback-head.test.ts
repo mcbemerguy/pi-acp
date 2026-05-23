@@ -17,6 +17,40 @@ function withPiAgentDir<T>(root: string, run: () => T): T {
   }
 }
 
+test('listPiSessions: session_info scan prioritizes recent names outside the default tail', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-test-'))
+  const sessionsDir = join(root, 'sessions', '--p--')
+  mkdirSync(sessionsDir, { recursive: true })
+
+  const sessionFile = join(sessionsDir, 's.jsonl')
+  const header = JSON.stringify({
+    type: 'session',
+    version: 3,
+    id: 'sess-recent-name',
+    timestamp: '2026-01-01T00:00:00.000Z',
+    cwd: '/tmp/project'
+  })
+  const earlyName = JSON.stringify({ type: 'session_info', name: 'Early stale name' })
+  const recentName = JSON.stringify({ type: 'session_info', name: 'Recent correct name' })
+  const recentMessage = JSON.stringify({
+    type: 'message',
+    id: 'm-recent',
+    parentId: null,
+    timestamp: '2026-01-01T00:00:03.000Z',
+    message: { role: 'assistant', content: 'ok' }
+  })
+
+  writeFileSync(
+    sessionFile,
+    `${header}\n${earlyName}\n${'x'.repeat(1100 * 1024)}\n${recentName}\n${'x'.repeat(300 * 1024)}\n${recentMessage}\n`,
+    { encoding: 'utf8' }
+  )
+
+  const s = withPiAgentDir(root, () => listPiSessions().find(x => x.sessionId === 'sess-recent-name'))
+  assert.ok(s)
+  assert.equal(s?.title, 'Recent correct name')
+})
+
 test('listPiSessions: fallback title reads only the bounded head chunk', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-test-'))
   const sessionsDir = join(root, 'sessions', '--p--')
