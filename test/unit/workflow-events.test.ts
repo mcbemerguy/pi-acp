@@ -148,6 +148,46 @@ test('WorkflowEventMapper completes open plan entries when a workflow run ends',
   assert.equal(plans.at(-1).entries[0].status, 'completed')
 })
 
+test('WorkflowEventMapper only completes open plan entries for the workflow run that ended', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+  const updates = [
+    ...mapper.map({
+      type: 'step_start',
+      timestamp: 't1',
+      runId: 'r1',
+      workflowId: 'wf',
+      stepId: 'code',
+      stepType: 'agent',
+      status: 'running'
+    }),
+    ...mapper.map({
+      type: 'step_start',
+      timestamp: 't2',
+      runId: 'r2',
+      workflowId: 'wf',
+      stepId: 'review',
+      stepType: 'agent',
+      status: 'running'
+    }),
+    ...mapper.map({
+      type: 'run_end',
+      timestamp: 't3',
+      runId: 'r1',
+      workflowId: 'wf',
+      status: 'completed'
+    })
+  ]
+
+  const finalPlan = updates.filter(update => update.sessionUpdate === 'plan').at(-1) as any
+  assert.deepEqual(
+    finalPlan.entries.map((entry: any) => ({ toolCallId: entry._meta.piWorkflow.toolCallId, status: entry.status })),
+    [
+      { toolCallId: 'workflow:r1:step:code', status: 'completed' },
+      { toolCallId: 'workflow:r2:step:review', status: 'in_progress' }
+    ]
+  )
+})
+
 test('WorkflowEventMapper maps distinct child tool updates that share a timestamp', () => {
   const mapper = new WorkflowEventMapper('/repo')
   const base = {

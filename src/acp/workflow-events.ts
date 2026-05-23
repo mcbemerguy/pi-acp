@@ -143,7 +143,7 @@ export class WorkflowEventMapper {
       })
     }
 
-    const finalPlan = this.completeOpenPlanEntries()
+    const finalPlan = this.completeOpenPlanEntries(runId)
     if (finalPlan) updates.push(finalPlan)
 
     updates.push({
@@ -368,10 +368,11 @@ export class WorkflowEventMapper {
     this.noIdMessageSequences.set(baseKey, (this.noIdMessageSequences.get(baseKey) ?? 0) + 1)
   }
 
-  private completeOpenPlanEntries(): SessionUpdate | null {
+  private completeOpenPlanEntries(runId: string): SessionUpdate | null {
     let changed = false
+    const stepPrefix = `workflow:${runId}:step:`
     for (const step of this.steps.values()) {
-      if (step.status !== 'in_progress') continue
+      if (step.status !== 'in_progress' || !step.id.startsWith(stepPrefix)) continue
       step.status = 'completed'
       changed = true
     }
