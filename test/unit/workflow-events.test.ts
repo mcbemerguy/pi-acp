@@ -20,10 +20,12 @@ test('isWorkflowCommandPrompt recognizes detached workflow slash commands', () =
   assert.equal(isWorkflowCommandPrompt('hello /workflow:review'), false)
   assert.deepEqual(parseWorkflowCommandPrompt('/workflow:review -- do it'), {
     workflowId: 'review',
+    commandName: 'workflow:review',
     initialTaskMessage: 'do it'
   })
   assert.deepEqual(parseWorkflowCommandPrompt('/workflow:review do it'), {
     workflowId: 'review',
+    commandName: 'workflow:review',
     initialTaskMessage: 'do it'
   })
 })
@@ -501,6 +503,12 @@ test('WorkflowEventMonitor filters workflow runs by cwd, workflow id, task, and 
     initialTaskMessage: 'task',
     parentSessionId: 'session-1'
   })
+  writeRun('missing-parent-session', {
+    id: 'missing-parent-session',
+    workflowId: 'plan-discussion',
+    cwd: '/repo',
+    initialTaskMessage: 'task'
+  })
   writeRun('accepted', {
     id: 'accepted',
     workflowId: 'plan-discussion',
@@ -531,6 +539,47 @@ test('WorkflowEventMonitor filters workflow runs by cwd, workflow id, task, and 
   assert.ok(
     updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:accepted')
   )
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('WorkflowEventMonitor matches custom workflow command names against Pi run metadata', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-command-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  mkdirSync(workflowRunsDir, { recursive: true })
+  const updates: any[] = []
+  const monitor = new WorkflowEventMonitor('/repo', update => updates.push(update), {
+    workflowRunsDir,
+    pollIntervalMs: 10,
+    graceMs: 30,
+    target: { workflowId: 'review', commandName: 'workflow:review', initialTaskMessage: 'task', parentSessionId: 'session-1' }
+  })
+
+  monitor.start()
+  const runDir = join(workflowRunsDir, 'custom')
+  mkdirSync(runDir)
+  writeFileSync(
+    join(runDir, 'run.json'),
+    JSON.stringify({ id: 'custom', workflowId: 'code-review-fix', commandName: 'workflow:review', cwd: '/repo', initialTaskMessage: 'task', parentSessionId: 'session-1' }),
+    'utf8'
+  )
+  writeFileSync(
+    join(runDir, 'events.jsonl'),
+    `${JSON.stringify({ type: 'run_start', timestamp: 't-custom', runId: 'custom', workflowId: 'code-review-fix', rootWorkflowId: 'code-review-fix', commandName: 'workflow:review', cwd: '/repo', status: 'running' })}\n`,
+    'utf8'
+  )
+
+  await wait(40)
+  appendFileSync(
+    join(runDir, 'events.jsonl'),
+    `${JSON.stringify({ type: 'run_end', timestamp: 't-end', runId: 'custom', workflowId: 'code-review-fix', rootWorkflowId: 'code-review-fix', commandName: 'workflow:review', cwd: '/repo', status: 'completed' })}\n`
+  )
+
+  await monitor.stopAfterPromptResolution()
+  assert.deepEqual(
+    updates.filter(update => update.sessionUpdate === 'tool_call').map(update => update.toolCallId),
+    ['workflow:custom']
+  )
+  assert.ok(updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:custom'))
   rmSync(root, { recursive: true, force: true })
 })
 

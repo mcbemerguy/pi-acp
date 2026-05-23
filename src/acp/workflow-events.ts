@@ -11,6 +11,7 @@ type EmitSessionUpdate = (update: SessionUpdate) => void
 
 export type WorkflowEventMonitorTarget = {
   workflowId: string
+  commandName?: string
   initialTaskMessage?: string
   parentSessionId?: string
 }
@@ -32,6 +33,7 @@ type TailState = {
 type WorkflowMeta = {
   runId: string
   workflowId?: string
+  commandName?: string
   runDir?: string
   auditPath?: string
   stepId?: string
@@ -67,6 +69,7 @@ export function parseWorkflowCommandPrompt(message: string): WorkflowEventMonito
   const initialTaskMessage = rawArgs.startsWith('--') ? rawArgs.slice(2).trimStart() : rawArgs
   return {
     workflowId,
+    commandName: `workflow:${workflowId}`,
     ...(initialTaskMessage ? { initialTaskMessage } : {})
   }
 }
@@ -134,6 +137,7 @@ export class WorkflowEventMapper {
           {
             runId,
             workflowId,
+            commandName: stringField(record.commandName),
             runDir: stringField(record.runDir),
             auditPath: stringField(record.auditPath)
           },
@@ -417,6 +421,7 @@ type WorkflowRunMetadata = {
   runId?: string
   workflowId?: string
   rootWorkflowId?: string
+  commandName?: string
   cwd?: string
   initialTaskMessage?: string
   parentSessionId?: string
@@ -569,6 +574,7 @@ function readWorkflowRunMetadata(runDir: string): WorkflowRunMetadata | null {
       runId: stringField(runJson.id),
       workflowId: stringField(runJson.workflowId),
       rootWorkflowId: stringField(runJson.rootWorkflowId) ?? stringField(runJson.workflowId),
+      commandName: stringField(runJson.commandName),
       cwd: stringField(runJson.cwd),
       initialTaskMessage: stringField(runJson.initialTaskMessage),
       parentSessionId: stringField(runJson.parentSessionId)
@@ -608,11 +614,12 @@ function readMetadataFromEvents(eventsPath: string): WorkflowRunMetadata | null 
     metadata.runId ??= stringField(record.runId)
     metadata.rootWorkflowId ??= stringField(record.rootWorkflowId)
     metadata.workflowId ??= stringField(record.workflowId)
+    metadata.commandName ??= stringField(record.commandName)
     metadata.cwd ??= stringField(record.cwd)
     metadata.initialTaskMessage ??= stringField(record.initialTaskMessage)
     metadata.parentSessionId ??= stringField(record.parentSessionId)
   }
-  return metadata.runId || metadata.workflowId || metadata.rootWorkflowId || metadata.cwd ? metadata : null
+  return metadata.runId || metadata.workflowId || metadata.rootWorkflowId || metadata.commandName || metadata.cwd ? metadata : null
 }
 
 function metadataMatchesTarget(
@@ -621,15 +628,22 @@ function metadataMatchesTarget(
   cwdKey: string
 ): RunMatch {
   const workflowId = metadata.rootWorkflowId ?? metadata.workflowId
-  if (!workflowId || !metadata.cwd) return 'unknown'
-  if (workflowId !== target.workflowId) return 'reject'
+  const commandName = metadata.commandName
+  if ((!workflowId && !commandName) || !metadata.cwd) return 'unknown'
   if (cwdComparableKey(metadata.cwd) !== cwdKey) return 'reject'
+  const workflowMatches = workflowId === target.workflowId
+  const commandMatches = Boolean(target.commandName && commandName === target.commandName)
+  if (!workflowMatches && !commandMatches) {
+    if (target.commandName && commandName === undefined) return 'unknown'
+    return 'reject'
+  }
   if (target.initialTaskMessage !== undefined) {
     if (metadata.initialTaskMessage === undefined) return 'unknown'
     if (metadata.initialTaskMessage !== target.initialTaskMessage) return 'reject'
   }
-  if (target.parentSessionId && metadata.parentSessionId && metadata.parentSessionId !== target.parentSessionId) {
-    return 'reject'
+  if (target.parentSessionId) {
+    if (metadata.parentSessionId === undefined) return 'unknown'
+    if (metadata.parentSessionId !== target.parentSessionId) return 'reject'
   }
   return 'accept'
 }
@@ -677,6 +691,7 @@ function metaFromRecord(record: Record<string, unknown>): WorkflowMeta {
   return {
     runId: String(record.runId),
     workflowId: stringField(record.workflowId),
+    commandName: stringField(record.commandName),
     runDir: stringField(record.runDir),
     auditPath: stringField(record.auditPath),
     stepId: stringField(record.stepId),
