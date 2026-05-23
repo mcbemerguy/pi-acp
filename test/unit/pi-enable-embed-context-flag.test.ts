@@ -40,6 +40,8 @@ test('PiAcpAgent: advertises Pi ACP extension UI custom notifications in capabil
 
   assert.deepEqual(res.agentCapabilities?._meta?.piAcp, {
     extensionUiEvents: true,
-    extensionUiEventMethod: '_pi/extension_ui_event'
+    extensionUiEventMethod: '_pi/extension_ui_event',
+    usageTelemetry: true,
+    usageTelemetryMethod: '_pi/session_usage_update'
   })
 })

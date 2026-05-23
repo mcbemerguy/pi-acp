@@ -22,7 +22,7 @@ import {
   normalizeExtensionUiRequest,
   PI_EXTENSION_UI_EVENT_METHOD
 } from './extension-ui.js'
-import { usageUpdateFromPiSessionStats } from './usage.js'
+import { PI_USAGE_UPDATE_METHOD, piUsageTelemetryFromPiSessionStats, usageUpdateFromPiSessionStats } from './usage.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -316,6 +316,11 @@ export class PiAcpSession {
   publishUsageUpdateFromStats(stats: unknown): void {
     const update = usageUpdateFromPiSessionStats(stats)
     if (update) this.emit(update)
+  }
+
+  publishPiUsageTelemetryFromStats(stats: unknown): void {
+    const usage = piUsageTelemetryFromPiSessionStats(stats)
+    if (usage) this.emitCustomNotification(PI_USAGE_UPDATE_METHOD, { sessionId: this.sessionId, usage })
   }
 
   private enqueueSend(send: () => Promise<void>): void {

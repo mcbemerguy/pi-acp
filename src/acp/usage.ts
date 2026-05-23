@@ -1,6 +1,46 @@
 import type { SessionUpdate, Usage } from '@agentclientprotocol/sdk'
 
+export const PI_USAGE_UPDATE_METHOD = '_pi/session_usage_update'
+
 type RecordValue = Record<string, unknown>
+
+export type PiUsageTelemetry = {
+  context?: {
+    usedTokens?: number
+    maxTokens?: number
+  }
+  totals?: {
+    totalTokens?: number
+    inputTokens?: number
+    outputTokens?: number
+    reasoningTokens?: number
+    cachedReadTokens?: number
+    cachedWriteTokens?: number
+  }
+  lastRequest?: {
+    totalTokens?: number
+    inputTokens?: number
+    outputTokens?: number
+    reasoningTokens?: number
+    cachedReadTokens?: number
+    cachedWriteTokens?: number
+  }
+  cost?: {
+    amount: number
+    currency: string
+  }
+  model?: {
+    name?: string
+    provider?: string
+    effort?: string
+  }
+  cache?: {
+    status?: string
+  }
+  autoCompaction?: {
+    enabled?: boolean
+  }
+}
 
 function isRecord(value: unknown): value is RecordValue {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -35,6 +75,25 @@ function firstPositiveInt(...values: unknown[]): number | undefined {
   return undefined
 }
 
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+function finiteNonNegativeNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+function firstBoolean(...values: unknown[]): boolean | undefined {
+  for (const value of values) {
+    if (typeof value === 'boolean') return value
+  }
+  return undefined
+}
+
+function hasKeys(value: object): boolean {
+  return Object.keys(value).length > 0
+}
+
 export function usageFromPiSessionStats(stats: unknown): Usage | undefined {
   if (!isRecord(stats)) return undefined
   const tokens = nestedRecord(stats, 'tokens')
@@ -67,13 +126,11 @@ export function usageFromPiSessionStats(stats: unknown): Usage | undefined {
   }
 }
 
-export function usageUpdateFromPiSessionStats(stats: unknown): SessionUpdate | undefined {
-  if (!isRecord(stats)) return undefined
+function contextFromPiSessionStats(stats: RecordValue): NonNullable<PiUsageTelemetry['context']> | undefined {
   const contextUsage = nestedRecord(stats, 'contextUsage')
   const context = nestedRecord(stats, 'context') ?? nestedRecord(stats, 'contextWindow')
   const model = nestedRecord(stats, 'model')
-
-  const used = firstNonNegativeInt(
+  const usedTokens = firstNonNegativeInt(
     contextUsage?.tokens,
     contextUsage?.used,
     contextUsage?.usedTokens,
@@ -82,7 +139,7 @@ export function usageUpdateFromPiSessionStats(stats: unknown): SessionUpdate | u
     stats.usedTokens,
     stats.contextUsed
   )
-  const size = firstPositiveInt(
+  const maxTokens = firstPositiveInt(
     contextUsage?.contextWindow,
     contextUsage?.size,
     contextUsage?.maxTokens,
@@ -95,17 +152,95 @@ export function usageUpdateFromPiSessionStats(stats: unknown): SessionUpdate | u
     model?.contextWindow,
     model?.maxTokens
   )
+  return usedTokens !== undefined || maxTokens !== undefined
+    ? {
+        ...(usedTokens !== undefined ? { usedTokens } : {}),
+        ...(maxTokens !== undefined ? { maxTokens } : {})
+      }
+    : undefined
+}
+
+function tokenDetailsFromRecord(tokens: RecordValue | undefined): NonNullable<PiUsageTelemetry['totals']> | undefined {
+  if (!tokens) return undefined
+  const inputTokens = firstNonNegativeInt(tokens.input, tokens.inputTokens)
+  const outputTokens = firstNonNegativeInt(tokens.output, tokens.outputTokens)
+  const cachedReadTokens = firstNonNegativeInt(tokens.cacheRead, tokens.cachedReadTokens)
+  const cachedWriteTokens = firstNonNegativeInt(tokens.cacheWrite, tokens.cachedWriteTokens)
+  const reasoningTokens = firstNonNegativeInt(
+    tokens.thought,
+    tokens.thoughtTokens,
+    tokens.reasoning,
+    tokens.reasoningTokens
+  )
+  const totalTokens = firstNonNegativeInt(tokens.total, tokens.totalTokens)
+  const details = {
+    ...(totalTokens !== undefined ? { totalTokens } : {}),
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
+    ...(cachedReadTokens !== undefined ? { cachedReadTokens } : {}),
+    ...(cachedWriteTokens !== undefined ? { cachedWriteTokens } : {})
+  }
+  return hasKeys(details) ? details : undefined
+}
+
+export function piUsageTelemetryFromPiSessionStats(stats: unknown): PiUsageTelemetry | undefined {
+  if (!isRecord(stats)) return undefined
+  const tokens = nestedRecord(stats, 'tokens')
+  const lastTokens =
+    nestedRecord(stats, 'lastRequest') ?? nestedRecord(stats, 'lastTurn') ?? nestedRecord(stats, 'lastUsage')
+  const model = nestedRecord(stats, 'model')
+  const cache = nestedRecord(stats, 'cache')
+  const autoCompaction = nestedRecord(stats, 'autoCompaction') ?? nestedRecord(stats, 'compaction')
+
+  const context = contextFromPiSessionStats(stats)
+  const totals = tokenDetailsFromRecord(tokens)
+  const lastRequest = tokenDetailsFromRecord(lastTokens) ?? totals
+  const amount = finiteNonNegativeNumber(stats.cost)
+  const currency = nonEmptyString(stats.currency) ?? (amount !== undefined ? 'USD' : undefined)
+  const modelInfo = {
+    ...((nonEmptyString(model?.name) ?? nonEmptyString(stats.model))
+      ? { name: nonEmptyString(model?.name) ?? nonEmptyString(stats.model) }
+      : {}),
+    ...((nonEmptyString(model?.provider) ?? nonEmptyString(stats.provider))
+      ? { provider: nonEmptyString(model?.provider) ?? nonEmptyString(stats.provider) }
+      : {}),
+    ...((nonEmptyString(model?.effort) ?? nonEmptyString(stats.effort) ?? nonEmptyString(stats.reasoningEffort))
+      ? {
+          effort: nonEmptyString(model?.effort) ?? nonEmptyString(stats.effort) ?? nonEmptyString(stats.reasoningEffort)
+        }
+      : {})
+  }
+  const cacheInfo = {
+    ...((nonEmptyString(cache?.status) ?? nonEmptyString(stats.cacheStatus))
+      ? { status: nonEmptyString(cache?.status) ?? nonEmptyString(stats.cacheStatus) }
+      : {})
+  }
+  const autoCompactionEnabled = firstBoolean(autoCompaction?.enabled, autoCompaction?.automatic, stats.autoCompaction)
+  const telemetry: PiUsageTelemetry = {
+    ...(context ? { context } : {}),
+    ...(totals ? { totals } : {}),
+    ...(lastRequest ? { lastRequest } : {}),
+    ...(amount !== undefined && currency !== undefined ? { cost: { amount, currency } } : {}),
+    ...(hasKeys(modelInfo) ? { model: modelInfo } : {}),
+    ...(hasKeys(cacheInfo) ? { cache: cacheInfo } : {}),
+    ...(autoCompactionEnabled !== undefined ? { autoCompaction: { enabled: autoCompactionEnabled } } : {})
+  }
+
+  return hasKeys(telemetry) ? telemetry : undefined
+}
+
+export function usageUpdateFromPiSessionStats(stats: unknown): SessionUpdate | undefined {
+  const telemetry = piUsageTelemetryFromPiSessionStats(stats)
+  const used = telemetry?.context?.usedTokens
+  const size = telemetry?.context?.maxTokens
 
   if (used === undefined || size === undefined) return undefined
-
-  const currency = typeof stats.currency === 'string' && stats.currency.trim() ? stats.currency.trim() : undefined
-  const amount =
-    typeof stats.cost === 'number' && Number.isFinite(stats.cost) && stats.cost >= 0 ? stats.cost : undefined
 
   return {
     sessionUpdate: 'usage_update',
     used,
     size,
-    ...(amount !== undefined && currency !== undefined ? { cost: { amount, currency } } : {})
+    ...(telemetry?.cost ? { cost: telemetry.cost } : {})
   }
 }

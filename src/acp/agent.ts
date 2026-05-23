@@ -33,7 +33,7 @@ import { getEnableSkillCommands } from './pi-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { PI_EXTENSION_UI_EVENT_METHOD } from './extension-ui.js'
-import { usageFromPiSessionStats } from './usage.js'
+import { PI_USAGE_UPDATE_METHOD, usageFromPiSessionStats } from './usage.js'
 import {
   getSessionConfigOptions,
   isThinkingLevel,
@@ -208,7 +208,9 @@ export class PiAcpAgent implements ACPAgent {
         _meta: {
           piAcp: {
             extensionUiEvents: true,
-            extensionUiEventMethod: PI_EXTENSION_UI_EVENT_METHOD
+            extensionUiEventMethod: PI_EXTENSION_UI_EVENT_METHOD,
+            usageTelemetry: true,
+            usageTelemetryMethod: PI_USAGE_UPDATE_METHOD
           }
         }
       }
@@ -380,6 +382,7 @@ export class PiAcpAgent implements ACPAgent {
       if (cmd === 'session') {
         const stats = (await session.proc.getSessionStats()) as unknown
         session.publishUsageUpdateFromStats(stats)
+        session.publishPiUsageTelemetryFromStats(stats)
         const statsRecord = stats && typeof stats === 'object' ? (stats as Record<string, unknown>) : null
 
         const lines: string[] = []
@@ -788,7 +791,10 @@ export class PiAcpAgent implements ACPAgent {
 
     const result = await session.prompt(message, images)
     const stats = await getSessionStatsIfAvailable(session)
-    if (stats !== undefined) session.publishUsageUpdateFromStats(stats)
+    if (stats !== undefined) {
+      session.publishUsageUpdateFromStats(stats)
+      session.publishPiUsageTelemetryFromStats(stats)
+    }
     const usage = usageFromPiSessionStats(stats)
 
     // ACP StopReason does not include "error"; if pi fails we map to end_turn for now,
