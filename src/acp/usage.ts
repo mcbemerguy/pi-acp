@@ -79,6 +79,14 @@ function nonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
 }
 
+function firstNonEmptyString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    const normalized = nonEmptyString(value)
+    if (normalized !== undefined) return normalized
+  }
+  return undefined
+}
+
 function finiteNonNegativeNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
 }
@@ -184,39 +192,50 @@ function tokenDetailsFromRecord(tokens: RecordValue | undefined): NonNullable<Pi
   return hasKeys(details) ? details : undefined
 }
 
-export function piUsageTelemetryFromPiSessionStats(stats: unknown): PiUsageTelemetry | undefined {
+export function piUsageTelemetryFromPiSessionStats(stats: unknown, state?: unknown): PiUsageTelemetry | undefined {
   if (!isRecord(stats)) return undefined
+  const stateRecord = isRecord(state) ? state : undefined
   const tokens = nestedRecord(stats, 'tokens')
   const lastTokens =
     nestedRecord(stats, 'lastRequest') ?? nestedRecord(stats, 'lastTurn') ?? nestedRecord(stats, 'lastUsage')
-  const model = nestedRecord(stats, 'model')
-  const cache = nestedRecord(stats, 'cache')
-  const autoCompaction = nestedRecord(stats, 'autoCompaction') ?? nestedRecord(stats, 'compaction')
+  const statsModel = nestedRecord(stats, 'model')
+  const stateModel = stateRecord ? nestedRecord(stateRecord, 'model') : undefined
+  const cache = nestedRecord(stats, 'cache') ?? (stateRecord ? nestedRecord(stateRecord, 'cache') : undefined)
+  const autoCompaction =
+    nestedRecord(stats, 'autoCompaction') ??
+    nestedRecord(stats, 'compaction') ??
+    (stateRecord ? (nestedRecord(stateRecord, 'autoCompaction') ?? nestedRecord(stateRecord, 'compaction')) : undefined)
 
   const context = contextFromPiSessionStats(stats)
   const totals = tokenDetailsFromRecord(tokens)
-  const lastRequest = tokenDetailsFromRecord(lastTokens) ?? totals
+  const lastRequest = tokenDetailsFromRecord(lastTokens)
   const amount = finiteNonNegativeNumber(stats.cost)
   const currency = nonEmptyString(stats.currency) ?? (amount !== undefined ? 'USD' : undefined)
+  const modelName = firstNonEmptyString(statsModel?.name, stateModel?.name, stats.model)
+  const modelProvider = firstNonEmptyString(statsModel?.provider, stateModel?.provider, stats.provider)
+  const modelEffort = firstNonEmptyString(
+    statsModel?.effort,
+    stateModel?.effort,
+    stats.effort,
+    stateRecord?.thinkingLevel,
+    stats.reasoningEffort
+  )
+  const cacheStatus = firstNonEmptyString(cache?.status, stats.cacheStatus, stateRecord?.cacheStatus)
   const modelInfo = {
-    ...((nonEmptyString(model?.name) ?? nonEmptyString(stats.model))
-      ? { name: nonEmptyString(model?.name) ?? nonEmptyString(stats.model) }
-      : {}),
-    ...((nonEmptyString(model?.provider) ?? nonEmptyString(stats.provider))
-      ? { provider: nonEmptyString(model?.provider) ?? nonEmptyString(stats.provider) }
-      : {}),
-    ...((nonEmptyString(model?.effort) ?? nonEmptyString(stats.effort) ?? nonEmptyString(stats.reasoningEffort))
-      ? {
-          effort: nonEmptyString(model?.effort) ?? nonEmptyString(stats.effort) ?? nonEmptyString(stats.reasoningEffort)
-        }
-      : {})
+    ...(modelName ? { name: modelName } : {}),
+    ...(modelProvider ? { provider: modelProvider } : {}),
+    ...(modelEffort ? { effort: modelEffort } : {})
   }
   const cacheInfo = {
-    ...((nonEmptyString(cache?.status) ?? nonEmptyString(stats.cacheStatus))
-      ? { status: nonEmptyString(cache?.status) ?? nonEmptyString(stats.cacheStatus) }
-      : {})
+    ...(cacheStatus ? { status: cacheStatus } : {})
   }
-  const autoCompactionEnabled = firstBoolean(autoCompaction?.enabled, autoCompaction?.automatic, stats.autoCompaction)
+  const autoCompactionEnabled = firstBoolean(
+    autoCompaction?.enabled,
+    autoCompaction?.automatic,
+    stats.autoCompaction,
+    stateRecord?.autoCompactionEnabled,
+    stateRecord?.autoCompaction
+  )
   const telemetry: PiUsageTelemetry = {
     ...(context ? { context } : {}),
     ...(totals ? { totals } : {}),

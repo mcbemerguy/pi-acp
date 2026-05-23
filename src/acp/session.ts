@@ -318,8 +318,8 @@ export class PiAcpSession {
     if (update) this.emit(update)
   }
 
-  publishPiUsageTelemetryFromStats(stats: unknown): void {
-    const usage = piUsageTelemetryFromPiSessionStats(stats)
+  publishPiUsageTelemetryFromStats(stats: unknown, state?: unknown): void {
+    const usage = piUsageTelemetryFromPiSessionStats(stats, state)
     if (usage) this.emitCustomNotification(PI_USAGE_UPDATE_METHOD, { sessionId: this.sessionId, usage })
   }
 

@@ -77,6 +77,14 @@ test('piUsageTelemetryFromPiSessionStats returns normalized display-ready detail
       cacheWrite: 5_000,
       total: 106_000
     },
+    lastRequest: {
+      input: 100,
+      output: 50,
+      reasoning: 10,
+      cacheRead: 20,
+      cacheWrite: 5,
+      total: 185
+    },
     contextUsage: {
       tokens: 60_000,
       contextWindow: 200_000
@@ -99,12 +107,12 @@ test('piUsageTelemetryFromPiSessionStats returns normalized display-ready detail
       cachedWriteTokens: 5_000
     },
     lastRequest: {
-      totalTokens: 106_000,
-      inputTokens: 50_000,
-      outputTokens: 10_000,
-      reasoningTokens: 1_000,
-      cachedReadTokens: 40_000,
-      cachedWriteTokens: 5_000
+      totalTokens: 185,
+      inputTokens: 100,
+      outputTokens: 50,
+      reasoningTokens: 10,
+      cachedReadTokens: 20,
+      cachedWriteTokens: 5
     },
     cost: { amount: 0.42, currency: 'USD' },
     model: { name: 'gpt-5', provider: 'openai', effort: 'high' },
@@ -123,7 +131,39 @@ test('piUsageTelemetryFromPiSessionStats tolerates malformed partial stats', () 
 
   assert.deepEqual(usage, {
     totals: { outputTokens: 4 },
-    lastRequest: { outputTokens: 4 },
     model: { provider: 'pi' }
+  })
+})
+
+test('piUsageTelemetryFromPiSessionStats augments stats with get_state model and compaction details', () => {
+  const usage = piUsageTelemetryFromPiSessionStats(
+    {
+      tokens: { total: 105_000 },
+      contextUsage: { tokens: 60_000, contextWindow: 200_000 }
+    },
+    {
+      model: { name: 'Claude Sonnet 4', provider: 'anthropic' },
+      thinkingLevel: 'medium',
+      autoCompactionEnabled: true
+    }
+  )
+
+  assert.deepEqual(usage, {
+    context: { usedTokens: 60_000, maxTokens: 200_000 },
+    totals: { totalTokens: 105_000 },
+    model: { name: 'Claude Sonnet 4', provider: 'anthropic', effort: 'medium' },
+    autoCompaction: { enabled: true }
+  })
+})
+
+test('piUsageTelemetryFromPiSessionStats omits lastRequest when no per-request stats exist', () => {
+  const usage = piUsageTelemetryFromPiSessionStats({
+    tokens: { input: 10, output: 5, total: 15 },
+    contextUsage: { tokens: 15, contextWindow: 100 }
+  })
+
+  assert.deepEqual(usage, {
+    context: { usedTokens: 15, maxTokens: 100 },
+    totals: { totalTokens: 15, inputTokens: 10, outputTokens: 5 }
   })
 })

@@ -89,12 +89,14 @@ function builtinAvailableCommands(): AvailableCommand[] {
   ]
 }
 
-async function getSessionStatsIfAvailable(session: { proc: Pick<PiRpcProcess, 'getSessionStats'> }): Promise<unknown> {
-  try {
-    return await session.proc.getSessionStats()
-  } catch {
-    return undefined
-  }
+async function getSessionUsageInputsIfAvailable(session: {
+  proc: Pick<PiRpcProcess, 'getSessionStats' | 'getState'>
+}): Promise<{ stats?: unknown; state?: unknown }> {
+  const [stats, state] = await Promise.all([
+    session.proc.getSessionStats().catch(() => undefined),
+    session.proc.getState().catch(() => undefined)
+  ])
+  return { stats, state }
 }
 
 function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableCommand[] {
@@ -380,9 +382,10 @@ export class PiAcpAgent implements ACPAgent {
       }
 
       if (cmd === 'session') {
-        const stats = (await session.proc.getSessionStats()) as unknown
+        const { stats, state } = await getSessionUsageInputsIfAvailable(session)
+        if (stats === undefined) throw RequestError.internalError({}, 'pi get_session_stats failed')
         session.publishUsageUpdateFromStats(stats)
-        session.publishPiUsageTelemetryFromStats(stats)
+        session.publishPiUsageTelemetryFromStats(stats, state)
         const statsRecord = stats && typeof stats === 'object' ? (stats as Record<string, unknown>) : null
 
         const lines: string[] = []
@@ -790,10 +793,10 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     const result = await session.prompt(message, images)
-    const stats = await getSessionStatsIfAvailable(session)
+    const { stats, state } = await getSessionUsageInputsIfAvailable(session)
     if (stats !== undefined) {
       session.publishUsageUpdateFromStats(stats)
-      session.publishPiUsageTelemetryFromStats(stats)
+      session.publishPiUsageTelemetryFromStats(stats, state)
     }
     const usage = usageFromPiSessionStats(stats)
 
