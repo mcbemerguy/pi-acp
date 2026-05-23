@@ -69,20 +69,23 @@ export function usageFromPiSessionStats(stats: unknown): Usage | undefined {
 
 export function usageUpdateFromPiSessionStats(stats: unknown): SessionUpdate | undefined {
   if (!isRecord(stats)) return undefined
-  const tokens = nestedRecord(stats, 'tokens')
+  const contextUsage = nestedRecord(stats, 'contextUsage')
   const context = nestedRecord(stats, 'context') ?? nestedRecord(stats, 'contextWindow')
   const model = nestedRecord(stats, 'model')
 
   const used = firstNonNegativeInt(
+    contextUsage?.tokens,
+    contextUsage?.used,
+    contextUsage?.usedTokens,
     context?.used,
     context?.usedTokens,
     stats.usedTokens,
-    stats.contextUsed,
-    tokens?.context,
-    tokens?.total,
-    tokens?.totalTokens
+    stats.contextUsed
   )
   const size = firstPositiveInt(
+    contextUsage?.contextWindow,
+    contextUsage?.size,
+    contextUsage?.maxTokens,
     context?.size,
     context?.maxTokens,
     context?.contextWindow,
