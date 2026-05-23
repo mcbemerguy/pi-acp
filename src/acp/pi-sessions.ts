@@ -12,6 +12,7 @@ export type PiSessionListItem = {
 
 const DEFAULT_TAIL_BYTES = 256 * 1024
 const DEFAULT_HEAD_BYTES = 64 * 1024
+const DEFAULT_INFO_SCAN_BYTES = 1024 * 1024
 
 function getPiAgentDir(): string {
   // pi supports overriding config dir via PI_CODING_AGENT_DIR.
@@ -130,9 +131,7 @@ function pickTitleFromTail(tail: string): string | null {
   return null
 }
 
-function scanSessionInfoNameFromFile(path: string): string | null {
-  // Fallback when the session_info entry is older than our tail window.
-  // Scan the whole file line-by-line and remember the last session_info.name.
+function scanSessionInfoNameFromFile(path: string, maxBytes = DEFAULT_INFO_SCAN_BYTES): string | null {
   const fd = openSync(path, 'r')
   try {
     const buf = Buffer.alloc(256 * 1024)
@@ -140,8 +139,9 @@ function scanSessionInfoNameFromFile(path: string): string | null {
     let offset = 0
     let lastName: string | null = null
 
-    while (true) {
-      const n = readSync(fd, buf, 0, buf.length, offset)
+    while (offset < maxBytes) {
+      const bytesToRead = Math.min(buf.length, maxBytes - offset)
+      const n = readSync(fd, buf, 0, bytesToRead, offset)
       if (n <= 0) break
       offset += n
 
@@ -227,11 +227,24 @@ function pickUpdatedAtFromTail(tail: string): string | null {
   return null
 }
 
-function pickFallbackTitleFromHead(path: string): string | null {
-  // Fallback to first user message.
-  // NOTE: we keep this simple: read a small head chunk and parse line-by-line.
+function readHead(path: string, headBytes = DEFAULT_HEAD_BYTES): string {
+  const fd = openSync(path, 'r')
   try {
-    const raw = readFileSync(path, { encoding: 'utf8' })
+    const buf = Buffer.alloc(headBytes)
+    const n = readSync(fd, buf, 0, buf.length, 0)
+    return buf.subarray(0, n).toString('utf-8')
+  } finally {
+    try {
+      closeSync(fd)
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function pickFallbackTitleFromHead(path: string): string | null {
+  try {
+    const raw = readHead(path)
     const lines = raw.split(/\r?\n/)
     for (const line0 of lines) {
       const line = line0.trim()
@@ -249,11 +262,6 @@ function pickFallbackTitleFromHead(path: string): string | null {
       } catch {
         // ignore
       }
-
-      // Avoid scanning extremely large files fully.
-      // If we didn't find a user message in the first ~2000 lines, give up.
-      // (Most sessions have it early.)
-      if (lines.length > 2000) break
     }
   } catch {
     // ignore
