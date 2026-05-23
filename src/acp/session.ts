@@ -191,8 +191,6 @@ export class PiAcpSession {
   readonly cwd: string
   readonly mcpServers: McpServer[]
 
-  private startupInfo: string | null = null
-  private startupInfoSent = false
   private currentAgentMessageId: string | null = null
 
   readonly proc: PiRpcProcess
@@ -251,23 +249,7 @@ export class PiAcpSession {
     this.proc.dispose?.()
   }
 
-  setStartupInfo(text: string) {
-    this.startupInfo = text
-    this.startupInfoSent = false
-  }
-
-  sendStartupInfoIfPending(): void {
-    if (!this.startupInfo || this.startupInfoSent) return
-    this.startupInfoSent = true
-    this.emit({
-      sessionUpdate: 'agent_message_chunk',
-      content: { type: 'text', text: this.startupInfo }
-    })
-  }
-
   async prompt(message: string, images: unknown[] = []): Promise<StopReason> {
-    this.sendStartupInfoIfPending()
-
     // pi RPC mode disables slash command expansion, so we do it here.
     const expandedMessage = expandSlashCommand(message, this.fileCommands)
 

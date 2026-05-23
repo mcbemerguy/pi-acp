@@ -1,8 +1,5 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 
@@ -15,11 +12,7 @@ class FakeSessions {
 }
 
 test('PiAcpAgent: newSession returns ACP configOptions for model and thought level only', async () => {
-  const prevAgentDir = process.env.PI_CODING_AGENT_DIR
   const realSetTimeout = globalThis.setTimeout
-  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-configoptions-'))
-  writeFileSync(join(dir, 'settings.json'), JSON.stringify({ quietStartup: true }, null, 2), 'utf-8')
-  process.env.PI_CODING_AGENT_DIR = dir
   ;(globalThis as any).setTimeout = () => 0 as any
 
   try {
@@ -38,9 +31,7 @@ test('PiAcpAgent: newSession returns ACP configOptions for model and thought lev
           thinkingLevel: 'low',
           model: { provider: 'openrouter', id: 'anthropic/claude' }
         })
-      },
-      setStartupInfo() {},
-      sendStartupInfoIfPending() {}
+      }
     }
 
     const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
@@ -69,7 +60,5 @@ test('PiAcpAgent: newSession returns ACP configOptions for model and thought lev
     )
   } finally {
     ;(globalThis as any).setTimeout = realSetTimeout
-    if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR
-    else process.env.PI_CODING_AGENT_DIR = prevAgentDir
   }
 })

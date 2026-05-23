@@ -56,20 +56,3 @@ export function getEnableSkillCommands(cwd: string): boolean {
 
   return true
 }
-
-/**
- * Mirror pi's quietStartup setting: if true, pi suppresses the verbose startup prelude.
- * We use it to decide whether to synthesize + emit our own "startup info" message.
- */
-export function getQuietStartup(cwd: string): boolean {
-  const merged = getMergedSettings(cwd)
-
-  const direct = merged.quietStartup
-  if (typeof direct === 'boolean') return direct
-
-  // Back-compat: some versions used quietStart
-  const legacy = (merged as any).quietStart
-  if (typeof legacy === 'boolean') return legacy
-
-  return false
-}
