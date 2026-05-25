@@ -138,6 +138,56 @@ test('WorkflowEventMapper maps inline subworkflow completion to a completed plan
   assert.equal(plans.at(-1).entries[0].status, 'completed')
 })
 
+test('WorkflowEventMapper maps subworkflow tool calls to live plan entries', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+  const updates = [
+    ...mapper.map({
+      type: 'step_start',
+      timestamp: 't1',
+      runId: 'r1',
+      workflowId: 'wf',
+      stepId: 'orchestrate',
+      stepType: 'agent',
+      status: 'running'
+    }),
+    ...mapper.map({
+      type: 'subworkflow_call_start',
+      timestamp: 't2',
+      runId: 'r1',
+      workflowId: 'wf',
+      stepId: 'orchestrate',
+      toolName: 'code_review_fix',
+      childWorkflowId: 'code-review-fix',
+      startedAt: '2026-05-25T18:22:13.747Z',
+      task: 'Implement phase 1 with enough detail to be useful in the sidebar',
+      status: 'running'
+    }),
+    ...mapper.map({
+      type: 'subworkflow_call_end',
+      timestamp: 't3',
+      runId: 'r1',
+      workflowId: 'wf',
+      stepId: 'orchestrate',
+      toolName: 'code_review_fix',
+      childWorkflowId: 'code-review-fix',
+      startedAt: '2026-05-25T18:22:13.747Z',
+      childRunId: 'code-review-fix-1',
+      status: 'completed'
+    })
+  ]
+
+  const plans = updates.filter(update => update.sessionUpdate === 'plan') as any[]
+  const startedEntries = plans.at(-2).entries
+  const completedEntries = plans.at(-1).entries
+  assert.deepEqual(
+    startedEntries.map((entry: any) => entry.status),
+    ['in_progress', 'in_progress']
+  )
+  assert.match(startedEntries[1].content, /^Subworkflow: code-review-fix via code_review_fix — Implement phase 1/)
+  assert.equal(completedEntries[1].content, startedEntries[1].content)
+  assert.equal(completedEntries[1].status, 'completed')
+})
+
 test('WorkflowEventMapper completes open plan entries when a workflow run ends', () => {
   const mapper = new WorkflowEventMapper('/repo')
   const updates = [

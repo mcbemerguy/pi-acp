@@ -116,6 +116,9 @@ export class WorkflowEventMapper {
           runId,
           'step_end'
         )
+      case 'subworkflow_call_start':
+      case 'subworkflow_call_end':
+        return this.mapSubWorkflowCall(record, runId, type)
       case 'child_pi_event':
         return this.mapChildPiEvent(record, runId)
       default:
@@ -209,6 +212,25 @@ export class WorkflowEventMapper {
     const toolCallId = stepToolId(runId, stepId)
     const stepContent = stepTitle(record, stepId)
     this.steps.set(toolCallId, { id: toolCallId, content: stepContent, status: planStatus(record, type) })
+
+    const plan = this.planUpdate()
+    return plan ? [plan] : []
+  }
+
+  private mapSubWorkflowCall(record: Record<string, unknown>, runId: string, type: string): SessionUpdate[] {
+    const stepId = stringField(record.stepId)
+    const startedAt = stringField(record.startedAt)
+    const childWorkflowId = stringField(record.childWorkflowId) ?? stringField(record.workflowId) ?? 'workflow'
+    const toolName = stringField(record.toolName) ?? childWorkflowId
+    if (!stepId || !startedAt) return []
+
+    const toolCallId = subWorkflowCallToolId(runId, stepId, toolName, startedAt)
+    const existing = this.steps.get(toolCallId)
+    this.steps.set(toolCallId, {
+      id: toolCallId,
+      content: subWorkflowCallTitle(record, childWorkflowId, toolName, existing?.content),
+      status: type === 'subworkflow_call_end' ? 'completed' : 'in_progress'
+    })
 
     const plan = this.planUpdate()
     return plan ? [plan] : []
@@ -689,6 +711,10 @@ function childToolId(runId: string, stepId: string, toolCallId: string): string 
   return `workflow:${runId}:step:${stepId}:tool:${toolCallId}`
 }
 
+function subWorkflowCallToolId(runId: string, stepId: string, toolName: string, startedAt: string): string {
+  return ['workflow', runId, 'step', stepId, 'subworkflow', toolName, startedAt].map(encodeIdPart).join(':')
+}
+
 function metaFromRecord(record: Record<string, unknown>): WorkflowMeta {
   return {
     runId: String(record.runId),
@@ -721,6 +747,23 @@ function planStatus(record: Record<string, unknown>, type: string): 'pending' | 
 function stepTitle(record: Record<string, unknown>, stepId: string): string {
   const stepType = stringField(record.stepType)
   return stepType ? `Workflow step: ${stepId} (${stepType})` : `Workflow step: ${stepId}`
+}
+
+function subWorkflowCallTitle(
+  record: Record<string, unknown>,
+  childWorkflowId: string,
+  toolName: string,
+  fallback?: string
+): string {
+  const label = toolName !== childWorkflowId ? `${childWorkflowId} via ${toolName}` : childWorkflowId
+  const task = stringField(record.task)
+  if (task) return `Subworkflow: ${label} — ${truncateOneLine(task, 180)}`
+  return fallback ?? `Subworkflow: ${label}`
+}
+
+function truncateOneLine(value: string, max: number): string {
+  const line = value.replace(/\s+/g, ' ').trim()
+  return line.length <= max ? line : `${line.slice(0, max - 1)}…`
 }
 
 function assistantText(message: Record<string, unknown> | undefined): string {
