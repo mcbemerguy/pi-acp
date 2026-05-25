@@ -180,7 +180,7 @@ export class WorkflowEventMapper {
 
     const auditPath = stringField(record.auditPath)
     const auditUri = auditPath ? pathToFileURL(auditPath).href : undefined
-    const summary = `Workflow ${workflowId} ${status === 'failed' ? 'failed' : 'completed'}${auditUri ? `. Audit: ${auditUri}` : '.'}`
+    const summary = `Workflow ${workflowId} ${status === 'failed' ? 'failed' : 'completed'}${auditUri ? `. Audit: [audit.md](<${auditUri}>)` : '.'}`
     updates.push({
       sessionUpdate: 'agent_message_chunk',
       content: { type: 'text', text: summary } satisfies ContentBlock,
@@ -619,7 +619,9 @@ function readMetadataFromEvents(eventsPath: string): WorkflowRunMetadata | null 
     metadata.initialTaskMessage ??= stringField(record.initialTaskMessage)
     metadata.parentSessionId ??= stringField(record.parentSessionId)
   }
-  return metadata.runId || metadata.workflowId || metadata.rootWorkflowId || metadata.commandName || metadata.cwd ? metadata : null
+  return metadata.runId || metadata.workflowId || metadata.rootWorkflowId || metadata.commandName || metadata.cwd
+    ? metadata
+    : null
 }
 
 function metadataMatchesTarget(

@@ -551,7 +551,12 @@ test('WorkflowEventMonitor matches custom workflow command names against Pi run 
     workflowRunsDir,
     pollIntervalMs: 10,
     graceMs: 30,
-    target: { workflowId: 'review', commandName: 'workflow:review', initialTaskMessage: 'task', parentSessionId: 'session-1' }
+    target: {
+      workflowId: 'review',
+      commandName: 'workflow:review',
+      initialTaskMessage: 'task',
+      parentSessionId: 'session-1'
+    }
   })
 
   monitor.start()
@@ -559,7 +564,14 @@ test('WorkflowEventMonitor matches custom workflow command names against Pi run 
   mkdirSync(runDir)
   writeFileSync(
     join(runDir, 'run.json'),
-    JSON.stringify({ id: 'custom', workflowId: 'code-review-fix', commandName: 'workflow:review', cwd: '/repo', initialTaskMessage: 'task', parentSessionId: 'session-1' }),
+    JSON.stringify({
+      id: 'custom',
+      workflowId: 'code-review-fix',
+      commandName: 'workflow:review',
+      cwd: '/repo',
+      initialTaskMessage: 'task',
+      parentSessionId: 'session-1'
+    }),
     'utf8'
   )
   writeFileSync(
@@ -579,7 +591,9 @@ test('WorkflowEventMonitor matches custom workflow command names against Pi run 
     updates.filter(update => update.sessionUpdate === 'tool_call').map(update => update.toolCallId),
     ['workflow:custom']
   )
-  assert.ok(updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:custom'))
+  assert.ok(
+    updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:custom')
+  )
   rmSync(root, { recursive: true, force: true })
 })
 
@@ -605,7 +619,7 @@ test('WorkflowEventMapper renders audit summary without raw Markdown-sensitive W
   const auditUri = pathToFileURL(auditPath).href
 
   assert.ok(summary)
-  assert.equal(summary.content.text, `Workflow wf failed. Audit: ${auditUri}`)
+  assert.equal(summary.content.text, `Workflow wf failed. Audit: [audit.md](<${auditUri}>)`)
   assert.equal(summary.content.text.includes(auditPath), false)
   assert.ok(link)
   assert.equal(link.content.uri, auditUri)
