@@ -56,7 +56,7 @@ test('baseline: Pi RPC stdout ingestion observes every generated event in order'
   }
 })
 
-test('baseline: ACP session enqueue path retains every Pi event before client presentation drains', async () => {
+test('phase 4: ACP session outbound pressure coalesces presentation text after ingestion accounting', async () => {
   const fixture = makePiTextDeltaEvents(2_000, 48)
   const conn = new FakeAgentSideConnection()
   let unblock!: () => void
@@ -84,14 +84,16 @@ test('baseline: ACP session enqueue path retains every Pi event before client pr
 
   const beforeEnd = session.getOutboundPressureSnapshot()
   assert.equal(beforeEnd.enqueued, fixture.records.length + 1)
-  assert.equal(beforeEnd.maxPending, fixture.records.length + 1)
+  assert.ok(beforeEnd.maxPending < 10, `expected bounded pending ACP updates, got ${beforeEnd.maxPending}`)
   assert.equal(beforeEnd.completed, 0)
+  assert.ok(beforeEnd.coalesced > 0)
 
   const agentEndAt = performance.now()
   proc.emit({ type: 'agent_end' })
   await wait(20)
   const blocked = session.getOutboundPressureSnapshot()
-  assert.equal(blocked.pending, fixture.records.length + 1)
+  assert.ok(blocked.pending < 10, `expected bounded blocked ACP updates, got ${blocked.pending}`)
+  assert.equal(blocked.enqueued, fixture.records.length + 1)
 
   unblock()
   const reason = await prompt
@@ -99,7 +101,7 @@ test('baseline: ACP session enqueue path retains every Pi event before client pr
   assert.equal(reason, 'end_turn')
   await waitUntil(() => {
     const snapshot = session.getOutboundPressureSnapshot()
-    return snapshot.completed === snapshot.enqueued && snapshot.pending === 0
+    return snapshot.pending === 0
   })
 
   const textChunks = conn.updates.flatMap(message => {
@@ -111,9 +113,9 @@ test('baseline: ACP session enqueue path retains every Pi event before client pr
       : []
   })
 
-  assert.deepEqual(
-    textChunks,
-    fixture.records.map(record => String((record.assistantMessageEvent as { delta: string }).delta))
+  assert.equal(
+    textChunks.join(''),
+    fixture.records.map(record => String((record.assistantMessageEvent as { delta: string }).delta)).join('')
   )
 
   const finalPressure = session.getOutboundPressureSnapshot()
@@ -123,6 +125,9 @@ test('baseline: ACP session enqueue path retains every Pi event before client pr
       events: fixture.records.length,
       bytes: fixture.bytes,
       maxQueueDepth: finalPressure.maxPending,
+      coalesced: finalPressure.coalesced,
+      sentUpdates: conn.updates.length,
+      sourceUpdatesAccounted: finalPressure.enqueued,
       promptCompletionLatencyMs: Math.round(promptCompletionLatencyMs)
     })
   )

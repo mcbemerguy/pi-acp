@@ -60,7 +60,20 @@ export type OutboundPressureSnapshot = {
   failed: number
   pending: number
   maxPending: number
+  coalesced: number
+  diagnostics: number
 }
+
+type OutboundQueueItem = {
+  kind: 'sessionUpdate' | 'extNotification'
+  update?: SessionUpdate
+  method?: string
+  params?: Record<string, unknown>
+  resolve?: () => void
+  reject?: (err: unknown) => void
+}
+
+const OUTBOUND_BACKLOG_DIAGNOSTIC_PENDING = 256
 
 function findUniqueLineNumber(text: string, needle: string): number | undefined {
   if (!needle) return undefined
@@ -229,6 +242,8 @@ export class PiAcpSession {
   private sawAgentActivity = false
   private promptAckFallbackTimer: NodeJS.Timeout | null = null
   private currentWorkflowMonitor: WorkflowEventMonitor | null = null
+  private completingWorkflowMonitor: WorkflowEventMonitor | null = null
+  private completionReasonOverride: StopReason | null = null
   private drainingCancelledTurn = false
   private cancelDrainTimer: NodeJS.Timeout | null = null
 
@@ -237,13 +252,19 @@ export class PiAcpSession {
   // Compatible format may need to be implemented in pi in the future.
   private editSnapshots = new Map<string, { path: string; oldText: string }>()
 
-  private lastSend: Promise<void> = Promise.resolve()
+  private outboundQueue: OutboundQueueItem[] = []
+  private sendingOutbound = false
+  private drainingOutbound = false
+  private outboundDrainWaiters: Array<() => void> = []
+  private outboundDiagnosticQueued = false
   private outboundPressure: OutboundPressureSnapshot = {
     enqueued: 0,
     completed: 0,
     failed: 0,
     pending: 0,
-    maxPending: 0
+    maxPending: 0,
+    coalesced: 0,
+    diagnostics: 0
   }
 
   constructor(opts: {
@@ -269,6 +290,8 @@ export class PiAcpSession {
   dispose(): void {
     this.currentWorkflowMonitor?.dispose()
     this.currentWorkflowMonitor = null
+    this.completingWorkflowMonitor?.dispose()
+    this.completingWorkflowMonitor = null
     if (this.cancelDrainTimer) {
       clearTimeout(this.cancelDrainTimer)
       this.cancelDrainTimer = null
@@ -339,13 +362,15 @@ export class PiAcpSession {
 
     try {
       await this.withTimeout(this.proc.abort(), this.cancelAbortTimeoutMs, 'pi abort')
-      this.completeTurn('cancelled', { drainPiEvents: true })
+      if (!this.interruptCompletingTurn('cancelled', { drainPiEvents: true })) {
+        this.completeTurn('cancelled', { drainPiEvents: true })
+      }
     } catch {
       this.emit({
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'Pi did not acknowledge cancellation; restarting the ACP subprocess.' }
       })
-      this.completeTurn('cancelled')
+      if (!this.interruptCompletingTurn('cancelled')) this.completeTurn('cancelled')
       this.proc.dispose('SIGKILL')
     }
   }
@@ -368,37 +393,109 @@ export class PiAcpSession {
     return { ...this.outboundPressure }
   }
 
-  private enqueueSend(send: () => Promise<void>): void {
+  private enqueueOutbound(item: OutboundQueueItem): void {
     this.outboundPressure.enqueued += 1
-    this.outboundPressure.pending += 1
-    this.outboundPressure.maxPending = Math.max(this.outboundPressure.maxPending, this.outboundPressure.pending)
-    this.lastSend = this.lastSend.then(async () => {
-      try {
-        await send()
-        this.outboundPressure.completed += 1
-      } catch {
-        this.outboundPressure.failed += 1
-      } finally {
-        this.outboundPressure.pending -= 1
+    if (this.coalesceOutbound(item)) {
+      this.outboundPressure.coalesced += 1
+      this.updateOutboundPendingPressure()
+      return
+    }
+
+    this.outboundQueue.push(item)
+    this.updateOutboundPendingPressure()
+    this.queueOutboundDiagnosticIfNeeded()
+    this.drainOutboundQueue()
+  }
+
+  private coalesceOutbound(item: OutboundQueueItem): boolean {
+    if (item.kind !== 'sessionUpdate' || !item.update || item.resolve || item.reject) return false
+    const previous = this.outboundQueue[this.outboundQueue.length - 1]
+    if (!previous || previous.kind !== 'sessionUpdate' || !previous.update) return false
+
+    if (mergeTextChunkUpdate(previous.update, item.update)) return true
+    if (replaceRoutinePresentationUpdate(previous, item)) return true
+
+    return false
+  }
+
+  private queueOutboundDiagnosticIfNeeded(): void {
+    const pending = this.currentOutboundPending()
+    if (pending < OUTBOUND_BACKLOG_DIAGNOSTIC_PENDING || this.outboundDiagnosticQueued) return
+
+    this.outboundDiagnosticQueued = true
+    this.outboundPressure.diagnostics += 1
+    this.outboundQueue.push({
+      kind: 'sessionUpdate',
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        content: {
+          type: 'text',
+          text: `ACP outbound presentation is backlogged (${pending} updates pending); routine text/status updates may be coalesced after ingestion.`
+        } satisfies ContentBlock
       }
     })
+    this.updateOutboundPendingPressure()
+  }
+
+  private drainOutboundQueue(): void {
+    if (this.drainingOutbound) return
+    this.drainingOutbound = true
+    void (async () => {
+      while (this.outboundQueue.length) {
+        const item = this.outboundQueue.shift()
+        if (!item) continue
+        this.sendingOutbound = true
+        this.updateOutboundPendingPressure()
+        try {
+          if (item.kind === 'sessionUpdate') {
+            await this.conn.sessionUpdate({ sessionId: this.sessionId, update: item.update as SessionUpdate })
+          } else {
+            await this.conn.extNotification(String(item.method), item.params ?? {})
+          }
+          this.outboundPressure.completed += 1
+          item.resolve?.()
+        } catch (err) {
+          this.outboundPressure.failed += 1
+          item.reject?.(err)
+        } finally {
+          this.sendingOutbound = false
+          this.updateOutboundPendingPressure()
+        }
+      }
+      this.drainingOutbound = false
+      this.outboundDiagnosticQueued = false
+      this.resolveOutboundDrainWaiters()
+      if (this.outboundQueue.length) this.drainOutboundQueue()
+    })()
+  }
+
+  private currentOutboundPending(): number {
+    return this.outboundQueue.length + (this.sendingOutbound ? 1 : 0)
+  }
+
+  private updateOutboundPendingPressure(): void {
+    const pending = this.currentOutboundPending()
+    this.outboundPressure.pending = pending
+    this.outboundPressure.maxPending = Math.max(this.outboundPressure.maxPending, pending)
+  }
+
+  private resolveOutboundDrainWaiters(): void {
+    if (this.currentOutboundPending() !== 0) return
+    const waiters = this.outboundDrainWaiters.splice(0, this.outboundDrainWaiters.length)
+    for (const resolve of waiters) resolve()
   }
 
   private emit(update: SessionUpdate): void {
-    this.enqueueSend(() =>
-      this.conn.sessionUpdate({
-        sessionId: this.sessionId,
-        update
-      })
-    )
+    this.enqueueOutbound({ kind: 'sessionUpdate', update })
   }
 
   private emitCustomNotification(method: string, params: Record<string, unknown>): void {
-    this.enqueueSend(() => this.conn.extNotification(method, params))
+    this.enqueueOutbound({ kind: 'extNotification', method, params })
   }
 
   private async flushEmits(): Promise<void> {
-    await this.lastSend
+    if (this.currentOutboundPending() === 0) return
+    await new Promise<void>(resolve => this.outboundDrainWaiters.push(resolve))
   }
 
   private withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -415,6 +512,8 @@ export class PiAcpSession {
     this.cancelRequested = false
     this.inAgentLoop = false
     this.completingTurn = false
+    this.completingWorkflowMonitor = null
+    this.completionReasonOverride = null
     this.sawAgentActivity = false
     if (this.promptAckFallbackTimer) {
       clearTimeout(this.promptAckFallbackTimer)
@@ -467,15 +566,28 @@ export class PiAcpSession {
       })
   }
 
+  private interruptCompletingTurn(reason: StopReason, opts: { drainPiEvents?: boolean } = {}): boolean {
+    if (!this.pendingTurn || !this.completingTurn) return false
+    this.completionReasonOverride = reason
+    if (opts.drainPiEvents) this.startCancelledTurnDrain()
+    this.currentWorkflowMonitor?.dispose()
+    this.currentWorkflowMonitor = null
+    this.completingWorkflowMonitor?.dispose()
+    this.completingWorkflowMonitor = null
+    return true
+  }
+
   private completeTurn(
     reason: StopReason,
     opts: { reject?: unknown; proceedQueue?: boolean; drainPiEvents?: boolean } = {}
   ): void {
     if (!this.pendingTurn || this.completingTurn) return
     this.completingTurn = true
+    this.completionReasonOverride = null
     const pending = this.pendingTurn
     const monitor = this.currentWorkflowMonitor
     this.currentWorkflowMonitor = null
+    this.completingWorkflowMonitor = monitor
     if (opts.drainPiEvents) this.startCancelledTurnDrain()
 
     void (async () => {
@@ -488,8 +600,10 @@ export class PiAcpSession {
       }
       await this.flushEmits()
 
-      if (opts.reject) pending.reject(opts.reject)
-      else pending.resolve(reason)
+      const finalReason = this.completionReasonOverride ?? reason
+      if (finalReason === 'cancelled') pending.resolve('cancelled')
+      else if (opts.reject) pending.reject(opts.reject)
+      else pending.resolve(finalReason)
 
       if (this.promptAckFallbackTimer) {
         clearTimeout(this.promptAckFallbackTimer)
@@ -499,6 +613,8 @@ export class PiAcpSession {
       this.pendingTurn = null
       this.inAgentLoop = false
       this.completingTurn = false
+      this.completingWorkflowMonitor = null
+      this.completionReasonOverride = null
       this.sawAgentActivity = false
       this.currentAgentMessageId = null
 
@@ -856,6 +972,29 @@ export class PiAcpSession {
       })
     }
   }
+}
+
+function mergeTextChunkUpdate(previous: SessionUpdate, next: SessionUpdate): boolean {
+  if (previous.sessionUpdate !== next.sessionUpdate) return false
+  if (previous.sessionUpdate !== 'agent_message_chunk' && previous.sessionUpdate !== 'agent_thought_chunk') return false
+  const previousContent = (previous as { content?: ContentBlock }).content
+  const nextContent = (next as { content?: ContentBlock }).content
+  if (previousContent?.type !== 'text' || nextContent?.type !== 'text') return false
+  const previousMessageId = (previous as { messageId?: unknown }).messageId
+  const nextMessageId = (next as { messageId?: unknown }).messageId
+  if (typeof previousMessageId !== 'string' || previousMessageId !== nextMessageId) return false
+
+  previousContent.text += nextContent.text
+  return true
+}
+
+function replaceRoutinePresentationUpdate(previous: OutboundQueueItem, next: OutboundQueueItem): boolean {
+  if (!previous.update || !next.update) return false
+  if (previous.update.sessionUpdate !== next.update.sessionUpdate) return false
+  if (next.update.sessionUpdate !== 'session_info_update' && next.update.sessionUpdate !== 'plan') return false
+
+  previous.update = next.update
+  return true
 }
 
 function shouldRespondToExtensionUiRequest(method: string): boolean {

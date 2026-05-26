@@ -681,6 +681,48 @@ test('PiAcpSession: prompt rejects and surfaces message when pi prompt fails', a
   )
 })
 
+test('PiAcpSession: cancel overrides an in-progress prompt failure completion', async () => {
+  const conn = new FakeAgentSideConnection()
+  let unblockSessionUpdates!: () => void
+  conn.sessionUpdateBlocker = new Promise(resolve => {
+    unblockSessionUpdates = resolve
+  })
+  const proc = new FakePiRpcProcess()
+  proc.promptError = new Error('socket hang up')
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const prompt = session.prompt('hello')
+
+  try {
+    for (let i = 0; i < 10 && !(session as any).completingTurn; i += 1) await wait(0)
+    assert.equal((session as any).completingTurn, true)
+
+    await session.cancel()
+    unblockSessionUpdates()
+
+    const reason = await prompt
+    assert.equal(reason, 'cancelled')
+    assert.equal(proc.abortCount, 1)
+    assert.ok(
+      conn.updates.some(
+        msg =>
+          msg.update.sessionUpdate === 'agent_message_chunk' &&
+          (msg.update as any).content.text === 'Pi prompt failed: socket hang up'
+      )
+    )
+  } finally {
+    unblockSessionUpdates()
+  }
+})
+
 test('PiAcpSession: prompt resolves when an extension command returns without agent_end', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -758,6 +800,61 @@ test('PiAcpSession: workflow slash prompt stays pending until workflow run_end',
     const reason = await prompt
     assert.equal(reason, 'end_turn')
     assert.ok(conn.updates.some(msg => msg.update.sessionUpdate === 'tool_call_update'))
+  } finally {
+    if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = oldAgentDir
+    rmSync(agentDir, { recursive: true, force: true })
+  }
+})
+
+test('PiAcpSession: cancel interrupts a workflow prompt waiting for run_end', async () => {
+  const oldAgentDir = process.env.PI_CODING_AGENT_DIR
+  const agentDir = mkdtempSync(join(tmpdir(), 'pi-acp-agent-'))
+  process.env.PI_CODING_AGENT_DIR = agentDir
+
+  try {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-acp-workflow-cwd-'))
+    const conn = new FakeAgentSideConnection()
+    const proc = new FakePiRpcProcess()
+    const session = new PiAcpSession({
+      sessionId: 's1',
+      cwd,
+      mcpServers: [],
+      proc: proc as any,
+      conn: asAgentConn(conn),
+      fileCommands: []
+    })
+
+    const prompt = session.prompt('/workflow:review task')
+
+    const workflowRunsDir = join(agentDir, 'workflow-runs')
+    const runDir = join(workflowRunsDir, 'r1')
+    mkdirSync(runDir, { recursive: true })
+    writeFileSync(
+      join(runDir, 'run.json'),
+      JSON.stringify({
+        id: 'r1',
+        workflowId: 'review',
+        commandName: 'workflow:review',
+        cwd,
+        initialTaskMessage: 'task',
+        parentSessionId: 's1',
+        status: 'running'
+      }),
+      'utf8'
+    )
+    writeFileSync(
+      join(runDir, 'events.jsonl'),
+      `${JSON.stringify({ type: 'run_start', timestamp: 't1', runId: 'r1', workflowId: 'review', commandName: 'workflow:review', cwd, status: 'running' })}\n`,
+      'utf8'
+    )
+
+    await wait(200)
+    await session.cancel()
+    const reason = await Promise.race([prompt, wait(500).then(() => 'timeout')])
+
+    assert.equal(proc.abortCount, 1)
+    assert.equal(reason, 'cancelled')
   } finally {
     if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
     else process.env.PI_CODING_AGENT_DIR = oldAgentDir

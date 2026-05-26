@@ -12,10 +12,12 @@ export class FakeAgentSideConnection {
     { type: 'sessionUpdate'; msg: SessionUpdateMsg } | { type: 'extNotification'; msg: ExtNotificationMsg }
   > = []
   private extensionResponses: Array<Record<string, unknown> | Error> = []
+  sessionUpdateBlocker: Promise<void> | null = null
   extNotificationDelayMs = 0
   extNotificationBlocker: Promise<void> | null = null
 
   async sessionUpdate(msg: SessionUpdateMsg): Promise<void> {
+    if (this.sessionUpdateBlocker) await this.sessionUpdateBlocker
     this.updates.push(msg)
     this.sent.push({ type: 'sessionUpdate', msg })
   }
