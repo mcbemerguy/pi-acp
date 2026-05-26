@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, rmSync, writeFileSync, appendFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -12,6 +12,14 @@ import {
 } from '../../src/acp/workflow-events.js'
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const startedAt = Date.now()
+  while (!predicate()) {
+    if (Date.now() - startedAt > timeoutMs) throw new Error('timed out waiting for workflow monitor condition')
+    await wait(5)
+  }
+}
 
 test('isWorkflowCommandPrompt recognizes detached workflow slash commands', () => {
   assert.equal(isWorkflowCommandPrompt('/workflow:review do it'), true)
@@ -514,6 +522,233 @@ test('WorkflowEventMonitor tails new run artifacts and tolerates malformed parti
   rmSync(root, { recursive: true, force: true })
 })
 
+test('WorkflowEventMonitor tails large JSONL lines incrementally once and in order', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-large-tail-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  const runDir = join(workflowRunsDir, 'large')
+  const eventsPath = join(runDir, 'events.jsonl')
+  const observedSequences: number[] = []
+  const monitor = new WorkflowEventMonitor('/repo', () => {}, {
+    workflowRunsDir,
+    pollIntervalMs: 5,
+    graceMs: 20,
+    onRecord: record => observedSequences.push(Number(record.sequence))
+  })
+
+  const payload = 'x'.repeat(8_000)
+  const records: Record<string, unknown>[] = [
+    { type: 'run_start', sequence: 0, timestamp: 't0', runId: 'large', workflowId: 'wf', status: 'running' },
+    ...Array.from({ length: 10 }, (_, index) => ({
+      type: 'child_pi_event',
+      sequence: index + 1,
+      timestamp: `t${index + 1}`,
+      runId: 'large',
+      workflowId: 'wf',
+      stepId: 'code',
+      childSessionId: 'child',
+      childEventType: 'message_update',
+      event: {
+        type: 'message_update',
+        messageId: `m-${index}`,
+        assistantMessageEvent: { type: 'text_delta', delta: `${index}-${payload}`, partial: { id: `m-${index}` } }
+      }
+    })),
+    { type: 'run_end', sequence: 11, timestamp: 't11', runId: 'large', workflowId: 'wf', status: 'completed' }
+  ]
+
+  let bytesWritten = 0
+  try {
+    monitor.start()
+    mkdirSync(runDir, { recursive: true })
+    writeFileSync(eventsPath, '', 'utf8')
+    for (const [index, record] of records.entries()) {
+      const line = `${JSON.stringify(record)}\n`
+      appendFileSync(eventsPath, line, 'utf8')
+      bytesWritten += Buffer.byteLength(line)
+      await waitUntil(() => observedSequences.length === index + 1)
+    }
+    await monitor.waitForRunEndAfterPromptResolution()
+
+    assert.deepEqual(
+      observedSequences,
+      records.map(record => Number(record.sequence))
+    )
+    const snapshot = monitor.getIngestionSnapshot()
+    assert.equal(snapshot.recordsObserved, records.length)
+    assert.equal(snapshot.newBytesObserved, bytesWritten)
+    assert.equal(snapshot.fileBytesRead, bytesWritten)
+  } finally {
+    monitor.dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('WorkflowEventMonitor observes fast runs that complete before the next poll', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-fast-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  mkdirSync(workflowRunsDir, { recursive: true })
+  const updates: any[] = []
+  const monitor = new WorkflowEventMonitor('/repo', update => updates.push(update), {
+    workflowRunsDir,
+    pollIntervalMs: 25,
+    graceMs: 20
+  })
+
+  try {
+    monitor.start()
+    const runDir = join(workflowRunsDir, 'fast')
+    mkdirSync(runDir)
+    writeFileSync(
+      join(runDir, 'events.jsonl'),
+      `${JSON.stringify({ type: 'run_start', timestamp: 't1', runId: 'fast', workflowId: 'wf', status: 'running' })}\n${JSON.stringify({ type: 'run_end', timestamp: 't2', runId: 'fast', workflowId: 'wf', status: 'completed' })}\n`,
+      'utf8'
+    )
+
+    await monitor.waitForRunEndAfterPromptResolution()
+    assert.deepEqual(
+      updates.filter(update => update.sessionUpdate === 'tool_call').map(update => update.toolCallId),
+      ['workflow:fast']
+    )
+    assert.ok(
+      updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:fast')
+    )
+  } finally {
+    monitor.dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('WorkflowEventMonitor handles events.jsonl truncation while preserving terminal observation', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-truncate-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  mkdirSync(workflowRunsDir, { recursive: true })
+  const updates: any[] = []
+  const monitor = new WorkflowEventMonitor('/repo', update => updates.push(update), {
+    workflowRunsDir,
+    pollIntervalMs: 5,
+    graceMs: 20
+  })
+
+  try {
+    monitor.start()
+    const runDir = join(workflowRunsDir, 'truncated')
+    mkdirSync(runDir)
+    const eventsPath = join(runDir, 'events.jsonl')
+    writeFileSync(
+      eventsPath,
+      `${JSON.stringify({ type: 'run_start', timestamp: 't1', runId: 'truncated', workflowId: 'wf', status: 'running', padding: 'x'.repeat(2_000) })}\n`,
+      'utf8'
+    )
+    await waitUntil(() =>
+      updates.some(update => update.sessionUpdate === 'tool_call' && update.toolCallId === 'workflow:truncated')
+    )
+
+    writeFileSync(
+      eventsPath,
+      `${JSON.stringify({ type: 'run_end', timestamp: 't2', runId: 'truncated', workflowId: 'wf', status: 'completed' })}\n`,
+      'utf8'
+    )
+
+    await monitor.waitForRunEndAfterPromptResolution()
+    assert.ok(
+      updates.some(
+        update =>
+          update.sessionUpdate === 'tool_call_update' &&
+          update.toolCallId === 'workflow:truncated' &&
+          update.status === 'completed'
+      )
+    )
+  } finally {
+    monitor.dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('WorkflowEventMonitor handles events.jsonl rotation while preserving terminal observation', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-rotate-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  mkdirSync(workflowRunsDir, { recursive: true })
+  const updates: any[] = []
+  const monitor = new WorkflowEventMonitor('/repo', update => updates.push(update), {
+    workflowRunsDir,
+    pollIntervalMs: 5,
+    graceMs: 20
+  })
+
+  try {
+    monitor.start()
+    const runDir = join(workflowRunsDir, 'rotated')
+    mkdirSync(runDir)
+    const eventsPath = join(runDir, 'events.jsonl')
+    writeFileSync(
+      eventsPath,
+      `${JSON.stringify({ type: 'run_start', timestamp: 't1', runId: 'rotated', workflowId: 'wf', status: 'running' })}\n`,
+      'utf8'
+    )
+    await waitUntil(() =>
+      updates.some(update => update.sessionUpdate === 'tool_call' && update.toolCallId === 'workflow:rotated')
+    )
+
+    renameSync(eventsPath, join(runDir, 'events.jsonl.1'))
+    writeFileSync(
+      eventsPath,
+      `${JSON.stringify({ type: 'run_end', timestamp: 't2', runId: 'rotated', workflowId: 'wf', status: 'completed' })}\n`,
+      'utf8'
+    )
+
+    await monitor.waitForRunEndAfterPromptResolution()
+    assert.ok(
+      updates.some(
+        update =>
+          update.sessionUpdate === 'tool_call_update' &&
+          update.toolCallId === 'workflow:rotated' &&
+          update.status === 'completed'
+      )
+    )
+  } finally {
+    monitor.dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('WorkflowEventMonitor can discover targeted runs from events.jsonl when run.json is missing', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-no-run-json-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  mkdirSync(workflowRunsDir, { recursive: true })
+  const updates: any[] = []
+  const monitor = new WorkflowEventMonitor('/repo', update => updates.push(update), {
+    workflowRunsDir,
+    pollIntervalMs: 5,
+    graceMs: 20,
+    target: { workflowId: 'review', commandName: 'workflow:review', initialTaskMessage: 'task', parentSessionId: 's1' }
+  })
+
+  try {
+    monitor.start()
+    const runDir = join(workflowRunsDir, 'events-only')
+    mkdirSync(runDir)
+    writeFileSync(
+      join(runDir, 'events.jsonl'),
+      `${JSON.stringify({ type: 'run_start', timestamp: 't1', runId: 'events-only', workflowId: 'review', rootWorkflowId: 'review', commandName: 'workflow:review', cwd: '/repo', initialTaskMessage: 'task', parentSessionId: 's1', status: 'running' })}\n${JSON.stringify({ type: 'run_end', timestamp: 't2', runId: 'events-only', workflowId: 'review', rootWorkflowId: 'review', commandName: 'workflow:review', cwd: '/repo', status: 'completed' })}\n`,
+      'utf8'
+    )
+
+    await monitor.waitForRunEndAfterPromptResolution()
+    assert.deepEqual(
+      updates.filter(update => update.sessionUpdate === 'tool_call').map(update => update.toolCallId),
+      ['workflow:events-only']
+    )
+    assert.ok(
+      updates.some(
+        update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:events-only'
+      )
+    )
+  } finally {
+    monitor.dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('WorkflowEventMonitor can keep tailing an accepted run until run_end', async () => {
   const root = join(tmpdir(), `pi-acp-workflow-wait-${process.pid}-${Date.now()}`)
   const workflowRunsDir = join(root, 'workflow-runs')
@@ -550,6 +785,82 @@ test('WorkflowEventMonitor can keep tailing an accepted run until run_end', asyn
 
   assert.equal(stopped, true)
   assert.ok(updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:r1'))
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('WorkflowEventMonitor falls back to terminal run.json when run_end is missing', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-run-json-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  mkdirSync(workflowRunsDir, { recursive: true })
+  const updates: any[] = []
+  const monitor = new WorkflowEventMonitor('/repo', update => updates.push(update), {
+    workflowRunsDir,
+    pollIntervalMs: 10,
+    graceMs: 30
+  })
+
+  monitor.start()
+  const runDir = join(workflowRunsDir, 'r1')
+  mkdirSync(runDir)
+  const eventsPath = join(runDir, 'events.jsonl')
+  writeFileSync(
+    eventsPath,
+    `${JSON.stringify({ type: 'run_start', timestamp: 't1', runId: 'r1', workflowId: 'wf', status: 'running' })}\n`,
+    'utf8'
+  )
+
+  const stop = monitor.waitForRunEndAfterPromptResolution()
+  await wait(30)
+  writeFileSync(
+    join(runDir, 'run.json'),
+    JSON.stringify({
+      id: 'r1',
+      workflowId: 'wf',
+      cwd: '/repo',
+      runDir,
+      auditPath: join(runDir, 'audit.md'),
+      status: 'completed',
+      endedAt: '2026-05-26T00:00:00.000Z'
+    }),
+    'utf8'
+  )
+
+  await stop
+  const finalUpdate = updates.find(
+    update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:r1'
+  )
+  assert.equal(finalUpdate?.status, 'completed')
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('WorkflowEventMonitor times out accepted runs that never publish a terminal state', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-timeout-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  mkdirSync(workflowRunsDir, { recursive: true })
+  const updates: any[] = []
+  const monitor = new WorkflowEventMonitor('/repo', update => updates.push(update), {
+    workflowRunsDir,
+    pollIntervalMs: 10,
+    graceMs: 30,
+    runEndMaxWaitMs: 35
+  })
+
+  monitor.start()
+  const runDir = join(workflowRunsDir, 'r1')
+  mkdirSync(runDir)
+  writeFileSync(
+    join(runDir, 'events.jsonl'),
+    `${JSON.stringify({ type: 'run_start', timestamp: 't1', runId: 'r1', workflowId: 'wf', status: 'running' })}\n`,
+    'utf8'
+  )
+
+  await monitor.waitForRunEndAfterPromptResolution()
+
+  const finalUpdate = updates.find(
+    update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:r1'
+  )
+  assert.equal(finalUpdate?.status, 'failed')
+  assert.match(JSON.stringify(finalUpdate?.rawOutput), /run_end was not observed/)
   rmSync(root, { recursive: true, force: true })
 })
 

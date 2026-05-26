@@ -1,7 +1,8 @@
 import type { ContentBlock, SessionUpdate, ToolCallContent, ToolKind } from '@agentclientprotocol/sdk'
 import { createHash } from 'node:crypto'
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { closeSync, openSync, readFileSync, readdirSync, readSync, statSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import { pathToFileURL } from 'node:url'
 import { getAgentDir } from './pi-settings.js'
 import { toolResultToText } from './translate/pi-tools.js'
@@ -20,6 +21,7 @@ type WorkflowEventMonitorOptions = {
   workflowRunsDir?: string
   pollIntervalMs?: number
   graceMs?: number
+  runEndMaxWaitMs?: number
   target?: WorkflowEventMonitorTarget | null
   onRecord?: (record: Record<string, unknown>, sequence: number) => void
 }
@@ -37,6 +39,9 @@ type TailState = {
   filePath: string
   offset: number
   buffer: string
+  decoder: StringDecoder
+  dev?: number
+  ino?: number
   ended: boolean
 }
 
@@ -457,14 +462,22 @@ type WorkflowRunMetadata = {
   cwd?: string
   initialTaskMessage?: string
   parentSessionId?: string
+  runDir?: string
+  auditPath?: string
 }
 
 type RunMatch = 'accept' | 'reject' | 'unknown'
+
+const DEFAULT_RUN_END_MAX_WAIT_MS = 4 * 60 * 60 * 1000
+const TAIL_READ_CHUNK_BYTES = 64 * 1024
+const METADATA_READ_CHUNK_BYTES = 16 * 1024
+const METADATA_MAX_LINES = 50
 
 export class WorkflowEventMonitor {
   private readonly workflowRunsDir: string
   private readonly pollIntervalMs: number
   private readonly graceMs: number
+  private readonly runEndMaxWaitMs: number
   private readonly emit: EmitSessionUpdate
   private readonly mapper: WorkflowEventMapper
   private readonly target: WorkflowEventMonitorTarget | null
@@ -491,6 +504,7 @@ export class WorkflowEventMonitor {
     this.workflowRunsDir = options.workflowRunsDir ?? join(getAgentDir(), 'workflow-runs')
     this.pollIntervalMs = options.pollIntervalMs ?? 75
     this.graceMs = options.graceMs ?? 350
+    this.runEndMaxWaitMs = options.runEndMaxWaitMs ?? DEFAULT_RUN_END_MAX_WAIT_MS
     this.emit = emit
     this.mapper = new WorkflowEventMapper(cwd)
     this.target = options.target ?? null
@@ -546,10 +560,13 @@ export class WorkflowEventMonitor {
       Array.from(this.tails.values()).filter(tail => !tail.ended).length
     )
     for (const tail of this.tails.values()) this.readTail(tail)
+    this.syncAcceptedRunJsonTerminalState()
     this.maybeFinish()
   }
 
   private discoverRuns(): void {
+    if (this.acceptedRunDir) return
+
     for (const dir of listRunDirs(this.workflowRunsDir)) {
       if (this.knownDirs.has(dir)) continue
       const runDir = join(this.workflowRunsDir, dir)
@@ -557,10 +574,15 @@ export class WorkflowEventMonitor {
       if (match === 'unknown') continue
       this.knownDirs.add(dir)
       if (match === 'reject') continue
-      this.acceptedRunDir = dir
-      const eventsPath = join(runDir, 'events.jsonl')
-      this.tails.set(eventsPath, { filePath: eventsPath, offset: 0, buffer: '', ended: false })
+      this.acceptRunDir(dir, runDir)
+      break
     }
+  }
+
+  private acceptRunDir(dir: string, runDir: string): void {
+    this.acceptedRunDir = dir
+    const eventsPath = join(runDir, 'events.jsonl')
+    this.tails.set(eventsPath, createTail(eventsPath))
   }
 
   private matchRunDir(dir: string, runDir: string): RunMatch {
@@ -575,21 +597,19 @@ export class WorkflowEventMonitor {
     if (tail.ended) return
     let text = ''
     try {
-      if (!existsSync(tail.filePath)) return
       const stat = statSync(tail.filePath)
       if (!stat.isFile()) return
-      if (stat.size < tail.offset) {
-        tail.offset = 0
-        tail.buffer = ''
-      }
+      if (tailIdentityChanged(tail, stat.dev, stat.ino) || stat.size < tail.offset) resetTail(tail)
+      tail.dev = stat.dev
+      tail.ino = stat.ino
       if (stat.size === tail.offset) return
-      const data = readFileSync(tail.filePath)
-      this.ingestion.fileBytesRead += data.byteLength
       const previousOffset = tail.offset
-      const endOffset = Math.min(stat.size, data.byteLength)
-      text = data.subarray(previousOffset, endOffset).toString('utf8')
-      this.ingestion.newBytesObserved += Math.max(0, endOffset - previousOffset)
-      tail.offset = endOffset
+      const read = readFileRange(tail.filePath, previousOffset, stat.size, tail.decoder)
+      if (!read || read.bytesRead <= 0) return
+      text = read.text
+      this.ingestion.fileBytesRead += read.bytesRead
+      this.ingestion.newBytesObserved += read.bytesRead
+      tail.offset = previousOffset + read.bytesRead
     } catch {
       return
     }
@@ -616,13 +636,57 @@ export class WorkflowEventMonitor {
     }
   }
 
+  private syncAcceptedRunJsonTerminalState(): void {
+    if (!this.acceptedRunDir) return
+    const activeTails = Array.from(this.tails.values()).filter(tail => !tail.ended)
+    if (!activeTails.length) return
+
+    const runDir = join(this.workflowRunsDir, this.acceptedRunDir)
+    const record = readTerminalRunEndRecord(runDir, this.acceptedRunDir)
+    if (!record) return
+
+    for (const update of this.mapper.map(record)) this.emit(update)
+    for (const tail of activeTails) tail.ended = true
+  }
+
+  private emitRunEndTimeoutFallback(): void {
+    if (!this.acceptedRunDir) return
+    const runDir = join(this.workflowRunsDir, this.acceptedRunDir)
+    const metadata = readWorkflowRunMetadata(runDir) ?? {}
+    const runId = metadata.runId ?? this.acceptedRunDir
+    const workflowId = metadata.rootWorkflowId ?? metadata.workflowId ?? this.target?.workflowId ?? 'workflow'
+    const message = `Workflow run_end was not observed within ${this.runEndMaxWaitMs}ms; ending the ACP turn.`
+    const fallbackRecord = {
+      type: 'run_end',
+      timestamp: new Date().toISOString(),
+      runId,
+      rootWorkflowId: metadata.rootWorkflowId ?? workflowId,
+      workflowId,
+      commandName: metadata.commandName,
+      cwd: metadata.cwd,
+      parentSessionId: metadata.parentSessionId,
+      runDir,
+      auditPath: metadata.auditPath,
+      status: 'failed',
+      error: message
+    }
+    for (const update of this.mapper.map(fallbackRecord)) this.emit(update)
+    for (const tail of this.tails.values()) tail.ended = true
+  }
+
   private maybeFinish(): void {
     if (this.stopRequestedAt === null) return
-    const graceElapsed = Date.now() - this.stopRequestedAt >= this.graceMs
+    const elapsed = Date.now() - this.stopRequestedAt
+    const graceElapsed = elapsed >= this.graceMs
     const noActiveTails = Array.from(this.tails.values()).every(tail => tail.ended)
 
     if (this.stopMode === 'run_end') {
       if (this.acceptedRunDir && noActiveTails) {
+        this.dispose()
+        return
+      }
+      if (this.acceptedRunDir && this.runEndMaxWaitMs > 0 && elapsed >= this.runEndMaxWaitMs) {
+        this.emitRunEndTimeoutFallback()
         this.dispose()
         return
       }
@@ -633,6 +697,43 @@ export class WorkflowEventMonitor {
     if (!graceElapsed && !noActiveTails) return
     if (!graceElapsed && this.tails.size === 0) return
     this.dispose()
+  }
+}
+
+function createTail(filePath: string): TailState {
+  return { filePath, offset: 0, buffer: '', decoder: new StringDecoder('utf8'), ended: false }
+}
+
+function resetTail(tail: TailState): void {
+  tail.offset = 0
+  tail.buffer = ''
+  tail.decoder = new StringDecoder('utf8')
+}
+
+function tailIdentityChanged(tail: TailState, dev: number, ino: number): boolean {
+  return tail.dev !== undefined && tail.ino !== undefined && (tail.dev !== dev || tail.ino !== ino)
+}
+
+function readFileRange(
+  filePath: string,
+  startOffset: number,
+  endOffset: number,
+  decoder: StringDecoder
+): { text: string; bytesRead: number } | null {
+  const fd = openSync(filePath, 'r')
+  try {
+    const buffer = Buffer.allocUnsafe(Math.min(TAIL_READ_CHUNK_BYTES, Math.max(1, endOffset - startOffset)))
+    let position = startOffset
+    let text = ''
+    while (position < endOffset) {
+      const bytesRead = readSync(fd, buffer, 0, Math.min(buffer.byteLength, endOffset - position), position)
+      if (bytesRead <= 0) break
+      position += bytesRead
+      text += decoder.write(buffer.subarray(0, bytesRead))
+    }
+    return { text, bytesRead: position - startOffset }
+  } finally {
+    closeSync(fd)
   }
 }
 
@@ -648,18 +749,47 @@ function listRunDirs(workflowRunsDir: string): string[] {
 
 function readWorkflowRunMetadata(runDir: string): WorkflowRunMetadata | null {
   const runJson = readJsonObject(join(runDir, 'run.json'))
-  if (runJson) {
-    return {
-      runId: stringField(runJson.id),
-      workflowId: stringField(runJson.workflowId),
-      rootWorkflowId: stringField(runJson.rootWorkflowId) ?? stringField(runJson.workflowId),
-      commandName: stringField(runJson.commandName),
-      cwd: stringField(runJson.cwd),
-      initialTaskMessage: stringField(runJson.initialTaskMessage),
-      parentSessionId: stringField(runJson.parentSessionId)
-    }
-  }
+  if (runJson) return metadataFromRunJson(runJson, runDir)
   return readMetadataFromEvents(join(runDir, 'events.jsonl'))
+}
+
+function readTerminalRunEndRecord(runDir: string, fallbackRunId: string): Record<string, unknown> | null {
+  const runJson = readJsonObject(join(runDir, 'run.json'))
+  if (!runJson) return null
+
+  const status = stringField(runJson.status)?.toLowerCase()
+  const endedAt = stringField(runJson.endedAt)
+  if (!endedAt && (!status || status === 'running')) return null
+
+  const metadata = metadataFromRunJson(runJson, runDir)
+  return {
+    type: 'run_end',
+    timestamp: endedAt ?? new Date().toISOString(),
+    runId: metadata.runId ?? fallbackRunId,
+    rootWorkflowId: metadata.rootWorkflowId ?? metadata.workflowId,
+    workflowId: metadata.workflowId ?? metadata.rootWorkflowId,
+    commandName: metadata.commandName,
+    cwd: metadata.cwd,
+    parentSessionId: metadata.parentSessionId,
+    runDir: metadata.runDir ?? runDir,
+    auditPath: metadata.auditPath,
+    status: !status || status === 'running' ? 'completed' : status,
+    error: stringField(runJson.error)
+  }
+}
+
+function metadataFromRunJson(runJson: Record<string, unknown>, runDir: string): WorkflowRunMetadata {
+  return {
+    runId: stringField(runJson.id),
+    workflowId: stringField(runJson.workflowId),
+    rootWorkflowId: stringField(runJson.rootWorkflowId) ?? stringField(runJson.workflowId),
+    commandName: stringField(runJson.commandName),
+    cwd: stringField(runJson.cwd),
+    initialTaskMessage: stringField(runJson.initialTaskMessage),
+    parentSessionId: stringField(runJson.parentSessionId),
+    runDir: stringField(runJson.runDir) ?? runDir,
+    auditPath: stringField(runJson.auditPath)
+  }
 }
 
 function readJsonObject(filePath: string): Record<string, unknown> | null {
@@ -672,15 +802,11 @@ function readJsonObject(filePath: string): Record<string, unknown> | null {
 }
 
 function readMetadataFromEvents(eventsPath: string): WorkflowRunMetadata | null {
-  let text = ''
-  try {
-    text = readFileSync(eventsPath, 'utf8')
-  } catch {
-    return null
-  }
+  const lines = readInitialLines(eventsPath, METADATA_MAX_LINES)
+  if (!lines) return null
 
   const metadata: WorkflowRunMetadata = {}
-  for (const line of text.split(/\r?\n/).slice(0, 50)) {
+  for (const line of lines) {
     const trimmed = line.trim()
     if (!trimmed) continue
     let record: unknown
@@ -697,10 +823,44 @@ function readMetadataFromEvents(eventsPath: string): WorkflowRunMetadata | null 
     metadata.cwd ??= stringField(record.cwd)
     metadata.initialTaskMessage ??= stringField(record.initialTaskMessage)
     metadata.parentSessionId ??= stringField(record.parentSessionId)
+    metadata.runDir ??= stringField(record.runDir)
+    metadata.auditPath ??= stringField(record.auditPath)
   }
   return metadata.runId || metadata.workflowId || metadata.rootWorkflowId || metadata.commandName || metadata.cwd
     ? metadata
     : null
+}
+
+function readInitialLines(filePath: string, maxLines: number): string[] | null {
+  let fd: number | null = null
+  try {
+    fd = openSync(filePath, 'r')
+    const decoder = new StringDecoder('utf8')
+    const buffer = Buffer.allocUnsafe(METADATA_READ_CHUNK_BYTES)
+    let text = ''
+    let lineCount = 0
+    while (lineCount < maxLines) {
+      const bytesRead = readSync(fd, buffer, 0, buffer.byteLength, null)
+      if (bytesRead <= 0) break
+      const chunk = decoder.write(buffer.subarray(0, bytesRead))
+      text += chunk
+      lineCount += countLineBreaks(chunk)
+    }
+    text += decoder.end()
+    return text.split(/\r?\n/).slice(0, maxLines)
+  } catch {
+    return null
+  } finally {
+    if (fd !== null) closeSync(fd)
+  }
+}
+
+function countLineBreaks(value: string): number {
+  let count = 0
+  for (let index = 0; index < value.length; index += 1) {
+    if (value.charCodeAt(index) === 10) count += 1
+  }
+  return count
 }
 
 function metadataMatchesTarget(
@@ -791,7 +951,7 @@ function withWorkflowMeta(value: unknown, meta: WorkflowMeta): unknown {
 
 function isFailedStatus(record: Record<string, unknown>): boolean {
   const status = stringField(record.status)?.toLowerCase()
-  return status === 'failed' || status === 'error' || Boolean(record.error)
+  return status === 'failed' || status === 'error' || status === 'aborted' || Boolean(record.error)
 }
 
 function planStatus(record: Record<string, unknown>, type: string): 'pending' | 'in_progress' | 'completed' {
