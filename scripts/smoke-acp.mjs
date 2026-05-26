@@ -1,10 +1,12 @@
 import { spawn } from 'node:child_process'
 
 const cwd = process.cwd()
+const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+const npmSpawnOptions = { stdio: 'inherit', cwd, shell: process.platform === 'win32' }
 
 // Build first so Zed-style invocation (node dist/index.js) works.
 await new Promise((resolve, reject) => {
-  const p = spawn('npm', ['run', 'build'], { stdio: 'inherit', cwd })
+  const p = spawn(npmCommand, ['run', 'build'], npmSpawnOptions)
   p.on('exit', code => (code === 0 ? resolve() : reject(new Error(`build failed: ${code}`))))
 })
 
