@@ -26,6 +26,16 @@ type WorkflowEventMonitorOptions = {
   onRecord?: (record: Record<string, unknown>, sequence: number) => void
 }
 
+type WorkflowEventSourceIdentity = {
+  sourceKey: string
+  startOffset: number
+  endOffset: number
+}
+
+type WorkflowEventIdentity =
+  | { kind: 'source'; identity: WorkflowEventSourceIdentity }
+  | { kind: 'fallback'; key: string }
+
 export type WorkflowIngestionSnapshot = {
   recordsObserved: number
   newBytesObserved: number
@@ -39,9 +49,11 @@ type TailState = {
   filePath: string
   offset: number
   buffer: string
+  bufferStartOffset: number
   decoder: StringDecoder
   dev?: number
   ino?: number
+  generation: number
   ended: boolean
 }
 
@@ -98,8 +110,10 @@ export function parseWorkflowCommandPrompt(message: string): WorkflowEventMonito
 
 export class WorkflowEventMapper {
   private readonly cwd: string
-  private readonly seen = new Set<string>()
+  private readonly sourceIdentities = new SourcePositionDedupe(64)
+  private readonly fallbackIdentities = new BoundedIdentitySet(4_096)
   private readonly runs = new Set<string>()
+  private readonly endedRuns = new Set<string>()
   private readonly steps = new Map<string, StepPlan>()
   private readonly childTools = new Set<string>()
   private readonly childToolMetadata = new Map<string, ChildToolMetadata>()
@@ -111,15 +125,14 @@ export class WorkflowEventMapper {
     this.cwd = cwd
   }
 
-  map(record: unknown): SessionUpdate[] {
+  map(record: unknown, sourceIdentity?: WorkflowEventSourceIdentity): SessionUpdate[] {
     if (!isObject(record)) return []
     const type = stringField(record.type)
     const runId = stringField(record.runId)
     if (!type || !runId) return []
 
-    const dedupeKey = eventDedupeKey(record)
-    if (this.seen.has(dedupeKey)) return []
-    this.seen.add(dedupeKey)
+    const identity = eventDedupeIdentity(record, sourceIdentity)
+    if (identity && !this.acceptIdentity(identity)) return []
 
     switch (type) {
       case 'run_start':
@@ -148,7 +161,13 @@ export class WorkflowEventMapper {
     }
   }
 
+  private acceptIdentity(identity: WorkflowEventIdentity): boolean {
+    if (identity.kind === 'source') return this.sourceIdentities.accept(identity.identity)
+    return this.fallbackIdentities.add(identity.key)
+  }
+
   private mapRunStart(record: Record<string, unknown>, runId: string): SessionUpdate[] {
+    if (this.runs.has(runId)) return []
     const workflowId = stringField(record.workflowId) ?? 'workflow'
     this.runs.add(runId)
     return [
@@ -174,6 +193,8 @@ export class WorkflowEventMapper {
   }
 
   private mapRunEnd(record: Record<string, unknown>, runId: string): SessionUpdate[] {
+    if (this.endedRuns.has(runId)) return []
+    this.endedRuns.add(runId)
     const workflowId = stringField(record.workflowId) ?? 'workflow'
     const status = isFailedStatus(record) ? 'failed' : 'completed'
     const meta = metaFromRecord(record)
@@ -233,7 +254,10 @@ export class WorkflowEventMapper {
 
     const toolCallId = stepToolId(runId, stepId)
     const stepContent = stepTitle(record, stepId)
-    this.steps.set(toolCallId, { id: toolCallId, content: stepContent, status: planStatus(record, type) })
+    const next = { id: toolCallId, content: stepContent, status: planStatus(record, type) }
+    const existing = this.steps.get(toolCallId)
+    if (existing && existing.content === next.content && existing.status === next.status) return []
+    this.steps.set(toolCallId, next)
 
     const plan = this.planUpdate()
     return plan ? [plan] : []
@@ -248,11 +272,13 @@ export class WorkflowEventMapper {
 
     const toolCallId = subWorkflowCallToolId(runId, stepId, toolName, startedAt)
     const existing = this.steps.get(toolCallId)
-    this.steps.set(toolCallId, {
+    const next = {
       id: toolCallId,
       content: subWorkflowCallTitle(record, childWorkflowId, toolName, existing?.content),
       status: type === 'subworkflow_call_end' ? 'completed' : 'in_progress'
-    })
+    } satisfies StepPlan
+    if (existing && existing.content === next.content && existing.status === next.status) return []
+    this.steps.set(toolCallId, next)
 
     const plan = this.planUpdate()
     return plan ? [plan] : []
@@ -280,6 +306,7 @@ export class WorkflowEventMapper {
     const updates: SessionUpdate[] = []
 
     if (childType === 'tool_execution_start') {
+      if (this.childTools.has(toolCallId)) return []
       const metadata = { title: toolName, kind: toToolKind(toolName) }
       this.childTools.add(toolCallId)
       this.childToolMetadata.set(toolCallId, metadata)
@@ -605,6 +632,7 @@ export class WorkflowEventMonitor {
   private readTail(tail: TailState): void {
     if (tail.ended) return
     let text = ''
+    let previousOffset = tail.offset
     try {
       const stat = statSync(tail.filePath)
       if (!stat.isFile()) return
@@ -612,7 +640,7 @@ export class WorkflowEventMonitor {
       tail.dev = stat.dev
       tail.ino = stat.ino
       if (stat.size === tail.offset) return
-      const previousOffset = tail.offset
+      previousOffset = tail.offset
       const read = readFileRange(tail.filePath, previousOffset, stat.size, tail.decoder)
       if (!read || read.bytesRead <= 0) return
       text = read.text
@@ -623,11 +651,12 @@ export class WorkflowEventMonitor {
       return
     }
 
-    const lines = (tail.buffer + text).split(/\r?\n/)
-    tail.buffer = lines.pop() ?? ''
+    const parsedLines = consumeTailText(tail.buffer, tail.bufferStartOffset, text, previousOffset)
+    tail.buffer = parsedLines.buffer
+    tail.bufferStartOffset = parsedLines.bufferStartOffset
     this.ingestion.maxTailBufferBytes = Math.max(this.ingestion.maxTailBufferBytes, Buffer.byteLength(tail.buffer))
-    for (const line of lines) {
-      const trimmed = line.trim()
+    for (const line of parsedLines.lines) {
+      const trimmed = line.text.trim()
       if (!trimmed) continue
       let record: unknown
       try {
@@ -640,7 +669,12 @@ export class WorkflowEventMonitor {
         this.ingestion.recordsObserved += 1
         this.onRecord?.(record, this.ingestion.recordsObserved - 1)
       }
-      for (const update of this.mapper.map(record)) this.emit(update)
+      const sourceIdentity = {
+        sourceKey: tailSourceKey(tail),
+        startOffset: line.startOffset,
+        endOffset: line.endOffset
+      }
+      for (const update of this.mapper.map(record, sourceIdentity)) this.emit(update)
       if (isObject(record) && record.type === 'run_end') tail.ended = true
     }
   }
@@ -739,17 +773,62 @@ export class WorkflowEventMonitor {
 }
 
 function createTail(filePath: string): TailState {
-  return { filePath, offset: 0, buffer: '', decoder: new StringDecoder('utf8'), ended: false }
+  return {
+    filePath,
+    offset: 0,
+    buffer: '',
+    bufferStartOffset: 0,
+    decoder: new StringDecoder('utf8'),
+    generation: 0,
+    ended: false
+  }
 }
 
 function resetTail(tail: TailState): void {
   tail.offset = 0
   tail.buffer = ''
+  tail.bufferStartOffset = 0
   tail.decoder = new StringDecoder('utf8')
+  tail.generation += 1
 }
 
 function tailIdentityChanged(tail: TailState, dev: number, ino: number): boolean {
   return tail.dev !== undefined && tail.ino !== undefined && (tail.dev !== dev || tail.ino !== ino)
+}
+
+function tailSourceKey(tail: TailState): string {
+  return compactParts(['events-jsonl', tail.filePath, tail.dev, tail.ino, tail.generation])
+}
+
+type ConsumedTailLine = {
+  text: string
+  startOffset: number
+  endOffset: number
+}
+
+function consumeTailText(
+  buffer: string,
+  bufferStartOffset: number,
+  text: string,
+  textStartOffset: number
+): { lines: ConsumedTailLine[]; buffer: string; bufferStartOffset: number } {
+  const combined = buffer ? buffer + text : text
+  const lines: ConsumedTailLine[] = []
+  let cursor = 0
+  let lineStartOffset = buffer ? bufferStartOffset : textStartOffset
+
+  for (let index = 0; index < combined.length; index += 1) {
+    if (combined.charCodeAt(index) !== 10) continue
+    const rawEnd = index + 1
+    const textEnd = index > cursor && combined.charCodeAt(index - 1) === 13 ? index - 1 : index
+    const rawLine = combined.slice(cursor, rawEnd)
+    const endOffset = lineStartOffset + Buffer.byteLength(rawLine)
+    lines.push({ text: combined.slice(cursor, textEnd), startOffset: lineStartOffset, endOffset })
+    cursor = rawEnd
+    lineStartOffset = endOffset
+  }
+
+  return { lines, buffer: combined.slice(cursor), bufferStartOffset: lineStartOffset }
 }
 
 function activeTailOffsetsKey(tails: TailState[]): string {
@@ -757,9 +836,14 @@ function activeTailOffsetsKey(tails: TailState[]): string {
 }
 
 function terminalRunJsonFallbackRecordKey(record: Record<string, unknown>): string {
-  const stableRecord = { ...record }
-  delete stableRecord.timestamp
-  return stableStringify(stableRecord)
+  return compactParts([
+    'terminal-run-json',
+    stringField(record.runId),
+    stringField(record.workflowId),
+    stringField(record.status),
+    stringField(record.auditPath),
+    stringField(record.error)
+  ])
 }
 
 function readFileRange(
@@ -952,19 +1036,150 @@ function stringField(value: unknown): string | undefined {
   return typeof value === 'string' && value ? value : undefined
 }
 
-function eventDedupeKey(record: Record<string, unknown>): string {
-  return stableStringify(record)
+function eventDedupeIdentity(
+  record: Record<string, unknown>,
+  sourceIdentity: WorkflowEventSourceIdentity | undefined
+): WorkflowEventIdentity | null {
+  if (sourceIdentity) return { kind: 'source', identity: sourceIdentity }
+  const key = compactEventIdentity(record)
+  return key ? { kind: 'fallback', key } : null
 }
 
-function stableStringify(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(item => stableStringify(item)).join(',')}]`
-  if (isObject(value)) {
-    return `{${Object.keys(value)
-      .sort()
-      .map(key => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
-      .join(',')}}`
+function compactEventIdentity(record: Record<string, unknown>): string | null {
+  const type = stringField(record.type)
+  const runId = stringField(record.runId)
+  if (!type || !runId) return null
+
+  const sequence = primitiveIdentityPart(record.sequence)
+  if (sequence) return compactParts(['run', runId, 'sequence', sequence])
+
+  switch (type) {
+    case 'run_start':
+    case 'run_end':
+      return compactParts(['run', runId, type])
+    case 'step_start':
+    case 'step_update':
+    case 'step_end':
+    case 'inline_subworkflow_start':
+    case 'inline_subworkflow_end':
+      return compactParts([type, runId, stringField(record.stepId), stringField(record.status)])
+    case 'subworkflow_call_start':
+    case 'subworkflow_call_end':
+      return compactParts([
+        type,
+        runId,
+        stringField(record.stepId),
+        stringField(record.toolName),
+        stringField(record.startedAt),
+        stringField(record.status)
+      ])
+    case 'child_pi_event':
+      return compactChildEventIdentity(record, runId)
+    default:
+      return compactParts([type, runId, primitiveIdentityPart(record.timestamp), jsonHash(record)])
   }
-  return JSON.stringify(value)
+}
+
+function compactChildEventIdentity(record: Record<string, unknown>, runId: string): string | null {
+  const event = isObject(record.event) ? record.event : undefined
+  const childType = stringField(record.childEventType)
+  const stepId = stringField(record.stepId)
+  if (!event || !childType || !stepId) return null
+
+  const base = ['child', runId, stepId, stringField(record.childSessionId), childType]
+  if (childType.startsWith('tool_execution_')) {
+    const toolCallId = stringField(event.toolCallId)
+    if (!toolCallId) return null
+    if (childType === 'tool_execution_update') {
+      return compactParts([...base, toolCallId, primitiveIdentityPart(record.timestamp), jsonHash(event.partialResult)])
+    }
+    return compactParts([...base, toolCallId])
+  }
+
+  if (childType === 'message_update') {
+    const assistantMessageEvent = isObject(event.assistantMessageEvent) ? event.assistantMessageEvent : undefined
+    return compactParts([
+      ...base,
+      childMessageExplicitId(event, assistantMessageEvent),
+      stringField(assistantMessageEvent?.type),
+      primitiveIdentityPart(record.timestamp),
+      jsonHash(assistantMessageEvent)
+    ])
+  }
+
+  if (childType === 'message_end') {
+    const message = isObject(event.message) ? event.message : undefined
+    return compactParts([
+      ...base,
+      childMessageExplicitId(event),
+      primitiveIdentityPart(record.timestamp),
+      jsonHash(message)
+    ])
+  }
+
+  return compactParts([...base, primitiveIdentityPart(record.timestamp), jsonHash(event)])
+}
+
+function primitiveIdentityPart(value: unknown): string | undefined {
+  if (typeof value === 'string' && value) return value
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  if (typeof value === 'boolean') return String(value)
+  return undefined
+}
+
+function compactParts(parts: Array<string | number | undefined>): string {
+  return parts.map(part => encodeURIComponent(String(part ?? ''))).join(':')
+}
+
+function jsonHash(value: unknown): string {
+  return createHash('sha1')
+    .update(JSON.stringify(value) ?? 'undefined')
+    .digest('hex')
+    .slice(0, 16)
+}
+
+class BoundedIdentitySet {
+  private readonly keys = new Set<string>()
+
+  constructor(private readonly maxSize: number) {}
+
+  add(key: string): boolean {
+    if (this.keys.has(key)) return false
+    this.keys.add(key)
+    while (this.keys.size > this.maxSize) {
+      const oldest = this.keys.values().next().value as string | undefined
+      if (oldest === undefined) break
+      this.keys.delete(oldest)
+    }
+    return true
+  }
+
+  get size(): number {
+    return this.keys.size
+  }
+}
+
+class SourcePositionDedupe {
+  private readonly sources = new Map<string, number>()
+
+  constructor(private readonly maxSources: number) {}
+
+  accept(identity: WorkflowEventSourceIdentity): boolean {
+    const previousEnd = this.sources.get(identity.sourceKey)
+    if (previousEnd !== undefined && identity.endOffset <= previousEnd) return false
+    if (previousEnd !== undefined) this.sources.delete(identity.sourceKey)
+    this.sources.set(identity.sourceKey, Math.max(previousEnd ?? 0, identity.endOffset))
+    while (this.sources.size > this.maxSources) {
+      const oldest = this.sources.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.sources.delete(oldest)
+    }
+    return true
+  }
+
+  get size(): number {
+    return this.sources.size
+  }
 }
 
 function workflowToolId(runId: string): string {

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { appendFileSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import { pathToFileURL } from 'node:url'
 import {
   WorkflowEventMapper,
@@ -259,6 +260,64 @@ test('WorkflowEventMapper only completes open plan entries for the workflow run 
       { toolCallId: 'workflow:r2:step:review', status: 'in_progress' }
     ]
   )
+})
+
+test('WorkflowEventMapper suppresses re-observed source identities without collapsing distinct source positions', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+  const record = {
+    type: 'child_pi_event',
+    timestamp: 'same-ms',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'code',
+    childSessionId: 'child',
+    childEventType: 'tool_execution_update',
+    event: {
+      type: 'tool_execution_update',
+      toolCallId: 'tool-1',
+      toolName: 'bash',
+      partialResult: { content: [{ type: 'text', text: 'same' }] }
+    }
+  }
+
+  const first = mapper.map(record, { sourceKey: 'events:1', startOffset: 0, endOffset: 100 })
+  const reread = mapper.map(record, { sourceKey: 'events:1', startOffset: 0, endOffset: 100 })
+  const nextPosition = mapper.map(record, { sourceKey: 'events:1', startOffset: 101, endOffset: 201 })
+
+  assert.equal(
+    first.some(update => update.sessionUpdate === 'tool_call_update'),
+    true
+  )
+  assert.equal(reread.length, 0)
+  assert.equal(nextPosition.filter(update => update.sessionUpdate === 'tool_call_update').length, 1)
+})
+
+test('WorkflowEventMapper bounds fallback identity retention for long streams', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+  let toolUpdates = 0
+
+  for (let index = 0; index < 4_500; index += 1) {
+    const updates = mapper.map({
+      type: 'child_pi_event',
+      sequence: index,
+      timestamp: `t${index}`,
+      runId: 'r1',
+      workflowId: 'wf',
+      stepId: 'code',
+      childSessionId: 'child',
+      childEventType: 'tool_execution_update',
+      event: {
+        type: 'tool_execution_update',
+        toolCallId: 'tool-1',
+        toolName: 'bash',
+        partialResult: { content: [{ type: 'text', text: `chunk-${index}` }] }
+      }
+    })
+    toolUpdates += updates.filter(update => update.sessionUpdate === 'tool_call_update').length
+  }
+
+  assert.equal(toolUpdates, 4_500)
+  assert.equal((mapper as any).fallbackIdentities.size, 4_096)
 })
 
 test('WorkflowEventMapper maps distinct child tool updates that share a timestamp', () => {
@@ -520,6 +579,56 @@ test('WorkflowEventMonitor tails new run artifacts and tolerates malformed parti
   assert.equal(updates.filter(update => update.sessionUpdate === 'tool_call').length, 1)
   assert.ok(updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:r1'))
   rmSync(root, { recursive: true, force: true })
+})
+
+test('WorkflowEventMonitor suppresses source-position duplicates when a tail is re-read', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-reread-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  const runDir = join(workflowRunsDir, 'reread')
+  const eventsPath = join(runDir, 'events.jsonl')
+  mkdirSync(workflowRunsDir, { recursive: true })
+  const updates: any[] = []
+  const monitor = new WorkflowEventMonitor('/repo', update => updates.push(update), {
+    workflowRunsDir,
+    pollIntervalMs: 5,
+    graceMs: 20
+  })
+
+  try {
+    monitor.start()
+    mkdirSync(runDir)
+    writeFileSync(
+      eventsPath,
+      `${JSON.stringify({ type: 'run_start', timestamp: 't1', runId: 'reread', workflowId: 'wf', status: 'running' })}\n${JSON.stringify({ type: 'child_pi_event', timestamp: 't2', runId: 'reread', workflowId: 'wf', stepId: 'code', childSessionId: 'child', childEventType: 'message_update', event: { type: 'message_update', messageId: 'm1', assistantMessageEvent: { type: 'text_delta', delta: 'hello', partial: { id: 'm1' } } } })}\n`,
+      'utf8'
+    )
+    await waitUntil(() => updates.some(update => update.sessionUpdate === 'agent_message_chunk'))
+
+    const tail = Array.from((monitor as any).tails.values())[0] as any
+    tail.offset = 0
+    tail.buffer = ''
+    tail.bufferStartOffset = 0
+    tail.decoder = new StringDecoder('utf8')
+
+    await waitUntil(() => monitor.getIngestionSnapshot().recordsObserved >= 4)
+    appendFileSync(
+      eventsPath,
+      `${JSON.stringify({ type: 'run_end', timestamp: 't3', runId: 'reread', workflowId: 'wf', status: 'completed' })}\n`,
+      'utf8'
+    )
+    await monitor.waitForRunEndAfterPromptResolution()
+
+    assert.equal(updates.filter(update => update.sessionUpdate === 'tool_call').length, 1)
+    assert.deepEqual(
+      updates
+        .filter(update => update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text')
+        .map(update => update.content.text),
+      ['hello', 'Workflow wf completed.']
+    )
+  } finally {
+    monitor.dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('WorkflowEventMonitor tails large JSONL lines incrementally once and in order', async () => {
