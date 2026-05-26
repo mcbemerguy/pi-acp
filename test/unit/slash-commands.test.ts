@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -46,6 +46,27 @@ test('loadSlashCommands: invalidates cached prompt files by metadata', () => {
     utimesSync(prompt, future, future)
 
     assert.equal(expandSlashCommand('/hello world', loadSlashCommands(cwd)), 'second world')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('loadSlashCommands: invalidates same-size prompt edits with preserved mtime', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-slash-cache-same-size-'))
+  try {
+    const cwd = join(root, 'repo')
+    const prompts = join(cwd, '.pi', 'prompts')
+    const prompt = join(prompts, 'hello.md')
+    mkdirSync(prompts, { recursive: true })
+    writeFileSync(prompt, 'first $1')
+    const originalTimes = statSync(prompt)
+
+    assert.equal(expandSlashCommand('/hello world', loadSlashCommands(cwd)), 'first world')
+
+    writeFileSync(prompt, 'other $1')
+    utimesSync(prompt, originalTimes.atime, originalTimes.mtime)
+
+    assert.equal(expandSlashCommand('/hello world', loadSlashCommands(cwd)), 'other world')
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

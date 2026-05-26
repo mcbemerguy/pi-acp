@@ -1,15 +1,16 @@
 import { readFileSync, statSync } from 'node:fs'
 
 export type FileMetadata = {
-  mtimeMs: number
-  size: number
+  mtimeNs: bigint
+  ctimeNs: bigint
+  size: bigint
 }
 
 export function statFile(path: string): FileMetadata | null {
   try {
-    const st = statSync(path)
+    const st = statSync(path, { bigint: true })
     if (!st.isFile()) return null
-    return { mtimeMs: st.mtimeMs, size: st.size }
+    return { mtimeNs: st.mtimeNs, ctimeNs: st.ctimeNs, size: st.size }
   } catch {
     return null
   }
@@ -29,7 +30,13 @@ export function readTextFileCached(path: string): string | null {
   }
 
   const cached = textFileCache.get(path)
-  if (cached && cached.mtimeMs === metadata.mtimeMs && cached.size === metadata.size) return cached.content
+  if (
+    cached &&
+    cached.mtimeNs === metadata.mtimeNs &&
+    cached.ctimeNs === metadata.ctimeNs &&
+    cached.size === metadata.size
+  )
+    return cached.content
 
   try {
     const content = readFileSync(path, 'utf-8')
@@ -55,7 +62,13 @@ export function readJsonObjectCached(path: string): Record<string, unknown> {
   }
 
   const cached = jsonObjectCache.get(path)
-  if (cached && cached.mtimeMs === metadata.mtimeMs && cached.size === metadata.size) return cached.value
+  if (
+    cached &&
+    cached.mtimeNs === metadata.mtimeNs &&
+    cached.ctimeNs === metadata.ctimeNs &&
+    cached.size === metadata.size
+  )
+    return cached.value
 
   try {
     const data = JSON.parse(readFileSync(path, 'utf-8')) as unknown

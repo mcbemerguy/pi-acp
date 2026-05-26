@@ -82,7 +82,7 @@ function collectCommandFiles(
 }
 
 function commandFilesSignature(files: CommandFile[]): string {
-  return files.map(f => `${f.path}\0${f.mtimeMs}\0${f.size}`).join('\n')
+  return files.map(f => `${f.path}\0${f.mtimeNs}\0${f.ctimeNs}\0${f.size}`).join('\n')
 }
 
 function commandSource(source: 'user' | 'project', subdir: string): string {
