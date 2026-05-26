@@ -1,6 +1,6 @@
-import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { readJsonObjectCached } from './file-cache.js'
 
 function isObject(x: unknown): x is Record<string, unknown> {
   return Boolean(x) && typeof x === 'object' && !Array.isArray(x)
@@ -16,23 +16,12 @@ function deepMerge(a: Record<string, unknown>, b: Record<string, unknown>): Reco
   return out
 }
 
-function readJsonFile(path: string): Record<string, unknown> {
-  try {
-    if (!existsSync(path)) return {}
-    const raw = readFileSync(path, 'utf-8')
-    const data = JSON.parse(raw)
-    return isObject(data) ? data : {}
-  } catch {
-    return {}
-  }
-}
-
 function getMergedSettings(cwd: string): Record<string, unknown> {
   const globalSettingsPath = join(getAgentDir(), 'settings.json')
   const projectSettingsPath = resolve(cwd, '.pi', 'settings.json')
 
-  const global = readJsonFile(globalSettingsPath)
-  const project = readJsonFile(projectSettingsPath)
+  const global = readJsonObjectCached(globalSettingsPath)
+  const project = readJsonObjectCached(projectSettingsPath)
   return deepMerge(global, project)
 }
 

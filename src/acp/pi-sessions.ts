@@ -1,7 +1,8 @@
-import { readdirSync, readFileSync, statSync, openSync, readSync, closeSync, existsSync } from 'node:fs'
+import { readdirSync, statSync, openSync, readSync, closeSync, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve, isAbsolute, relative } from 'node:path'
 import type { StoredSession } from './session-store.js'
+import { readJsonObjectCached } from './file-cache.js'
 
 export type PiSessionListItem = {
   sessionId: string
@@ -39,20 +40,11 @@ function getPiAgentDir(): string {
 }
 
 function readSessionDirFromSettings(agentDir: string): string | null {
-  const settingsPath = join(agentDir, 'settings.json')
-  try {
-    if (!existsSync(settingsPath)) return null
-    const raw = readFileSync(settingsPath, 'utf8')
-    const data = JSON.parse(raw) as unknown
-    if (!data || typeof data !== 'object' || Array.isArray(data)) return null
+  const data = readJsonObjectCached(join(agentDir, 'settings.json'))
+  const sessionDir = data.sessionDir
+  if (typeof sessionDir !== 'string' || !sessionDir.trim()) return null
 
-    const sessionDir = (data as Record<string, unknown>).sessionDir
-    if (typeof sessionDir !== 'string' || !sessionDir.trim()) return null
-
-    return isAbsolute(sessionDir) ? sessionDir : resolve(agentDir, sessionDir)
-  } catch {
-    return null
-  }
+  return isAbsolute(sessionDir) ? sessionDir : resolve(agentDir, sessionDir)
 }
 
 export function getPiSessionsDir(): string {

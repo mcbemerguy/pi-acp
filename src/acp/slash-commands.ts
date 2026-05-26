@@ -1,7 +1,8 @@
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
+import { readTextFileCached, statFile, type FileMetadata } from './file-cache.js'
 
 /**
  * File-based slash command (mirrors pi-coding-agent semantics).
@@ -35,10 +36,26 @@ function parseFrontmatter(content: string): {
   return { frontmatter, content: remaining }
 }
 
-function loadCommandsFromDir(dir: string, source: 'user' | 'project', subdir = ''): FileSlashCommand[] {
-  const commands: FileSlashCommand[] = []
-  if (!existsSync(dir)) return commands
+type CommandFile = FileMetadata & {
+  path: string
+  name: string
+  source: 'user' | 'project'
+  subdir: string
+}
 
+type SlashCommandCacheEntry = {
+  signature: string
+  commands: FileSlashCommand[]
+}
+
+const slashCommandCache = new Map<string, SlashCommandCacheEntry>()
+
+function collectCommandFiles(
+  dir: string,
+  source: 'user' | 'project',
+  subdir = '',
+  out: CommandFile[] = []
+): CommandFile[] {
   try {
     const entries = readdirSync(dir, { withFileTypes: true })
 
@@ -47,47 +64,55 @@ function loadCommandsFromDir(dir: string, source: 'user' | 'project', subdir = '
 
       if (entry.isDirectory()) {
         const newSubdir = subdir ? `${subdir}:${entry.name}` : entry.name
-        commands.push(...loadCommandsFromDir(fullPath, source, newSubdir))
+        collectCommandFiles(fullPath, source, newSubdir, out)
         continue
       }
 
       if (!entry.isFile() || !entry.name.endsWith('.md')) continue
 
-      try {
-        const rawContent = readFileSync(fullPath, 'utf-8')
-        const { frontmatter, content } = parseFrontmatter(rawContent)
-
-        const name = entry.name.slice(0, -3)
-
-        const sourceStr =
-          source === 'user' ? (subdir ? `(user:${subdir})` : '(user)') : subdir ? `(project:${subdir})` : '(project)'
-
-        let description = frontmatter.description || ''
-        if (!description) {
-          const firstLine = content.split('\n').find(l => l.trim())
-          if (firstLine) {
-            description = firstLine.slice(0, 60)
-            if (firstLine.length > 60) description += '...'
-          }
-        }
-
-        description = description ? `${description} ${sourceStr}` : sourceStr
-
-        commands.push({
-          name,
-          description,
-          content,
-          source: sourceStr
-        })
-      } catch {
-        // Silently skip unreadable files.
-      }
+      const metadata = statFile(fullPath)
+      if (!metadata) continue
+      out.push({ path: fullPath, name: entry.name.slice(0, -3), source, subdir, ...metadata })
     }
   } catch {
-    // Silently skip unreadable dirs.
+    return out
   }
 
-  return commands
+  return out
+}
+
+function commandFilesSignature(files: CommandFile[]): string {
+  return files.map(f => `${f.path}\0${f.mtimeMs}\0${f.size}`).join('\n')
+}
+
+function commandSource(source: 'user' | 'project', subdir: string): string {
+  return source === 'user' ? (subdir ? `(user:${subdir})` : '(user)') : subdir ? `(project:${subdir})` : '(project)'
+}
+
+function parseCommandFile(file: CommandFile): FileSlashCommand | null {
+  const rawContent = readTextFileCached(file.path)
+  if (rawContent === null) return null
+
+  const { frontmatter, content } = parseFrontmatter(rawContent)
+  const sourceStr = commandSource(file.source, file.subdir)
+
+  let description = frontmatter.description || ''
+  if (!description) {
+    const firstLine = content.split('\n').find(l => l.trim())
+    if (firstLine) {
+      description = firstLine.slice(0, 60)
+      if (firstLine.length > 60) description += '...'
+    }
+  }
+
+  description = description ? `${description} ${sourceStr}` : sourceStr
+
+  return {
+    name: file.name,
+    description,
+    content,
+    source: sourceStr
+  }
 }
 
 /**
@@ -96,16 +121,22 @@ function loadCommandsFromDir(dir: string, source: 'user' | 'project', subdir = '
  *  - project: <cwd>/.pi/prompts/**\/*.md
  */
 export function loadSlashCommands(cwd: string): FileSlashCommand[] {
-  const commands: FileSlashCommand[] = []
-
   const userDir = join(homedir(), '.pi', 'agent', 'prompts')
   const projectDir = resolve(cwd, '.pi', 'prompts')
+  const cacheKey = `${resolve(cwd)}\0${userDir}\0${projectDir}`
 
-  // Match pi ordering: user first, then project.
-  commands.push(...loadCommandsFromDir(userDir, 'user'))
-  commands.push(...loadCommandsFromDir(projectDir, 'project'))
+  const files = [...collectCommandFiles(userDir, 'user'), ...collectCommandFiles(projectDir, 'project')]
+  const signature = commandFilesSignature(files)
+  const cached = slashCommandCache.get(cacheKey)
+  if (cached?.signature === signature) return cached.commands.slice()
 
-  return commands
+  const commands = files.flatMap(file => {
+    const command = parseCommandFile(file)
+    return command ? [command] : []
+  })
+
+  slashCommandCache.set(cacheKey, { signature, commands })
+  return commands.slice()
 }
 
 /**
