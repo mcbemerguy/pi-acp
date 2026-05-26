@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { pathToFileURL } from 'node:url'
 import { getAgentDir } from './pi-settings.js'
-import { toolResultToText } from './translate/pi-tools.js'
+import { safePresentationValue, toolResultToPresentationText, type PresentationSource } from './translate/pi-tools.js'
 import { toToolCallLocations, toToolKind } from './translate/tool-metadata.js'
 
 type EmitSessionUpdate = (update: SessionUpdate) => void
@@ -72,6 +72,7 @@ type WorkflowMeta = {
   auditPath?: string
   stepId?: string
   childSessionId?: string
+  source?: WorkflowEventSourceIdentity
 }
 
 type StepPlan = {
@@ -155,7 +156,7 @@ export class WorkflowEventMapper {
       case 'subworkflow_call_end':
         return this.mapSubWorkflowCall(record, runId, type)
       case 'child_pi_event':
-        return this.mapChildPiEvent(record, runId)
+        return this.mapChildPiEvent(record, runId, sourceIdentity)
       default:
         return []
     }
@@ -284,7 +285,11 @@ export class WorkflowEventMapper {
     return plan ? [plan] : []
   }
 
-  private mapChildPiEvent(record: Record<string, unknown>, runId: string): SessionUpdate[] {
+  private mapChildPiEvent(
+    record: Record<string, unknown>,
+    runId: string,
+    sourceIdentity?: WorkflowEventSourceIdentity
+  ): SessionUpdate[] {
     const childType = stringField(record.childEventType)
     const stepId = stringField(record.stepId)
     const event = isObject(record.event) ? record.event : undefined
@@ -301,7 +306,8 @@ export class WorkflowEventMapper {
     const toolName = stringField(event.toolName) ?? 'tool'
     const args = event.args
     const result = childType === 'tool_execution_update' ? event.partialResult : event.result
-    const meta = metaFromRecord(record)
+    const meta = metaFromRecord(record, sourceIdentity)
+    const source = workflowToolSource(toolCallId, childType, meta)
     const locations = toToolCallLocations(args, this.cwd)
     const updates: SessionUpdate[] = []
 
@@ -317,7 +323,7 @@ export class WorkflowEventMapper {
         kind: metadata.kind,
         status: 'in_progress',
         locations,
-        rawInput: withWorkflowMeta(args, meta),
+        rawInput: withWorkflowMeta(safePresentationValue(args, source), meta),
         _meta: { piWorkflow: meta }
       })
       return updates
@@ -340,12 +346,12 @@ export class WorkflowEventMapper {
         kind: metadata.kind,
         status: 'in_progress',
         locations,
-        rawInput: withWorkflowMeta(args, meta),
+        rawInput: withWorkflowMeta(safePresentationValue(args, source), meta),
         _meta: { piWorkflow: meta }
       })
     }
 
-    const text = toolResultToText(result)
+    const text = toolResultToPresentationText(result, source)
     const content = text
       ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
       : undefined
@@ -355,7 +361,7 @@ export class WorkflowEventMapper {
       ...(metadata ? { title: metadata.title, kind: metadata.kind } : {}),
       status: childType === 'tool_execution_end' ? (event.isError ? 'failed' : 'completed') : 'in_progress',
       content,
-      rawOutput: withWorkflowMeta(result, meta),
+      rawOutput: withWorkflowMeta(safePresentationValue(result, source), meta),
       _meta: { piWorkflow: meta }
     })
     if (childType === 'tool_execution_end') this.childToolMetadata.delete(toolCallId)
@@ -1212,7 +1218,7 @@ function subWorkflowCallToolId(runId: string, stepId: string, toolName: string, 
   return ['workflow', runId, 'step', stepId, 'subworkflow', toolName, startedAt].map(encodeIdPart).join(':')
 }
 
-function metaFromRecord(record: Record<string, unknown>): WorkflowMeta {
+function metaFromRecord(record: Record<string, unknown>, source?: WorkflowEventSourceIdentity): WorkflowMeta {
   return {
     runId: String(record.runId),
     workflowId: stringField(record.workflowId),
@@ -1220,7 +1226,17 @@ function metaFromRecord(record: Record<string, unknown>): WorkflowMeta {
     runDir: stringField(record.runDir),
     auditPath: stringField(record.auditPath),
     stepId: stringField(record.stepId),
-    childSessionId: stringField(record.childSessionId)
+    childSessionId: stringField(record.childSessionId),
+    ...(source ? { source } : {})
+  }
+}
+
+function workflowToolSource(toolCallId: string, eventType: string, meta: WorkflowMeta): PresentationSource {
+  return {
+    label: 'workflow child tool event',
+    toolCallId,
+    eventType,
+    workflow: meta
   }
 }
 

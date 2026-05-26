@@ -1319,3 +1319,32 @@ test('WorkflowEventMapper maps child bash tools to ACP execute kind', () => {
   assert.equal((updates[0] as any).title, 'bash')
   assert.equal((updates[0] as any).kind, 'execute')
 })
+
+test('WorkflowEventMapper truncates large child tool result presentation and keeps workflow source metadata', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+  const updates = mapper.map(
+    {
+      type: 'child_pi_event',
+      timestamp: 't1',
+      runId: 'r1',
+      workflowId: 'wf',
+      stepId: 'code',
+      childSessionId: 'child',
+      childEventType: 'tool_execution_end',
+      event: {
+        type: 'tool_execution_end',
+        toolCallId: 'tool-1',
+        toolName: 'bash',
+        isError: false,
+        result: { details: { stdout: 'x'.repeat(140 * 1024) } }
+      }
+    },
+    { sourceKey: 'events-jsonl:/runs/r1/events.jsonl', startOffset: 10, endOffset: 20 }
+  ) as any[]
+
+  const update = updates.find(item => item.sessionUpdate === 'tool_call_update')
+  assert.ok(update)
+  assert.match(update.content[0].content.text, /presentation truncated/)
+  assert.equal(update.rawOutput.piAcpPresentation.truncated, true)
+  assert.equal(update._meta.piWorkflow.source.startOffset, 10)
+})

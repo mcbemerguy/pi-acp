@@ -8,11 +8,17 @@ import type {
 } from '@agentclientprotocol/sdk'
 import { RequestError } from '@agentclientprotocol/sdk'
 import { maybeAuthRequiredError } from './auth-required.js'
-import { readFileSync } from 'node:fs'
+import { readFileSync, statSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
 import { SessionStore } from './session-store.js'
-import { toolResultToText } from './translate/pi-tools.js'
+import {
+  TOOL_PRESENTATION_LIMITS,
+  presentationDiagnostic,
+  safePresentationValue,
+  toolResultToPresentationText,
+  type PresentationSource
+} from './translate/pi-tools.js'
 import { toToolCallLocations, toToolKind } from './translate/tool-metadata.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import { isWorkflowCommandPrompt, parseWorkflowCommandPrompt, WorkflowEventMonitor } from './workflow-events.js'
@@ -175,7 +181,8 @@ export class SessionManager {
       mcpServers: params.mcpServers,
       proc,
       conn: params.conn,
-      fileCommands: params.fileCommands ?? []
+      fileCommands: params.fileCommands ?? [],
+      sessionFile
     })
 
     this.sessions.set(sessionId, session)
@@ -202,7 +209,8 @@ export class SessionManager {
       mcpServers: params.mcpServers,
       proc: params.proc,
       conn: params.conn,
-      fileCommands: params.fileCommands ?? []
+      fileCommands: params.fileCommands ?? [],
+      sessionFile: null
     })
 
     this.sessions.set(sessionId, session)
@@ -221,6 +229,7 @@ export class PiAcpSession {
   private readonly conn: AgentSideConnection
   private readonly fileCommands: FileSlashCommand[]
   private readonly cancelAbortTimeoutMs: number
+  private readonly sessionFile: string | null
 
   // Used to map abort semantics to ACP stopReason.
   // Applies to the currently running turn.
@@ -247,10 +256,7 @@ export class PiAcpSession {
   private drainingCancelledTurn = false
   private cancelDrainTimer: NodeJS.Timeout | null = null
 
-  // For ACP diff support: capture file contents before edits, then emit ToolCallContent {type:"diff"}.
-  // This is due to pi sending diff as a string as opposed to ACP expected diff format.
-  // Compatible format may need to be implemented in pi in the future.
-  private editSnapshots = new Map<string, { path: string; oldText: string }>()
+  private editSnapshots = new Map<string, { path: string; oldText?: string; skippedReason?: string }>()
 
   private outboundQueue: OutboundQueueItem[] = []
   private sendingOutbound = false
@@ -275,6 +281,7 @@ export class PiAcpSession {
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
     cancelAbortTimeoutMs?: number
+    sessionFile?: string | null
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -283,6 +290,7 @@ export class PiAcpSession {
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
     this.cancelAbortTimeoutMs = opts.cancelAbortTimeoutMs ?? CANCEL_ABORT_TIMEOUT_MS
+    this.sessionFile = opts.sessionFile ?? null
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
   }
@@ -662,6 +670,14 @@ export class PiAcpSession {
     }
   }
 
+  private toolSource(toolCallId: string, eventType: string): PresentationSource {
+    return { sessionId: this.sessionId, toolCallId, eventType, sessionFile: this.sessionFile }
+  }
+
+  private rawPresentation(value: unknown, toolCallId: string, eventType: string): unknown {
+    return safePresentationValue(value, this.toolSource(toolCallId, eventType))
+  }
+
   private handlePiEvent(ev: PiRpcEvent) {
     const type = String((ev as any).type ?? '')
 
@@ -741,7 +757,7 @@ export class PiAcpSession {
                   kind: metadata.kind,
                   status,
                   locations,
-                  rawInput
+                  rawInput: this.rawPresentation(rawInput, toolCallId, 'message_update')
                 })
               }
             } else {
@@ -755,7 +771,7 @@ export class PiAcpSession {
                 ...(metadata ? { title: metadata.title, kind: metadata.kind } : {}),
                 status,
                 locations,
-                rawInput
+                rawInput: this.rawPresentation(rawInput, toolCallId, 'message_update')
               })
             }
           }
@@ -774,17 +790,24 @@ export class PiAcpSession {
         const args = (ev as any).args
         let line: number | undefined
 
-        // Capture pre-edit file contents so we can emit a structured ACP diff on completion.
         if (toolName === 'edit') {
           const p = typeof args?.path === 'string' ? args.path : undefined
           if (p) {
             try {
               const abs = isAbsolute(p) ? p : resolvePath(this.cwd, p)
-              const oldText = readFileSync(abs, 'utf8')
-              this.editSnapshots.set(toolCallId, { path: p, oldText })
+              const stat = statSync(abs)
+              if (stat.size <= TOOL_PRESENTATION_LIMITS.diffFileBytes) {
+                const oldText = readFileSync(abs, 'utf8')
+                this.editSnapshots.set(toolCallId, { path: p, oldText })
 
-              const needle = typeof args?.oldText === 'string' ? args.oldText : ''
-              line = findUniqueLineNumber(oldText, needle)
+                const needle = typeof args?.oldText === 'string' ? args.oldText : ''
+                line = findUniqueLineNumber(oldText, needle)
+              } else {
+                this.editSnapshots.set(toolCallId, {
+                  path: p,
+                  skippedReason: `structured diff omitted because pre-edit file is ${stat.size} bytes`
+                })
+              }
             } catch {
               // Ignore snapshot failures; we'll fall back to plain text output.
             }
@@ -806,7 +829,7 @@ export class PiAcpSession {
             kind: metadata.kind,
             status: 'in_progress',
             locations,
-            rawInput: args
+            rawInput: this.rawPresentation(args, toolCallId, 'tool_execution_start')
           })
         } else {
           this.currentToolCalls.set(toolCallId, 'in_progress')
@@ -817,7 +840,7 @@ export class PiAcpSession {
             kind: metadata.kind,
             status: 'in_progress',
             locations,
-            rawInput: args
+            rawInput: this.rawPresentation(args, toolCallId, 'tool_execution_start')
           })
         }
 
@@ -829,7 +852,7 @@ export class PiAcpSession {
         if (!toolCallId) break
 
         const partial = (ev as any).partialResult
-        const text = toolResultToText(partial)
+        const text = toolResultToPresentationText(partial, this.toolSource(toolCallId, 'tool_execution_update'))
         const metadata = this.currentToolMetadata.get(toolCallId)
 
         this.emit({
@@ -840,7 +863,7 @@ export class PiAcpSession {
           content: text
             ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
             : undefined,
-          rawOutput: partial
+          rawOutput: this.rawPresentation(partial, toolCallId, 'tool_execution_update')
         })
         break
       }
@@ -851,34 +874,64 @@ export class PiAcpSession {
 
         const result = (ev as any).result
         const isError = Boolean((ev as any).isError)
-        const text = toolResultToText(result)
+        const text = toolResultToPresentationText(result, this.toolSource(toolCallId, 'tool_execution_end'))
 
-        // If this was an edit and we captured a snapshot, emit a structured ACP diff.
-        // This enables clients like Zed to render an actual diff UI.
         const snapshot = this.editSnapshots.get(toolCallId)
         let content: ToolCallContent[] | undefined
 
         if (!isError && snapshot) {
-          try {
-            const abs = isAbsolute(snapshot.path) ? snapshot.path : resolvePath(this.cwd, snapshot.path)
-            const newText = readFileSync(abs, 'utf8')
-            if (newText !== snapshot.oldText) {
-              content = [
-                {
-                  type: 'diff',
-                  path: snapshot.path,
-                  oldText: snapshot.oldText,
-                  newText
-                },
-                ...(text ? ([{ type: 'content', content: { type: 'text', text } }] as ToolCallContent[]) : [])
-              ]
+          if (snapshot.skippedReason) {
+            content = [
+              {
+                type: 'content',
+                content: {
+                  type: 'text',
+                  text: presentationDiagnostic(
+                    snapshot.skippedReason,
+                    this.toolSource(toolCallId, 'tool_execution_end')
+                  )
+                }
+              },
+              ...(text ? ([{ type: 'content', content: { type: 'text', text } }] as ToolCallContent[]) : [])
+            ]
+          } else if (snapshot.oldText !== undefined) {
+            try {
+              const abs = isAbsolute(snapshot.path) ? snapshot.path : resolvePath(this.cwd, snapshot.path)
+              const stat = statSync(abs)
+              if (stat.size <= TOOL_PRESENTATION_LIMITS.diffFileBytes) {
+                const newText = readFileSync(abs, 'utf8')
+                if (newText !== snapshot.oldText) {
+                  content = [
+                    {
+                      type: 'diff',
+                      path: snapshot.path,
+                      oldText: snapshot.oldText,
+                      newText
+                    },
+                    ...(text ? ([{ type: 'content', content: { type: 'text', text } }] as ToolCallContent[]) : [])
+                  ]
+                }
+              } else {
+                content = [
+                  {
+                    type: 'content',
+                    content: {
+                      type: 'text',
+                      text: presentationDiagnostic(
+                        `structured diff omitted because post-edit file is ${stat.size} bytes`,
+                        this.toolSource(toolCallId, 'tool_execution_end')
+                      )
+                    }
+                  },
+                  ...(text ? ([{ type: 'content', content: { type: 'text', text } }] as ToolCallContent[]) : [])
+                ]
+              }
+            } catch {
+              // ignore; fall back to text only
             }
-          } catch {
-            // ignore; fall back to text only
           }
         }
 
-        // Fallback: just text content.
         if (!content && text) {
           content = [{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[]
         }
@@ -891,7 +944,7 @@ export class PiAcpSession {
           ...(metadata ? { title: metadata.title, kind: metadata.kind } : {}),
           status: isError ? 'failed' : 'completed',
           content,
-          rawOutput: result
+          rawOutput: this.rawPresentation(result, toolCallId, 'tool_execution_end')
         })
 
         this.currentToolCalls.delete(toolCallId)
