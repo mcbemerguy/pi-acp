@@ -419,8 +419,20 @@ export class PiAcpSession {
       })
       .catch(err => {
         const authErr = maybeAuthRequiredError(err)
-        if (authErr) this.completeTurn('error', { reject: authErr, proceedQueue: false })
-        else this.completeTurn(this.cancelRequested ? 'cancelled' : 'error', { proceedQueue: false })
+        if (authErr) {
+          this.completeTurn('error', { reject: authErr, proceedQueue: false })
+          return
+        }
+        if (this.cancelRequested) {
+          this.completeTurn('cancelled', { proceedQueue: false })
+          return
+        }
+        const message = `Pi prompt failed: ${err instanceof Error ? err.message : String(err)}`
+        this.emit({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: message } satisfies ContentBlock
+        })
+        this.completeTurn('error', { reject: RequestError.internalError({}, message), proceedQueue: false })
       })
   }
 

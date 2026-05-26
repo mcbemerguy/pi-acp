@@ -52,6 +52,7 @@ export class FakePiRpcProcess {
   abortCount = 0
   disposeCount = 0
   abortPromise: Promise<void> | null = null
+  promptError: unknown = null
 
   onEvent(handler: (ev: PiRpcEvent) => void): () => void {
     this.handlers.push(handler)
@@ -66,6 +67,7 @@ export class FakePiRpcProcess {
 
   async prompt(message: string, attachments: unknown[] = []): Promise<void> {
     this.prompts.push({ message, attachments })
+    if (this.promptError) throw this.promptError
   }
 
   async abort(): Promise<void> {

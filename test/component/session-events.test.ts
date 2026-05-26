@@ -655,6 +655,32 @@ test('PiAcpSession: prompt resolves end_turn on agent_end, not prompt ack', asyn
   assert.equal(reason, 'end_turn')
 })
 
+test('PiAcpSession: prompt rejects and surfaces message when pi prompt fails', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.promptError = new Error('pi RPC prompt timed out after 30000ms')
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  await assert.rejects(() => session.prompt('hello'), /Pi prompt failed: pi RPC prompt timed out after 30000ms/)
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.ok(
+    conn.updates.some(
+      msg =>
+        msg.update.sessionUpdate === 'agent_message_chunk' &&
+        (msg.update as any).content.text === 'Pi prompt failed: pi RPC prompt timed out after 30000ms'
+    )
+  )
+})
+
 test('PiAcpSession: prompt resolves when an extension command returns without agent_end', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()

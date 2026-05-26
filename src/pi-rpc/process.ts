@@ -61,6 +61,7 @@ type SpawnParams = {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
+const PROMPT_REQUEST_TIMEOUT_MS = 0
 const ABORT_REQUEST_TIMEOUT_MS = 3_000
 
 export function buildPiRpcSpawnEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
@@ -226,7 +227,7 @@ export class PiRpcProcess {
   }
 
   async prompt(message: string, images: unknown[] = []): Promise<void> {
-    const res = await this.request({ type: 'prompt', message, images })
+    const res = await this.request({ type: 'prompt', message, images }, PROMPT_REQUEST_TIMEOUT_MS)
     if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
   }
 
@@ -340,17 +341,20 @@ export class PiRpcProcess {
 
     return new Promise<PiRpcResponse>((resolve, reject) => {
       let settled = false
-      const timeout = setTimeout(() => {
-        if (settled) return
-        settled = true
-        this.pending.delete(id)
-        reject(new Error(`pi RPC ${cmd.type} timed out after ${timeoutMs}ms`))
-      }, timeoutMs)
+      const timeout =
+        timeoutMs > 0
+          ? setTimeout(() => {
+              if (settled) return
+              settled = true
+              this.pending.delete(id)
+              reject(new Error(`pi RPC ${cmd.type} timed out after ${timeoutMs}ms`))
+            }, timeoutMs)
+          : null
 
       const finish = (fn: () => void) => {
         if (settled) return
         settled = true
-        clearTimeout(timeout)
+        if (timeout) clearTimeout(timeout)
         fn()
       }
 

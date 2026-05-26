@@ -800,10 +800,12 @@ export class PiAcpAgent implements ACPAgent {
     }
     const usage = usageFromPiSessionStats(stats)
 
-    // ACP StopReason does not include "error"; if pi fails we map to end_turn for now,
-    // unless we know this was a cancellation.
-    const stopReason: StopReason =
-      result === 'error' ? (session.wasCancelRequested() ? 'cancelled' : 'end_turn') : result
+    if (result === 'error') {
+      if (session.wasCancelRequested()) return { stopReason: 'cancelled', ...(usage ? { usage } : {}) }
+      throw RequestError.internalError({}, 'Pi prompt failed before completing the turn.')
+    }
+
+    const stopReason: StopReason = result
 
     return { stopReason, ...(usage ? { usage } : {}) }
   }
