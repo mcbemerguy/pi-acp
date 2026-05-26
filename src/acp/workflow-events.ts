@@ -45,6 +45,13 @@ type TailState = {
   ended: boolean
 }
 
+type TerminalRunJsonFallbackState = {
+  record: Record<string, unknown>
+  recordKey: string
+  observedAt: number
+  tailOffsetsKey: string
+}
+
 type WorkflowMeta = {
   runId: string
   workflowId?: string
@@ -472,6 +479,7 @@ const DEFAULT_RUN_END_MAX_WAIT_MS = 4 * 60 * 60 * 1000
 const TAIL_READ_CHUNK_BYTES = 64 * 1024
 const METADATA_READ_CHUNK_BYTES = 16 * 1024
 const METADATA_MAX_LINES = 50
+const METADATA_MAX_BYTES = 64 * 1024
 
 export class WorkflowEventMonitor {
   private readonly workflowRunsDir: string
@@ -499,6 +507,7 @@ export class WorkflowEventMonitor {
   private stopResolve: (() => void) | null = null
   private stopRequestedAt: number | null = null
   private stopMode: 'grace' | 'run_end' | null = null
+  private terminalRunJsonFallback: TerminalRunJsonFallbackState | null = null
 
   constructor(cwd: string, emit: EmitSessionUpdate, options: WorkflowEventMonitorOptions = {}) {
     this.workflowRunsDir = options.workflowRunsDir ?? join(getAgentDir(), 'workflow-runs')
@@ -639,14 +648,42 @@ export class WorkflowEventMonitor {
   private syncAcceptedRunJsonTerminalState(): void {
     if (!this.acceptedRunDir) return
     const activeTails = Array.from(this.tails.values()).filter(tail => !tail.ended)
-    if (!activeTails.length) return
+    if (!activeTails.length) {
+      this.terminalRunJsonFallback = null
+      return
+    }
 
     const runDir = join(this.workflowRunsDir, this.acceptedRunDir)
     const record = readTerminalRunEndRecord(runDir, this.acceptedRunDir)
-    if (!record) return
+    if (!record) {
+      this.terminalRunJsonFallback = null
+      return
+    }
+
+    const now = Date.now()
+    const tailOffsetsKey = activeTailOffsetsKey(activeTails)
+    const recordKey = terminalRunJsonFallbackRecordKey(record)
+    if (
+      !this.terminalRunJsonFallback ||
+      this.terminalRunJsonFallback.tailOffsetsKey !== tailOffsetsKey ||
+      this.terminalRunJsonFallback.recordKey !== recordKey
+    ) {
+      this.terminalRunJsonFallback = { record, recordKey, observedAt: now, tailOffsetsKey }
+      return
+    }
+    if (!this.shouldEmitTerminalRunJsonFallback(this.terminalRunJsonFallback, now)) return
 
     for (const update of this.mapper.map(record)) this.emit(update)
     for (const tail of activeTails) tail.ended = true
+    this.terminalRunJsonFallback = null
+  }
+
+  private shouldEmitTerminalRunJsonFallback(state: TerminalRunJsonFallbackState, now: number): boolean {
+    if (this.stopRequestedAt === null) return false
+    const stopElapsed = now - this.stopRequestedAt
+    const terminalElapsed = now - state.observedAt
+    if (this.stopMode === 'run_end' && this.runEndMaxWaitMs > 0 && stopElapsed >= this.runEndMaxWaitMs) return true
+    return stopElapsed >= this.graceMs && terminalElapsed >= this.graceMs
   }
 
   private emitRunEndTimeoutFallback(): void {
@@ -694,6 +731,7 @@ export class WorkflowEventMonitor {
       return
     }
 
+    if (this.terminalRunJsonFallback && !noActiveTails) return
     if (!graceElapsed && !noActiveTails) return
     if (!graceElapsed && this.tails.size === 0) return
     this.dispose()
@@ -712,6 +750,16 @@ function resetTail(tail: TailState): void {
 
 function tailIdentityChanged(tail: TailState, dev: number, ino: number): boolean {
   return tail.dev !== undefined && tail.ino !== undefined && (tail.dev !== dev || tail.ino !== ino)
+}
+
+function activeTailOffsetsKey(tails: TailState[]): string {
+  return tails.map(tail => `${tail.filePath}:${tail.offset}:${Buffer.byteLength(tail.buffer)}`).join('|')
+}
+
+function terminalRunJsonFallbackRecordKey(record: Record<string, unknown>): string {
+  const stableRecord = { ...record }
+  delete stableRecord.timestamp
+  return stableStringify(stableRecord)
 }
 
 function readFileRange(
@@ -802,7 +850,7 @@ function readJsonObject(filePath: string): Record<string, unknown> | null {
 }
 
 function readMetadataFromEvents(eventsPath: string): WorkflowRunMetadata | null {
-  const lines = readInitialLines(eventsPath, METADATA_MAX_LINES)
+  const lines = readInitialLines(eventsPath, METADATA_MAX_LINES, METADATA_MAX_BYTES)
   if (!lines) return null
 
   const metadata: WorkflowRunMetadata = {}
@@ -831,17 +879,20 @@ function readMetadataFromEvents(eventsPath: string): WorkflowRunMetadata | null 
     : null
 }
 
-function readInitialLines(filePath: string, maxLines: number): string[] | null {
+function readInitialLines(filePath: string, maxLines: number, maxBytes: number): string[] | null {
   let fd: number | null = null
   try {
     fd = openSync(filePath, 'r')
     const decoder = new StringDecoder('utf8')
-    const buffer = Buffer.allocUnsafe(METADATA_READ_CHUNK_BYTES)
+    const buffer = Buffer.allocUnsafe(Math.min(METADATA_READ_CHUNK_BYTES, maxBytes))
     let text = ''
     let lineCount = 0
-    while (lineCount < maxLines) {
-      const bytesRead = readSync(fd, buffer, 0, buffer.byteLength, null)
+    let totalBytesRead = 0
+    while (lineCount < maxLines && totalBytesRead < maxBytes) {
+      const bytesToRead = Math.min(buffer.byteLength, maxBytes - totalBytesRead)
+      const bytesRead = readSync(fd, buffer, 0, bytesToRead, null)
       if (bytesRead <= 0) break
+      totalBytesRead += bytesRead
       const chunk = decoder.write(buffer.subarray(0, bytesRead))
       text += chunk
       lineCount += countLineBreaks(chunk)

@@ -788,6 +788,68 @@ test('WorkflowEventMonitor can keep tailing an accepted run until run_end', asyn
   rmSync(root, { recursive: true, force: true })
 })
 
+test('WorkflowEventMonitor keeps tailing briefly after terminal run.json so real run_end is not lost', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-run-json-race-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  mkdirSync(workflowRunsDir, { recursive: true })
+  const updates: any[] = []
+  const observedTypes: string[] = []
+  const monitor = new WorkflowEventMonitor('/repo', update => updates.push(update), {
+    workflowRunsDir,
+    pollIntervalMs: 5,
+    graceMs: 80,
+    onRecord: record => observedTypes.push(String(record.type))
+  })
+
+  try {
+    monitor.start()
+    const runDir = join(workflowRunsDir, 'r1')
+    mkdirSync(runDir)
+    const eventsPath = join(runDir, 'events.jsonl')
+    writeFileSync(
+      eventsPath,
+      `${JSON.stringify({ type: 'run_start', timestamp: 't1', runId: 'r1', workflowId: 'wf', status: 'running' })}\n`,
+      'utf8'
+    )
+    await waitUntil(() => observedTypes.includes('run_start'))
+
+    const stop = monitor.waitForRunEndAfterPromptResolution()
+    writeFileSync(
+      join(runDir, 'run.json'),
+      JSON.stringify({
+        id: 'r1',
+        workflowId: 'wf',
+        cwd: '/repo',
+        runDir,
+        status: 'completed',
+        endedAt: '2026-05-26T00:00:00.000Z'
+      }),
+      'utf8'
+    )
+
+    await wait(25)
+    assert.equal(
+      updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:r1'),
+      false
+    )
+
+    appendFileSync(
+      eventsPath,
+      `${JSON.stringify({ type: 'run_end', timestamp: 't2', runId: 'r1', workflowId: 'wf', status: 'completed' })}\n`
+    )
+    await stop
+
+    assert.deepEqual(observedTypes, ['run_start', 'run_end'])
+    const finalUpdate = updates.find(
+      update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:r1'
+    )
+    assert.equal(finalUpdate?.status, 'completed')
+  } finally {
+    monitor.dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('WorkflowEventMonitor falls back to terminal run.json when run_end is missing', async () => {
   const root = join(tmpdir(), `pi-acp-workflow-run-json-${process.pid}-${Date.now()}`)
   const workflowRunsDir = join(root, 'workflow-runs')
