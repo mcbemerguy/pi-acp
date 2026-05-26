@@ -466,6 +466,7 @@ export class WorkflowEventMonitor {
   private stopPromise: Promise<void> | null = null
   private stopResolve: (() => void) | null = null
   private stopRequestedAt: number | null = null
+  private stopMode: 'grace' | 'run_end' | null = null
 
   constructor(cwd: string, emit: EmitSessionUpdate, options: WorkflowEventMonitorOptions = {}) {
     this.workflowRunsDir = options.workflowRunsDir ?? join(getAgentDir(), 'workflow-runs')
@@ -485,8 +486,17 @@ export class WorkflowEventMonitor {
   }
 
   stopAfterPromptResolution(): Promise<void> {
+    return this.requestStop('grace')
+  }
+
+  waitForRunEndAfterPromptResolution(): Promise<void> {
+    return this.requestStop('run_end')
+  }
+
+  private requestStop(mode: 'grace' | 'run_end'): Promise<void> {
     if (this.stopPromise) return this.stopPromise
     this.stopRequestedAt = Date.now()
+    this.stopMode = mode
     this.stopPromise = new Promise(resolve => {
       this.stopResolve = resolve
     })
@@ -573,6 +583,16 @@ export class WorkflowEventMonitor {
     if (this.stopRequestedAt === null) return
     const graceElapsed = Date.now() - this.stopRequestedAt >= this.graceMs
     const noActiveTails = Array.from(this.tails.values()).every(tail => tail.ended)
+
+    if (this.stopMode === 'run_end') {
+      if (this.acceptedRunDir && noActiveTails) {
+        this.dispose()
+        return
+      }
+      if (!this.acceptedRunDir && graceElapsed) this.dispose()
+      return
+    }
+
     if (!graceElapsed && !noActiveTails) return
     if (!graceElapsed && this.tails.size === 0) return
     this.dispose()

@@ -1,10 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
+
+const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
 test('PiAcpSession: emits agent_message_chunk for text_delta', async () => {
   const conn = new FakeAgentSideConnection()
@@ -671,6 +673,70 @@ test('PiAcpSession: prompt resolves when an extension command returns without ag
   const reason = await p
   assert.equal(reason, 'end_turn')
   assert.equal(proc.prompts.length, 1)
+})
+
+test('PiAcpSession: workflow slash prompt stays pending until workflow run_end', async () => {
+  const oldAgentDir = process.env.PI_CODING_AGENT_DIR
+  const agentDir = mkdtempSync(join(tmpdir(), 'pi-acp-agent-'))
+  process.env.PI_CODING_AGENT_DIR = agentDir
+
+  try {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-acp-workflow-cwd-'))
+    const conn = new FakeAgentSideConnection()
+    const proc = new FakePiRpcProcess()
+    const session = new PiAcpSession({
+      sessionId: 's1',
+      cwd,
+      mcpServers: [],
+      proc: proc as any,
+      conn: asAgentConn(conn),
+      fileCommands: []
+    })
+
+    let resolved = false
+    const prompt = session.prompt('/workflow:review task').then(reason => {
+      resolved = true
+      return reason
+    })
+
+    const workflowRunsDir = join(agentDir, 'workflow-runs')
+    const runDir = join(workflowRunsDir, 'r1')
+    mkdirSync(runDir, { recursive: true })
+    writeFileSync(
+      join(runDir, 'run.json'),
+      JSON.stringify({
+        id: 'r1',
+        workflowId: 'review',
+        commandName: 'workflow:review',
+        cwd,
+        initialTaskMessage: 'task',
+        parentSessionId: 's1'
+      }),
+      'utf8'
+    )
+    const eventsPath = join(runDir, 'events.jsonl')
+    writeFileSync(
+      eventsPath,
+      `${JSON.stringify({ type: 'run_start', timestamp: 't1', runId: 'r1', workflowId: 'review', commandName: 'workflow:review', cwd, status: 'running' })}\n`,
+      'utf8'
+    )
+
+    await wait(550)
+    assert.equal(resolved, false)
+
+    appendFileSync(
+      eventsPath,
+      `${JSON.stringify({ type: 'run_end', timestamp: 't2', runId: 'r1', workflowId: 'review', commandName: 'workflow:review', cwd, status: 'completed' })}\n`
+    )
+
+    const reason = await prompt
+    assert.equal(reason, 'end_turn')
+    assert.ok(conn.updates.some(msg => msg.update.sessionUpdate === 'tool_call_update'))
+  } finally {
+    if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = oldAgentDir
+    rmSync(agentDir, { recursive: true, force: true })
+  }
 })
 
 test('PiAcpSession: cancel flips stopReason to cancelled', async () => {

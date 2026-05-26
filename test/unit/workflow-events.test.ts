@@ -514,6 +514,45 @@ test('WorkflowEventMonitor tails new run artifacts and tolerates malformed parti
   rmSync(root, { recursive: true, force: true })
 })
 
+test('WorkflowEventMonitor can keep tailing an accepted run until run_end', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-wait-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  mkdirSync(workflowRunsDir, { recursive: true })
+  const updates: any[] = []
+  const monitor = new WorkflowEventMonitor('/repo', update => updates.push(update), {
+    workflowRunsDir,
+    pollIntervalMs: 10,
+    graceMs: 30
+  })
+
+  monitor.start()
+  const runDir = join(workflowRunsDir, 'r1')
+  mkdirSync(runDir)
+  const eventsPath = join(runDir, 'events.jsonl')
+  writeFileSync(
+    eventsPath,
+    `${JSON.stringify({ type: 'run_start', timestamp: 't1', runId: 'r1', workflowId: 'wf', status: 'running' })}\n`,
+    'utf8'
+  )
+
+  let stopped = false
+  const stop = monitor.waitForRunEndAfterPromptResolution().then(() => {
+    stopped = true
+  })
+
+  await wait(80)
+  assert.equal(stopped, false)
+  appendFileSync(
+    eventsPath,
+    `${JSON.stringify({ type: 'run_end', timestamp: 't2', runId: 'r1', workflowId: 'wf', status: 'completed' })}\n`
+  )
+  await stop
+
+  assert.equal(stopped, true)
+  assert.ok(updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:r1'))
+  rmSync(root, { recursive: true, force: true })
+})
+
 test('WorkflowEventMonitor filters workflow runs by cwd, workflow id, task, and locks to the accepted run', async () => {
   const root = join(tmpdir(), `pi-acp-workflow-filter-${process.pid}-${Date.now()}`)
   const workflowRunsDir = join(root, 'workflow-runs')

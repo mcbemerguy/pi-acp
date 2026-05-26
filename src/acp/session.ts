@@ -436,7 +436,13 @@ export class PiAcpSession {
     if (opts.drainPiEvents) this.startCancelledTurnDrain()
 
     void (async () => {
-      if (monitor) await monitor.stopAfterPromptResolution()
+      if (monitor) {
+        if (reason === 'end_turn' && !opts.reject && !opts.drainPiEvents) {
+          await monitor.waitForRunEndAfterPromptResolution()
+        } else {
+          await monitor.stopAfterPromptResolution()
+        }
+      }
       await this.flushEmits()
 
       if (opts.reject) pending.reject(opts.reject)
