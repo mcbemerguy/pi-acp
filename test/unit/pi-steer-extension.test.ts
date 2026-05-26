@@ -33,7 +33,7 @@ test('PiAcpAgent _pi/steer sends pi RPC steer with prompt conversion parity', as
     mode: 'steer',
     prompt: [
       { type: 'text', text: 'Look at this' },
-      { type: 'resource_link', uri: 'file:///tmp/a.ts' },
+      { type: 'resource_link', uri: 'file:///tmp/a.ts', name: 'a.ts' },
       { type: 'image', mimeType: 'image/png', data: 'aW1n' }
     ]
   })
@@ -72,6 +72,35 @@ test('PiAcpAgent _pi/steer rejects unknown session as protocol error', async () 
       }),
     (err: unknown) => err instanceof RequestError && err.code === -32602
   )
+})
+
+test('PiAcpAgent _pi/steer rejects malformed content blocks as invalid params', async () => {
+  const proc = new FakePiRpcProcess() as any
+  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
+  ;(agent as any).sessions = new FakeSessions({ sessionId: 's1', proc }) as any
+
+  await assert.rejects(
+    () =>
+      agent.extMethod('_pi/steer', {
+        sessionId: 's1',
+        mode: 'steer',
+        prompt: [null]
+      }),
+    (err: unknown) => err instanceof RequestError && err.code === -32602 && String(err.message).includes('prompt[0]')
+  )
+
+  await assert.rejects(
+    () =>
+      agent.extMethod('_pi/steer', {
+        sessionId: 's1',
+        mode: 'steer',
+        prompt: [{}]
+      }),
+    (err: unknown) => err instanceof RequestError && err.code === -32602 && String(err.message).includes('prompt[0]')
+  )
+
+  assert.equal(proc.steers.length, 0)
+  assert.equal(proc.followUps.length, 0)
 })
 
 test('PiAcpAgent generic session/prompt remains normal prompt path', async () => {

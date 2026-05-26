@@ -29,6 +29,7 @@ import { listPiSessions, findPiSessionFile, resolveStoredPiSessionFile } from '.
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
 import { toolResultToText } from './translate/pi-tools.js'
 import { promptToPiMessage } from './translate/prompt.js'
+import { zContentBlock } from '@agentclientprotocol/sdk/dist/schema/zod.gen.js'
 import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slash-commands.js'
 import { getEnableSkillCommands } from './pi-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
@@ -851,12 +852,23 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.invalidParams({}, 'prompt must be an array of ACP content blocks')
     }
 
+    const parsedPrompt = prompt.map((block, index) => {
+      const parsed = zContentBlock.safeParse(block)
+      if (!parsed.success) {
+        const issue = parsed.error.issues[0]
+        const path = issue?.path.length ? `.${issue.path.join('.')}` : ''
+        const detail = issue ? `: ${issue.message}` : ''
+        throw RequestError.invalidParams({}, `prompt[${index}]${path} is not a valid ACP content block${detail}`)
+      }
+      return parsed.data
+    })
+
     const mode = params.mode ?? 'steer'
     if (mode !== 'steer' && mode !== 'follow_up') {
       throw RequestError.invalidParams({}, 'mode must be "steer" or "follow_up"')
     }
 
-    return { sessionId, prompt: prompt as ContentBlock[], mode }
+    return { sessionId, prompt: parsedPrompt, mode }
   }
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
