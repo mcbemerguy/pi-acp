@@ -25,6 +25,7 @@ import {
 import { PI_USAGE_UPDATE_METHOD, piUsageTelemetryFromPiSessionStats, usageUpdateFromPiSessionStats } from './usage.js'
 
 const CANCEL_ABORT_TIMEOUT_MS = 3_500
+const CANCEL_DRAIN_TIMEOUT_MS = 2_000
 
 type SessionCreateParams = {
   cwd: string
@@ -220,6 +221,8 @@ export class PiAcpSession {
   private sawAgentActivity = false
   private promptAckFallbackTimer: NodeJS.Timeout | null = null
   private currentWorkflowMonitor: WorkflowEventMonitor | null = null
+  private drainingCancelledTurn = false
+  private cancelDrainTimer: NodeJS.Timeout | null = null
 
   // For ACP diff support: capture file contents before edits, then emit ToolCallContent {type:"diff"}.
   // This is due to pi sending diff as a string as opposed to ACP expected diff format.
@@ -251,6 +254,11 @@ export class PiAcpSession {
   dispose(): void {
     this.currentWorkflowMonitor?.dispose()
     this.currentWorkflowMonitor = null
+    if (this.cancelDrainTimer) {
+      clearTimeout(this.cancelDrainTimer)
+      this.cancelDrainTimer = null
+    }
+    this.drainingCancelledTurn = false
     this.proc.dispose?.()
   }
 
@@ -262,7 +270,7 @@ export class PiAcpSession {
       const queued: QueuedTurn = { message: expandedMessage, images, resolve, reject }
 
       // If a turn is already running, enqueue.
-      if (this.pendingTurn) {
+      if (this.pendingTurn || this.drainingCancelledTurn) {
         this.turnQueue.push(queued)
 
         // Best-effort: notify client that a prompt was queued.
@@ -316,7 +324,7 @@ export class PiAcpSession {
 
     try {
       await this.withTimeout(this.proc.abort(), this.cancelAbortTimeoutMs, 'pi abort')
-      this.completeTurn('cancelled')
+      this.completeTurn('cancelled', { drainPiEvents: true })
     } catch {
       this.emit({
         sessionUpdate: 'agent_message_chunk',
@@ -381,6 +389,7 @@ export class PiAcpSession {
       clearTimeout(this.promptAckFallbackTimer)
       this.promptAckFallbackTimer = null
     }
+    this.stopCancelledTurnDrain()
     this.currentAgentMessageId = crypto.randomUUID()
     const workflowTarget = parseWorkflowCommandPrompt(t.message)
     this.currentWorkflowMonitor = isWorkflowCommandPrompt(t.message)
@@ -415,12 +424,16 @@ export class PiAcpSession {
       })
   }
 
-  private completeTurn(reason: StopReason, opts: { reject?: unknown; proceedQueue?: boolean } = {}): void {
+  private completeTurn(
+    reason: StopReason,
+    opts: { reject?: unknown; proceedQueue?: boolean; drainPiEvents?: boolean } = {}
+  ): void {
     if (!this.pendingTurn || this.completingTurn) return
     this.completingTurn = true
     const pending = this.pendingTurn
     const monitor = this.currentWorkflowMonitor
     this.currentWorkflowMonitor = null
+    if (opts.drainPiEvents) this.startCancelledTurnDrain()
 
     void (async () => {
       if (monitor) await monitor.stopAfterPromptResolution()
@@ -440,7 +453,7 @@ export class PiAcpSession {
       this.sawAgentActivity = false
       this.currentAgentMessageId = null
 
-      const proceedQueue = opts.proceedQueue ?? true
+      const proceedQueue = (opts.proceedQueue ?? true) && !this.drainingCancelledTurn
       const next = proceedQueue ? this.turnQueue.shift() : undefined
       if (next) {
         this.emit({
@@ -457,8 +470,39 @@ export class PiAcpSession {
     })()
   }
 
+  private startCancelledTurnDrain(): void {
+    this.drainingCancelledTurn = true
+    if (this.cancelDrainTimer) clearTimeout(this.cancelDrainTimer)
+    this.cancelDrainTimer = setTimeout(() => this.stopCancelledTurnDrain(), CANCEL_DRAIN_TIMEOUT_MS)
+  }
+
+  private stopCancelledTurnDrain(): void {
+    if (!this.drainingCancelledTurn && !this.cancelDrainTimer) return
+    this.drainingCancelledTurn = false
+    if (this.cancelDrainTimer) {
+      clearTimeout(this.cancelDrainTimer)
+      this.cancelDrainTimer = null
+    }
+
+    if (!this.pendingTurn && this.turnQueue.length) {
+      const next = this.turnQueue.shift()
+      if (next) {
+        this.emit({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
+        })
+        this.startTurn(next)
+      }
+    }
+  }
+
   private handlePiEvent(ev: PiRpcEvent) {
     const type = String((ev as any).type ?? '')
+
+    if (this.drainingCancelledTurn) {
+      if (type === 'agent_end') this.stopCancelledTurnDrain()
+      return
+    }
 
     switch (type) {
       case 'extension_ui_request': {

@@ -39,6 +39,36 @@ test('PiAcpSession: cancel clears queued prompts', async () => {
   assert.equal(proc.prompts.length, 1)
 })
 
+test('PiAcpSession: cancel suppresses late events until cancelled agent ends', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const first = session.prompt('one')
+  await session.cancel()
+  assert.equal(await first, 'cancelled')
+
+  const second = session.prompt('two')
+  assert.equal(proc.prompts.length, 1)
+
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'late text' } } as any)
+  proc.emit({ type: 'agent_end' })
+
+  assert.equal(proc.prompts.length, 2)
+  assert.equal(conn.updates.some(u => JSON.stringify(u).includes('late text')), false)
+
+  proc.emit({ type: 'agent_end' })
+  assert.equal(await second, 'end_turn')
+})
+
 test('PiAcpSession: cancel resolves current prompt when abort hangs', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
