@@ -133,6 +133,112 @@ test('phase 4: ACP session outbound pressure coalesces presentation text after i
   )
 })
 
+test('phase 4: ACP session outbound pressure coalesces thought chunks without message ids', async () => {
+  const records: PiRpcEvent[] = Array.from({ length: 300 }, (_, sequence) => ({
+    type: 'message_update',
+    sequence,
+    assistantMessageEvent: {
+      type: 'thinking_delta',
+      delta: `thought-${sequence}-`
+    }
+  }))
+  const conn = new FakeAgentSideConnection()
+  let unblock!: () => void
+  const blocker = new Promise<void>(resolve => {
+    unblock = resolve
+  })
+  const originalSessionUpdate = conn.sessionUpdate.bind(conn)
+  conn.sessionUpdate = async message => {
+    await blocker
+    await originalSessionUpdate(message)
+  }
+  const proc = new FakePiRpcProcess()
+  const session = new PiAcpSession({
+    sessionId: 'thought-stress-session',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const prompt = session.prompt('stress thoughts')
+  proc.emit({ type: 'agent_start' })
+  for (const record of records) proc.emit(record)
+
+  const blocked = session.getOutboundPressureSnapshot()
+  assert.equal(blocked.enqueued, records.length + 1)
+  assert.ok(blocked.maxPending < 10, `expected bounded pending thought ACP updates, got ${blocked.maxPending}`)
+  assert.ok(blocked.coalesced > 0)
+  assert.equal(blocked.diagnostics, 0)
+
+  proc.emit({ type: 'agent_end' })
+  unblock()
+  assert.equal(await prompt, 'end_turn')
+  await waitUntil(() => session.getOutboundPressureSnapshot().pending === 0)
+
+  const thoughtText = conn.updates
+    .flatMap(message => {
+      const update: any = message.update
+      return update.sessionUpdate === 'agent_thought_chunk' && update.content?.type === 'text'
+        ? [String(update.content.text)]
+        : []
+    })
+    .join('')
+  assert.equal(
+    thoughtText,
+    records.map(record => String((record.assistantMessageEvent as { delta: string }).delta)).join('')
+  )
+})
+
+test('phase 4: outbound diagnostics are included in enqueue accounting', async () => {
+  const records: PiRpcEvent[] = Array.from({ length: 260 }, (_, sequence) => ({
+    type: 'message_update',
+    sequence,
+    assistantMessageEvent: {
+      type: 'toolcall_start',
+      toolCall: { id: `tool-${sequence}`, name: 'read' }
+    }
+  }))
+  const conn = new FakeAgentSideConnection()
+  let unblock!: () => void
+  const blocker = new Promise<void>(resolve => {
+    unblock = resolve
+  })
+  const originalSessionUpdate = conn.sessionUpdate.bind(conn)
+  conn.sessionUpdate = async message => {
+    await blocker
+    await originalSessionUpdate(message)
+  }
+  const proc = new FakePiRpcProcess()
+  const session = new PiAcpSession({
+    sessionId: 'diagnostic-accounting-session',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const prompt = session.prompt('stress tool calls')
+  proc.emit({ type: 'agent_start' })
+  for (const record of records) proc.emit(record)
+
+  const blocked = session.getOutboundPressureSnapshot()
+  assert.equal(blocked.diagnostics, 1)
+  assert.equal(blocked.enqueued, records.length + 2)
+  assert.ok(blocked.pending <= blocked.enqueued)
+  assert.ok(blocked.completed <= blocked.enqueued)
+
+  proc.emit({ type: 'agent_end' })
+  unblock()
+  assert.equal(await prompt, 'end_turn')
+  await waitUntil(() => session.getOutboundPressureSnapshot().pending === 0)
+
+  const finalPressure = session.getOutboundPressureSnapshot()
+  assert.ok(finalPressure.completed <= finalPressure.enqueued)
+})
+
 test('baseline: workflow monitor observes every JSONL event in order before mapping to ACP updates', async () => {
   const fixture = makeWorkflowTextDeltaRecords(1_200, 40)
   const root = join(tmpdir(), `pi-acp-workflow-stress-${process.pid}-${Date.now()}`)

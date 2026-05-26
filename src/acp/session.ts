@@ -424,6 +424,7 @@ export class PiAcpSession {
 
     this.outboundDiagnosticQueued = true
     this.outboundPressure.diagnostics += 1
+    this.outboundPressure.enqueued += 1
     this.outboundQueue.push({
       kind: 'sessionUpdate',
       update: {
@@ -982,7 +983,11 @@ function mergeTextChunkUpdate(previous: SessionUpdate, next: SessionUpdate): boo
   if (previousContent?.type !== 'text' || nextContent?.type !== 'text') return false
   const previousMessageId = (previous as { messageId?: unknown }).messageId
   const nextMessageId = (next as { messageId?: unknown }).messageId
-  if (typeof previousMessageId !== 'string' || previousMessageId !== nextMessageId) return false
+  if (previous.sessionUpdate === 'agent_message_chunk') {
+    if (typeof previousMessageId !== 'string' || previousMessageId !== nextMessageId) return false
+  } else if (previousMessageId !== nextMessageId) {
+    return false
+  }
 
   previousContent.text += nextContent.text
   return true
