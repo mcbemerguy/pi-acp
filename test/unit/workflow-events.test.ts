@@ -371,6 +371,112 @@ test('WorkflowEventMapper maps distinct child tool updates that share a timestam
   assert.equal(duplicate.length, 0)
 })
 
+test('WorkflowEventMapper fallback identities preserve valid plan content changes', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+
+  const stepStart = mapper.map({
+    type: 'step_update',
+    timestamp: 't1',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'code',
+    stepType: 'agent',
+    status: 'running'
+  })
+  const stepTypeChange = mapper.map({
+    type: 'step_update',
+    timestamp: 't2',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'code',
+    stepType: 'command',
+    status: 'running'
+  })
+  const subworkflowStart = mapper.map({
+    type: 'subworkflow_call_start',
+    timestamp: 't3',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'review',
+    toolName: 'workflow:review-fix',
+    childWorkflowId: 'review-fix',
+    startedAt: 'start-1',
+    status: 'running',
+    task: 'first task'
+  })
+  const subworkflowTaskChange = mapper.map({
+    type: 'subworkflow_call_start',
+    timestamp: 't4',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'review',
+    toolName: 'workflow:review-fix',
+    childWorkflowId: 'review-fix',
+    startedAt: 'start-1',
+    status: 'running',
+    task: 'changed task'
+  })
+  const duplicateTask = mapper.map({
+    type: 'subworkflow_call_start',
+    timestamp: 't5',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'review',
+    toolName: 'workflow:review-fix',
+    childWorkflowId: 'review-fix',
+    startedAt: 'start-1',
+    status: 'running',
+    task: 'changed task'
+  })
+
+  assert.equal(stepStart.at(-1)?.sessionUpdate, 'plan')
+  assert.equal(((stepTypeChange.at(-1) as any).entries[0] as any).content, 'Workflow step: code (command)')
+  assert.equal(subworkflowStart.at(-1)?.sessionUpdate, 'plan')
+  assert.equal(
+    ((subworkflowTaskChange.at(-1) as any).entries.at(-1) as any).content,
+    'Subworkflow: review-fix via workflow:review-fix — changed task'
+  )
+  assert.equal(duplicateTask.length, 0)
+})
+
+test('WorkflowEventMapper fallback hashes are stable across object key order', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+  const base = {
+    type: 'child_pi_event',
+    timestamp: 'same-ms',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'code',
+    childSessionId: 'child',
+    childEventType: 'tool_execution_update'
+  }
+
+  const first = mapper.map({
+    ...base,
+    event: {
+      type: 'tool_execution_update',
+      toolCallId: 'tool-1',
+      toolName: 'bash',
+      partialResult: { alpha: 1, beta: { zeta: 2, gamma: 3 } }
+    }
+  })
+  const reordered = mapper.map({
+    ...base,
+    event: {
+      toolName: 'bash',
+      toolCallId: 'tool-1',
+      type: 'tool_execution_update',
+      partialResult: { beta: { gamma: 3, zeta: 2 }, alpha: 1 }
+    }
+  })
+
+  assert.equal(
+    first.some(update => update.sessionUpdate === 'tool_call_update'),
+    true
+  )
+  assert.equal(reordered.length, 0)
+})
+
 test('WorkflowEventMapper projects child assistant text deltas and avoids duplicate message_end fallback', () => {
   const mapper = new WorkflowEventMapper('/repo')
   const delta = mapper.map({

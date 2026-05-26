@@ -1062,7 +1062,13 @@ function compactEventIdentity(record: Record<string, unknown>): string | null {
     case 'step_end':
     case 'inline_subworkflow_start':
     case 'inline_subworkflow_end':
-      return compactParts([type, runId, stringField(record.stepId), stringField(record.status)])
+      return compactParts([
+        type,
+        runId,
+        stringField(record.stepId),
+        stringField(record.status),
+        stringField(record.stepType)
+      ])
     case 'subworkflow_call_start':
     case 'subworkflow_call_end':
       return compactParts([
@@ -1071,7 +1077,10 @@ function compactEventIdentity(record: Record<string, unknown>): string | null {
         stringField(record.stepId),
         stringField(record.toolName),
         stringField(record.startedAt),
-        stringField(record.status)
+        stringField(record.status),
+        stringField(record.childWorkflowId),
+        stringField(record.workflowId),
+        stringField(record.task)
       ])
     case 'child_pi_event':
       return compactChildEventIdentity(record, runId)
@@ -1132,10 +1141,15 @@ function compactParts(parts: Array<string | number | undefined>): string {
 }
 
 function jsonHash(value: unknown): string {
-  return createHash('sha1')
-    .update(JSON.stringify(value) ?? 'undefined')
-    .digest('hex')
-    .slice(0, 16)
+  return createHash('sha1').update(stableJson(value)).digest('hex').slice(0, 16)
+}
+
+function stableJson(value: unknown): string {
+  if (value === undefined) return 'undefined'
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? String(value)
+  if (Array.isArray(value)) return `[${value.map(item => stableJson(item)).join(',')}]`
+  const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right))
+  return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`).join(',')}}`
 }
 
 class BoundedIdentitySet {
