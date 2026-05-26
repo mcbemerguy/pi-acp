@@ -89,6 +89,32 @@ test('listPiSessions filters and paginates before expensive page title fallback 
   })
 })
 
+test('listPiSessions reuses tail metadata only while file size and mtime are unchanged', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-list-cache-'))
+  const dir = join(root, 'sessions', '--repo--')
+  mkdirSync(dir, { recursive: true })
+
+  const sessionFile = join(dir, 'cached.jsonl')
+  writeSessionFile(sessionFile, { id: 'cached-session', cwd: '/repo', index: 1, title: 'Original title' })
+
+  withPiAgentDir(root, () => {
+    const first = listPiSessions({ cwd: '/repo' })
+    assert.equal(first[0]?.updatedAt, '2026-01-01T00:01:00.000Z')
+    assert.equal(first[0]?.title, 'Original title')
+
+    writeSessionFile(sessionFile, {
+      id: 'cached-session',
+      cwd: '/repo',
+      index: 2,
+      title: 'Updated title with a different length'
+    })
+
+    const second = listPiSessions({ cwd: '/repo' })
+    assert.equal(second[0]?.updatedAt, '2026-01-01T00:02:00.000Z')
+    assert.equal(second[0]?.title, 'Updated title with a different length')
+  })
+})
+
 test('session file resolution falls back after ACP-created mapping path is renamed', () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-list-renamed-'))
   const dir = join(root, 'sessions', '--repo--')

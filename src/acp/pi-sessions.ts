@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, statSync, openSync, readSync, closeSync, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, resolve, isAbsolute } from 'node:path'
+import { join, resolve, isAbsolute, relative } from 'node:path'
 import type { StoredSession } from './session-store.js'
 
 export type PiSessionListItem = {
@@ -23,8 +23,16 @@ const DEFAULT_HEAD_BYTES = 64 * 1024
 const DEFAULT_INFO_SCAN_BYTES = 1024 * 1024
 
 type SessionHeader = { sessionId: string; cwd: string }
-type SessionCandidate = SessionHeader & { sessionFile: string; mtimeIso: string | null }
+type SessionCandidate = SessionHeader & {
+  sessionFile: string
+  mtimeIso: string | null
+  mtimeMs: number
+  size: number
+}
 type TailInfo = { title: string | null; updatedAt: string | null }
+type CachedTailInfo = { mtimeMs: number; size: number; info: TailInfo }
+
+const tailInfoCache = new Map<string, CachedTailInfo>()
 
 function getPiAgentDir(): string {
   return process.env.PI_CODING_AGENT_DIR ? resolve(process.env.PI_CODING_AGENT_DIR) : join(homedir(), '.pi', 'agent')
@@ -240,7 +248,9 @@ function getCandidateFromFile(file: string): SessionCandidate | null {
     return {
       ...header,
       sessionFile: file,
-      mtimeIso: st.mtime.toISOString()
+      mtimeIso: st.mtime.toISOString(),
+      mtimeMs: st.mtimeMs,
+      size: st.size
     }
   } catch {
     return null
@@ -284,12 +294,17 @@ function collectFallbackCandidates(seenFiles: Set<string>): SessionCandidate[] {
 }
 
 function getTailInfo(candidate: SessionCandidate): TailInfo {
+  const cached = tailInfoCache.get(candidate.sessionFile)
+  if (cached && cached.mtimeMs === candidate.mtimeMs && cached.size === candidate.size) return cached.info
+
   try {
     const tail = readTail(candidate.sessionFile)
-    return {
+    const info = {
       title: pickTitleFromTail(tail),
       updatedAt: pickUpdatedAtFromTail(tail) ?? candidate.mtimeIso
     }
+    tailInfoCache.set(candidate.sessionFile, { mtimeMs: candidate.mtimeMs, size: candidate.size, info })
+    return info
   } catch {
     return { title: null, updatedAt: candidate.mtimeIso }
   }
@@ -352,9 +367,17 @@ export function findPiSessionFile(sessionId: string): string | null {
   return null
 }
 
+function isWithinDir(path: string, dir: string): boolean {
+  const rel = relative(dir, path)
+  return rel === '' || (!!rel && !rel.startsWith('..') && !isAbsolute(rel))
+}
+
 export function resolveStoredPiSessionFile(stored: StoredSession | null): string | null {
   if (!stored) return null
   if (!isAbsolute(stored.sessionFile)) return stored.sessionFile
+  if (!existsSync(stored.sessionFile)) {
+    return isWithinDir(stored.sessionFile, getPiSessionsDir()) ? null : stored.sessionFile
+  }
   const candidate = getCandidateFromFile(stored.sessionFile)
   if (!candidate || candidate.sessionId !== stored.sessionId) return null
   return candidate.sessionFile

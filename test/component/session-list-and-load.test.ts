@@ -10,6 +10,67 @@ import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 // We mock PiRpcProcess.spawn so loadSession doesn't actually spawn `pi`.
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 
+test('PiAcpAgent: loadSession rejects stale absolute ACP mapping that points at another session', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-stale-map-'))
+  const sessionsDir = join(root, 'sessions', '--tmp--project--')
+  const sessionFile = join(sessionsDir, 'wrong-session.jsonl')
+  mkdirSync(sessionsDir, { recursive: true })
+
+  writeFileSync(
+    sessionFile,
+    [
+      JSON.stringify({
+        type: 'session',
+        version: 3,
+        id: 'other-session',
+        timestamp: '2026-02-11T00:00:00.000Z',
+        cwd: '/tmp/project'
+      })
+    ].join('\n') + '\n',
+    { encoding: 'utf8' }
+  )
+
+  const oldEnv = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = root
+  const originalSpawn = PiRpcProcess.spawn
+  let spawned = false
+
+  try {
+    ;(PiRpcProcess as any).spawn = async () => {
+      spawned = true
+      throw new Error('spawn should not be called')
+    }
+
+    const conn = new FakeAgentSideConnection()
+    const agent = new PiAcpAgent(asAgentConn(conn))
+    ;(agent as any).store = {
+      get: () => ({
+        sessionId: 'wanted-session',
+        cwd: '/tmp/project',
+        sessionFile,
+        updatedAt: '2026-02-11T00:00:00.000Z'
+      }),
+      list: () => []
+    }
+
+    await assert.rejects(
+      () =>
+        agent.loadSession({
+          sessionId: 'wanted-session',
+          cwd: '/tmp/project',
+          mcpServers: [],
+          _meta: null
+        } as any),
+      (err: any) => err?.data === 'Unknown sessionId: wanted-session'
+    )
+    assert.equal(spawned, false)
+  } finally {
+    PiRpcProcess.spawn = originalSpawn
+    if (oldEnv === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = oldEnv
+  }
+})
+
 test('PiAcpAgent: listSessions lists pi sessions and loadSession replays history', async () => {
   // Create a fake PI_CODING_AGENT_DIR with one session.
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-test-'))
