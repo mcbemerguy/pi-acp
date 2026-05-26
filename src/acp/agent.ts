@@ -4,6 +4,7 @@ import {
   type AgentSideConnection,
   type AuthenticateRequest,
   type CancelNotification,
+  type ContentBlock,
   type InitializeRequest,
   type InitializeResponse,
   type ListSessionsRequest,
@@ -132,6 +133,14 @@ export async function discoverAvailableCommands(
 }
 import { fileURLToPath } from 'node:url'
 
+const PI_STEER_METHOD = '_pi/steer'
+
+type PiSteerParams = {
+  sessionId: string
+  prompt: ContentBlock[]
+  mode: 'steer' | 'follow_up'
+}
+
 const pkg = readNearestPackageJson(import.meta.url)
 
 function shouldReplayLoadSessionHistory(params: InitializeRequest): boolean {
@@ -212,7 +221,10 @@ export class PiAcpAgent implements ACPAgent {
             extensionUiEvents: true,
             extensionUiEventMethod: PI_EXTENSION_UI_EVENT_METHOD,
             usageTelemetry: true,
-            usageTelemetryMethod: PI_USAGE_UPDATE_METHOD
+            usageTelemetryMethod: PI_USAGE_UPDATE_METHOD,
+            steering: true,
+            steeringMethod: PI_STEER_METHOD,
+            steeringModes: ['steer', 'follow_up']
           }
         }
       }
@@ -813,6 +825,38 @@ export class PiAcpAgent implements ACPAgent {
   async cancel(params: CancelNotification): Promise<void> {
     const session = this.sessions.get(params.sessionId)
     await session.cancel()
+  }
+
+  async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (method !== PI_STEER_METHOD) throw RequestError.methodNotFound(method)
+
+    const steerParams = this.parsePiSteerParams(params)
+    const session = this.sessions.get(steerParams.sessionId)
+    const { message, images } = promptToPiMessage(steerParams.prompt)
+
+    if (steerParams.mode === 'steer') await session.proc.steer(message, images)
+    else await session.proc.followUp(message, images)
+
+    return { accepted: true, mode: steerParams.mode }
+  }
+
+  private parsePiSteerParams(params: Record<string, unknown>): PiSteerParams {
+    const sessionId = params.sessionId
+    if (typeof sessionId !== 'string' || !sessionId.trim()) {
+      throw RequestError.invalidParams({}, 'sessionId must be a non-empty string')
+    }
+
+    const prompt = params.prompt
+    if (!Array.isArray(prompt)) {
+      throw RequestError.invalidParams({}, 'prompt must be an array of ACP content blocks')
+    }
+
+    const mode = params.mode ?? 'steer'
+    if (mode !== 'steer' && mode !== 'follow_up') {
+      throw RequestError.invalidParams({}, 'mode must be "steer" or "follow_up"')
+    }
+
+    return { sessionId, prompt: prompt as ContentBlock[], mode }
   }
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {

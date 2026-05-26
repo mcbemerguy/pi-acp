@@ -42,6 +42,9 @@ test('PiAcpAgent: advertises Pi ACP extension UI custom notifications in capabil
     extensionUiEvents: true,
     extensionUiEventMethod: '_pi/extension_ui_event',
     usageTelemetry: true,
-    usageTelemetryMethod: '_pi/session_usage_update'
+    usageTelemetryMethod: '_pi/session_usage_update',
+    steering: true,
+    steeringMethod: '_pi/steer',
+    steeringModes: ['steer', 'follow_up']
   })
 })

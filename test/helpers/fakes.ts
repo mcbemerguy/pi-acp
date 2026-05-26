@@ -46,6 +46,8 @@ export class FakePiRpcProcess {
   private handlers: Array<(ev: PiRpcEvent) => void> = []
 
   readonly prompts: Array<{ message: string; attachments: unknown[] }> = []
+  readonly steers: Array<{ message: string; attachments: unknown[] }> = []
+  readonly followUps: Array<{ message: string; attachments: unknown[] }> = []
   readonly extensionUiResponses: Array<{
     id: string
     payload?: Record<string, unknown>
@@ -70,6 +72,14 @@ export class FakePiRpcProcess {
   async prompt(message: string, attachments: unknown[] = []): Promise<void> {
     this.prompts.push({ message, attachments })
     if (this.promptError) throw this.promptError
+  }
+
+  async steer(message: string, attachments: unknown[] = []): Promise<void> {
+    this.steers.push({ message, attachments })
+  }
+
+  async followUp(message: string, attachments: unknown[] = []): Promise<void> {
+    this.followUps.push({ message, attachments })
   }
 
   async abort(): Promise<void> {

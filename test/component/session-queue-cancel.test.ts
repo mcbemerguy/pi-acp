@@ -63,7 +63,10 @@ test('PiAcpSession: cancel suppresses late events until cancelled agent ends', a
   proc.emit({ type: 'agent_end' })
 
   assert.equal(proc.prompts.length, 2)
-  assert.equal(conn.updates.some(u => JSON.stringify(u).includes('late text')), false)
+  assert.equal(
+    conn.updates.some(u => JSON.stringify(u).includes('late text')),
+    false
+  )
 
   proc.emit({ type: 'agent_end' })
   assert.equal(await second, 'end_turn')

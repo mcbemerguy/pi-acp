@@ -17,6 +17,8 @@ export class PiRpcSpawnError extends Error {
 
 type PiRpcCommand =
   | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
+  | { type: 'steer'; id?: string; message: string; images?: unknown[] }
+  | { type: 'follow_up'; id?: string; message: string; images?: unknown[] }
   | { type: 'abort'; id?: string }
   | { type: 'get_state'; id?: string }
   | { type: 'extension_ui_response'; id: string; cancelled?: boolean; value?: unknown; confirmed?: boolean }
@@ -229,6 +231,16 @@ export class PiRpcProcess {
   async prompt(message: string, images: unknown[] = []): Promise<void> {
     const res = await this.request({ type: 'prompt', message, images }, PROMPT_REQUEST_TIMEOUT_MS)
     if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  async steer(message: string, images: unknown[] = []): Promise<void> {
+    const res = await this.request({ type: 'steer', message, images })
+    if (!res.success) throw new Error(`pi steer failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  async followUp(message: string, images: unknown[] = []): Promise<void> {
+    const res = await this.request({ type: 'follow_up', message, images })
+    if (!res.success) throw new Error(`pi follow_up failed: ${res.error ?? JSON.stringify(res.data)}`)
   }
 
   async abort(): Promise<void> {
