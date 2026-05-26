@@ -24,6 +24,8 @@ import {
 } from './extension-ui.js'
 import { PI_USAGE_UPDATE_METHOD, piUsageTelemetryFromPiSessionStats, usageUpdateFromPiSessionStats } from './usage.js'
 
+const CANCEL_ABORT_TIMEOUT_MS = 3_500
+
 type SessionCreateParams = {
   cwd: string
   mcpServers: McpServer[]
@@ -196,6 +198,7 @@ export class PiAcpSession {
   readonly proc: PiRpcProcess
   private readonly conn: AgentSideConnection
   private readonly fileCommands: FileSlashCommand[]
+  private readonly cancelAbortTimeoutMs: number
 
   // Used to map abort semantics to ACP stopReason.
   // Applies to the currently running turn.
@@ -232,6 +235,7 @@ export class PiAcpSession {
     proc: PiRpcProcess
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
+    cancelAbortTimeoutMs?: number
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -239,6 +243,7 @@ export class PiAcpSession {
     this.proc = opts.proc
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
+    this.cancelAbortTimeoutMs = opts.cancelAbortTimeoutMs ?? CANCEL_ABORT_TIMEOUT_MS
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
   }
@@ -288,7 +293,6 @@ export class PiAcpSession {
   }
 
   async cancel(): Promise<void> {
-    // Cancel current and clear any queued prompts.
     this.cancelRequested = true
 
     if (this.turnQueue.length) {
@@ -305,8 +309,22 @@ export class PiAcpSession {
       })
     }
 
-    // Abort the currently running turn (if any). If nothing is running, this is a no-op.
-    await this.proc.abort()
+    if (!this.pendingTurn) {
+      await this.proc.abort().catch(() => {})
+      return
+    }
+
+    try {
+      await this.withTimeout(this.proc.abort(), this.cancelAbortTimeoutMs, 'pi abort')
+      this.completeTurn('cancelled')
+    } catch {
+      this.emit({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Pi did not acknowledge cancellation; restarting the ACP subprocess.' }
+      })
+      this.completeTurn('cancelled')
+      this.proc.dispose('SIGKILL')
+    }
   }
 
   wasCancelRequested(): boolean {
@@ -342,6 +360,16 @@ export class PiAcpSession {
 
   private async flushEmits(): Promise<void> {
     await this.lastSend
+  }
+
+  private withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+    let timeout: NodeJS.Timeout | null = null
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs)
+    })
+    return Promise.race([promise, timeoutPromise]).finally(() => {
+      if (timeout) clearTimeout(timeout)
+    })
   }
 
   private startTurn(t: QueuedTurn): void {

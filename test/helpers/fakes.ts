@@ -50,6 +50,8 @@ export class FakePiRpcProcess {
     response?: { cancelled?: boolean; value?: unknown; confirmed?: boolean }
   }> = []
   abortCount = 0
+  disposeCount = 0
+  abortPromise: Promise<void> | null = null
 
   onEvent(handler: (ev: PiRpcEvent) => void): () => void {
     this.handlers.push(handler)
@@ -68,6 +70,11 @@ export class FakePiRpcProcess {
 
   async abort(): Promise<void> {
     this.abortCount += 1
+    if (this.abortPromise) await this.abortPromise
+  }
+
+  dispose(): void {
+    this.disposeCount += 1
   }
 
   async sendExtensionUiResponse(id: string, payload: Record<string, unknown>): Promise<void> {

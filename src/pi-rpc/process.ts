@@ -60,6 +60,9 @@ type SpawnParams = {
   sessionPath?: string
 }
 
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
+const ABORT_REQUEST_TIMEOUT_MS = 3_000
+
 export function buildPiRpcSpawnEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   return {
     ...env,
@@ -228,7 +231,7 @@ export class PiRpcProcess {
   }
 
   async abort(): Promise<void> {
-    const res = await this.request({ type: 'abort' })
+    const res = await this.request({ type: 'abort' }, ABORT_REQUEST_TIMEOUT_MS)
     if (!res.success) throw new Error(`pi abort failed: ${res.error ?? JSON.stringify(res.data)}`)
   }
 
@@ -331,23 +334,41 @@ export class PiRpcProcess {
     return res.data
   }
 
-  private request(cmd: PiRpcCommand): Promise<PiRpcResponse> {
+  private request(cmd: PiRpcCommand, timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS): Promise<PiRpcResponse> {
     const id = crypto.randomUUID()
     const withId = { ...cmd, id }
 
     return new Promise<PiRpcResponse>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
+      let settled = false
+      const timeout = setTimeout(() => {
+        if (settled) return
+        settled = true
+        this.pending.delete(id)
+        reject(new Error(`pi RPC ${cmd.type} timed out after ${timeoutMs}ms`))
+      }, timeoutMs)
+
+      const finish = (fn: () => void) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeout)
+        fn()
+      }
+
+      this.pending.set(id, {
+        resolve: v => finish(() => resolve(v)),
+        reject: e => finish(() => reject(e))
+      })
 
       try {
         this.writeLine(withId, err => {
           if (err) {
             this.pending.delete(id)
-            reject(err)
+            finish(() => reject(err))
           }
         })
       } catch (e) {
         this.pending.delete(id)
-        reject(e)
+        finish(() => reject(e))
       }
     })
   }

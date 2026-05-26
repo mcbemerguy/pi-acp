@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { normalizeAcpInputLine } from '../../src/acp/t3code-compat.js'
 
-test('normalizes t3code request-shaped session/cancel into ACP notification', () => {
+test('leaves t3code request-shaped session/cancel untouched so clients receive a response', () => {
   const line = JSON.stringify({
     jsonrpc: '2.0',
     method: 'session/cancel',
@@ -11,11 +11,7 @@ test('normalizes t3code request-shaped session/cancel into ACP notification', ()
     headers: []
   })
 
-  assert.deepEqual(JSON.parse(normalizeAcpInputLine(line)), {
-    jsonrpc: '2.0',
-    method: 'session/cancel',
-    params: { sessionId: 's1' }
-  })
+  assert.equal(normalizeAcpInputLine(line), line)
 })
 
 test('leaves valid ACP notifications untouched', () => {
