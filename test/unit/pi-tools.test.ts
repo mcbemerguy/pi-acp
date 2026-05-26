@@ -64,3 +64,32 @@ test('safePresentationValue: replaces large and cyclic raw values with diagnosti
   const safe = safePresentationValue(cyclic, { toolCallId: 'cyclic' }) as any
   assert.deepEqual(safe, { ok: true, self: '[Circular]' })
 })
+
+test('safePresentationValue: preserves unserializable scalar diagnostics in small raw values', () => {
+  const presented = safePresentationValue({ fn: () => undefined, sym: Symbol('x'), big: 1n }) as any
+
+  assert.equal(presented.fn, '[Function]')
+  assert.equal(presented.sym, 'Symbol(x)')
+  assert.equal(presented.big, '1n')
+})
+
+test('safePresentationValue: stops numeric JSON presentation at the byte limit', () => {
+  const raw = { rows: Array.from({ length: 100_000 }, (_, i) => i) }
+  const presented = safePresentationValue(raw, { toolCallId: 'numbers' }) as any
+
+  assert.equal(presented.piAcpPresentation.truncated, true)
+  assert.match(presented.piAcpPresentation.reason, /too large/)
+  assert.ok(presented.piAcpPresentation.approxJsonBytes <= TOOL_PRESENTATION_LIMITS.rawJsonBytes + 32)
+  assert.equal(presented.piAcpPresentation.source.toolCallId, 'numbers')
+})
+
+test('toolResultToPresentationText: omits large structured JSON fallback without full presentation', () => {
+  const text = toolResultToPresentationText(
+    { rows: Array.from({ length: 100_000 }, (_, i) => i) },
+    { toolCallId: 'structured' }
+  )
+
+  assert.match(text, /JSON presentation omitted/)
+  assert.match(text, /tool structured/)
+  assert.ok(Buffer.byteLength(text) < 512)
+})
