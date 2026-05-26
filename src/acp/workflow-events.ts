@@ -21,6 +21,16 @@ type WorkflowEventMonitorOptions = {
   pollIntervalMs?: number
   graceMs?: number
   target?: WorkflowEventMonitorTarget | null
+  onRecord?: (record: Record<string, unknown>, sequence: number) => void
+}
+
+export type WorkflowIngestionSnapshot = {
+  recordsObserved: number
+  newBytesObserved: number
+  fileBytesRead: number
+  malformedLines: number
+  maxTailBufferBytes: number
+  maxActiveTails: number
 }
 
 type TailState = {
@@ -459,6 +469,15 @@ export class WorkflowEventMonitor {
   private readonly mapper: WorkflowEventMapper
   private readonly target: WorkflowEventMonitorTarget | null
   private readonly cwdKey: string
+  private readonly onRecord?: (record: Record<string, unknown>, sequence: number) => void
+  private readonly ingestion: WorkflowIngestionSnapshot = {
+    recordsObserved: 0,
+    newBytesObserved: 0,
+    fileBytesRead: 0,
+    malformedLines: 0,
+    maxTailBufferBytes: 0,
+    maxActiveTails: 0
+  }
   private readonly knownDirs = new Set<string>()
   private readonly tails = new Map<string, TailState>()
   private acceptedRunDir: string | null = null
@@ -476,6 +495,7 @@ export class WorkflowEventMonitor {
     this.mapper = new WorkflowEventMapper(cwd)
     this.target = options.target ?? null
     this.cwdKey = cwdComparableKey(cwd)
+    this.onRecord = options.onRecord
   }
 
   start(): void {
@@ -491,6 +511,10 @@ export class WorkflowEventMonitor {
 
   waitForRunEndAfterPromptResolution(): Promise<void> {
     return this.requestStop('run_end')
+  }
+
+  getIngestionSnapshot(): WorkflowIngestionSnapshot {
+    return { ...this.ingestion }
   }
 
   private requestStop(mode: 'grace' | 'run_end'): Promise<void> {
@@ -517,6 +541,10 @@ export class WorkflowEventMonitor {
 
   private tick(): void {
     this.discoverRuns()
+    this.ingestion.maxActiveTails = Math.max(
+      this.ingestion.maxActiveTails,
+      Array.from(this.tails.values()).filter(tail => !tail.ended).length
+    )
     for (const tail of this.tails.values()) this.readTail(tail)
     this.maybeFinish()
   }
@@ -556,8 +584,11 @@ export class WorkflowEventMonitor {
       }
       if (stat.size === tail.offset) return
       const data = readFileSync(tail.filePath)
+      this.ingestion.fileBytesRead += data.byteLength
+      const previousOffset = tail.offset
       const endOffset = Math.min(stat.size, data.byteLength)
-      text = data.subarray(tail.offset, endOffset).toString('utf8')
+      text = data.subarray(previousOffset, endOffset).toString('utf8')
+      this.ingestion.newBytesObserved += Math.max(0, endOffset - previousOffset)
       tail.offset = endOffset
     } catch {
       return
@@ -565,6 +596,7 @@ export class WorkflowEventMonitor {
 
     const lines = (tail.buffer + text).split(/\r?\n/)
     tail.buffer = lines.pop() ?? ''
+    this.ingestion.maxTailBufferBytes = Math.max(this.ingestion.maxTailBufferBytes, Buffer.byteLength(tail.buffer))
     for (const line of lines) {
       const trimmed = line.trim()
       if (!trimmed) continue
@@ -572,7 +604,12 @@ export class WorkflowEventMonitor {
       try {
         record = JSON.parse(trimmed)
       } catch {
+        this.ingestion.malformedLines += 1
         continue
+      }
+      if (isObject(record)) {
+        this.ingestion.recordsObserved += 1
+        this.onRecord?.(record, this.ingestion.recordsObserved - 1)
       }
       for (const update of this.mapper.map(record)) this.emit(update)
       if (isObject(record) && record.type === 'run_end') tail.ended = true

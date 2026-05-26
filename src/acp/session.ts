@@ -54,6 +54,14 @@ type ToolMetadata = {
   kind: ToolKind
 }
 
+export type OutboundPressureSnapshot = {
+  enqueued: number
+  completed: number
+  failed: number
+  pending: number
+  maxPending: number
+}
+
 function findUniqueLineNumber(text: string, needle: string): number | undefined {
   if (!needle) return undefined
 
@@ -230,6 +238,13 @@ export class PiAcpSession {
   private editSnapshots = new Map<string, { path: string; oldText: string }>()
 
   private lastSend: Promise<void> = Promise.resolve()
+  private outboundPressure: OutboundPressureSnapshot = {
+    enqueued: 0,
+    completed: 0,
+    failed: 0,
+    pending: 0,
+    maxPending: 0
+  }
 
   constructor(opts: {
     sessionId: string
@@ -349,8 +364,24 @@ export class PiAcpSession {
     if (usage) this.emitCustomNotification(PI_USAGE_UPDATE_METHOD, { sessionId: this.sessionId, usage })
   }
 
+  getOutboundPressureSnapshot(): OutboundPressureSnapshot {
+    return { ...this.outboundPressure }
+  }
+
   private enqueueSend(send: () => Promise<void>): void {
-    this.lastSend = this.lastSend.then(send).catch(() => {})
+    this.outboundPressure.enqueued += 1
+    this.outboundPressure.pending += 1
+    this.outboundPressure.maxPending = Math.max(this.outboundPressure.maxPending, this.outboundPressure.pending)
+    this.lastSend = this.lastSend.then(async () => {
+      try {
+        await send()
+        this.outboundPressure.completed += 1
+      } catch {
+        this.outboundPressure.failed += 1
+      } finally {
+        this.outboundPressure.pending -= 1
+      }
+    })
   }
 
   private emit(update: SessionUpdate): void {
