@@ -48,6 +48,11 @@ export class SessionStore {
     return db.sessions[sessionId] ?? null
   }
 
+  list(): StoredSession[] {
+    const db = loadFile(this.path)
+    return Object.values(db.sessions)
+  }
+
   upsert(entry: { sessionId: string; cwd: string; sessionFile: string }): void {
     const db = loadFile(this.path)
     db.sessions[entry.sessionId] = {

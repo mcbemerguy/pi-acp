@@ -62,7 +62,7 @@ test('PiAcpAgent: listSessions lists pi sessions and loadSession replays history
     const agent = new PiAcpAgent(asAgentConn(conn))
 
     // 1) list sessions
-    const listed = await agent.listSessions({ cwd: null, cursor: null, _meta: null } as any)
+    const listed = await agent.listSessions({ cwd: '/tmp/project', cursor: null, _meta: null } as any)
     assert.ok(listed.sessions.length >= 1)
 
     const s = listed.sessions.find(x => x.sessionId === 'sess-1')

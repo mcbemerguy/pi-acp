@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync, statSync, openSync, readSync, closeSync, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve, isAbsolute } from 'node:path'
+import type { StoredSession } from './session-store.js'
 
 export type PiSessionListItem = {
   sessionId: string
@@ -10,13 +11,22 @@ export type PiSessionListItem = {
   sessionFile: string
 }
 
+export type PiSessionListOptions = {
+  cwd?: string | null
+  cursor?: string | null
+  limit?: number
+  storedSessions?: StoredSession[]
+}
+
 const DEFAULT_TAIL_BYTES = 256 * 1024
 const DEFAULT_HEAD_BYTES = 64 * 1024
 const DEFAULT_INFO_SCAN_BYTES = 1024 * 1024
 
+type SessionHeader = { sessionId: string; cwd: string }
+type SessionCandidate = SessionHeader & { sessionFile: string; mtimeIso: string | null }
+type TailInfo = { title: string | null; updatedAt: string | null }
+
 function getPiAgentDir(): string {
-  // pi supports overriding config dir via PI_CODING_AGENT_DIR.
-  // See pi README.
   return process.env.PI_CODING_AGENT_DIR ? resolve(process.env.PI_CODING_AGENT_DIR) : join(homedir(), '.pi', 'agent')
 }
 
@@ -45,7 +55,6 @@ export function getPiSessionsDir(): string {
 function walkJsonlFiles(dir: string, out: string[]) {
   let entries: import('node:fs').Dirent[]
   try {
-    // Force string names.
     entries = readdirSync(dir, { withFileTypes: true, encoding: 'utf8' }) as unknown as import('node:fs').Dirent[]
   } catch {
     return
@@ -60,9 +69,9 @@ function walkJsonlFiles(dir: string, out: string[]) {
 }
 
 function readFirstLine(path: string): string | null {
-  // Avoid reading the whole file.
-  const fd = openSync(path, 'r')
+  let fd: number | null = null
   try {
+    fd = openSync(path, 'r')
     const buf = Buffer.alloc(DEFAULT_HEAD_BYTES)
     const n = readSync(fd, buf, 0, buf.length, 0)
     if (n <= 0) return null
@@ -72,10 +81,12 @@ function readFirstLine(path: string): string | null {
   } catch {
     return null
   } finally {
-    try {
-      closeSync(fd)
-    } catch {
-      // ignore
+    if (fd !== null) {
+      try {
+        closeSync(fd)
+      } catch {
+        // ignore
+      }
     }
   }
 }
@@ -99,7 +110,7 @@ function readTail(path: string, tailBytes = DEFAULT_TAIL_BYTES): string {
   }
 }
 
-function parseSessionHeader(firstLine: string): { sessionId: string; cwd: string } | null {
+function parseSessionHeader(firstLine: string): SessionHeader | null {
   try {
     const obj = JSON.parse(firstLine) as any
     if (obj?.type !== 'session') return null
@@ -113,8 +124,6 @@ function parseSessionHeader(firstLine: string): { sessionId: string; cwd: string
 }
 
 function pickTitleFromTail(tail: string): string | null {
-  // Try to find the *latest* session_info entry (stores the user-provided name).
-  // We scan backwards line-by-line.
   const lines = tail.split(/\r?\n/)
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim()
@@ -143,11 +152,8 @@ function scanSessionInfoNameFromRecentFileWindow(
 }
 
 function pickUpdatedAtFromTail(tail: string): string | null {
-  // pi's `/resume` effectively orders sessions by last *message* activity.
-  // We scan backwards and pick the timestamp of the most recent entry with type === "message".
   const lines = tail.split(/\r?\n/)
 
-  // 1) Prefer the most recent message entry.
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim()
     if (!line) continue
@@ -163,7 +169,6 @@ function pickUpdatedAtFromTail(tail: string): string | null {
     }
   }
 
-  // 2) Fallback: any valid timestamp (covers sessions that somehow have no messages).
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim()
     if (!line) continue
@@ -224,69 +229,133 @@ function pickFallbackTitleFromHead(path: string): string | null {
   return null
 }
 
-export function listPiSessions(): PiSessionListItem[] {
+function getCandidateFromFile(file: string): SessionCandidate | null {
+  const first = readFirstLine(file)
+  if (!first) return null
+  const header = parseSessionHeader(first)
+  if (!header) return null
+
+  try {
+    const st = statSync(file)
+    return {
+      ...header,
+      sessionFile: file,
+      mtimeIso: st.mtime.toISOString()
+    }
+  } catch {
+    return null
+  }
+}
+
+function collectStoredCandidates(
+  storedSessions: StoredSession[] | undefined,
+  seenFiles: Set<string>,
+  cwd: string | null | undefined
+): SessionCandidate[] {
+  if (!storedSessions?.length) return []
+  const out: SessionCandidate[] = []
+
+  for (const stored of storedSessions) {
+    if (cwd && stored.cwd !== cwd) continue
+    if (!stored.sessionFile || seenFiles.has(stored.sessionFile)) continue
+    const candidate = getCandidateFromFile(stored.sessionFile)
+    if (!candidate || candidate.sessionId !== stored.sessionId) continue
+    seenFiles.add(stored.sessionFile)
+    out.push(candidate)
+  }
+
+  return out
+}
+
+function collectFallbackCandidates(seenFiles: Set<string>): SessionCandidate[] {
   const sessionsDir = getPiSessionsDir()
   const files: string[] = []
   walkJsonlFiles(sessionsDir, files)
 
-  const items: PiSessionListItem[] = []
-
+  const out: SessionCandidate[] = []
   for (const file of files) {
-    const first = readFirstLine(file)
-    if (!first) continue
-    const header = parseSessionHeader(first)
-    if (!header) continue
+    if (seenFiles.has(file)) continue
+    const candidate = getCandidateFromFile(file)
+    if (!candidate) continue
+    seenFiles.add(file)
+    out.push(candidate)
+  }
+  return out
+}
 
-    let updatedAt: string | null = null
-
-    let title: string | null = null
-    try {
-      const tail = readTail(file)
-      title = pickTitleFromTail(tail)
-      updatedAt = pickUpdatedAtFromTail(tail)
-    } catch {
-      // ignore
+function getTailInfo(candidate: SessionCandidate): TailInfo {
+  try {
+    const tail = readTail(candidate.sessionFile)
+    return {
+      title: pickTitleFromTail(tail),
+      updatedAt: pickUpdatedAtFromTail(tail) ?? candidate.mtimeIso
     }
+  } catch {
+    return { title: null, updatedAt: candidate.mtimeIso }
+  }
+}
 
-    // If the session was renamed before the tail window, scan a larger bounded recent window.
-    if (!title) {
-      title = scanSessionInfoNameFromRecentFileWindow(file)
+function toOffset(cursor: string | null | undefined): number {
+  const offset = cursor ? Number.parseInt(cursor, 10) : 0
+  return Number.isFinite(offset) && offset > 0 ? offset : 0
+}
+
+export function listPiSessions(options: PiSessionListOptions = {}): PiSessionListItem[] {
+  const seenFiles = new Set<string>()
+  const candidates = [
+    ...collectStoredCandidates(options.storedSessions, seenFiles, options.cwd),
+    ...collectFallbackCandidates(seenFiles)
+  ].filter(candidate => !options.cwd || candidate.cwd === options.cwd)
+
+  const tailInfo = new Map<string, TailInfo>()
+  const updatedAtFor = (candidate: SessionCandidate): string | null => {
+    let info = tailInfo.get(candidate.sessionFile)
+    if (!info) {
+      info = getTailInfo(candidate)
+      tailInfo.set(candidate.sessionFile, info)
     }
-
-    // Fallback for updatedAt when we couldn't parse timestamps from tail.
-    if (!updatedAt) {
-      try {
-        updatedAt = statSync(file).mtime.toISOString()
-      } catch {
-        updatedAt = null
-      }
-    }
-
-    if (!title) {
-      title = pickFallbackTitleFromHead(file)
-    }
-
-    items.push({
-      sessionId: header.sessionId,
-      cwd: header.cwd,
-      title,
-      updatedAt,
-      sessionFile: file
-    })
+    return info.updatedAt
   }
 
-  // Sort most recent first.
-  items.sort((a, b) => {
-    const aa = a.updatedAt ?? ''
-    const bb = b.updatedAt ?? ''
-    return bb.localeCompare(aa)
-  })
+  candidates.sort((a, b) => (updatedAtFor(b) ?? '').localeCompare(updatedAtFor(a) ?? ''))
 
-  return items
+  const start = toOffset(options.cursor)
+  const page =
+    options.limit && options.limit > 0 ? candidates.slice(start, start + options.limit) : candidates.slice(start)
+
+  return page.map(candidate => {
+    let info = tailInfo.get(candidate.sessionFile)
+    if (!info) {
+      info = getTailInfo(candidate)
+      tailInfo.set(candidate.sessionFile, info)
+    }
+
+    let title = info.title
+    if (!title) title = scanSessionInfoNameFromRecentFileWindow(candidate.sessionFile)
+    if (!title) title = pickFallbackTitleFromHead(candidate.sessionFile)
+
+    return {
+      sessionId: candidate.sessionId,
+      cwd: candidate.cwd,
+      title,
+      updatedAt: info.updatedAt,
+      sessionFile: candidate.sessionFile
+    }
+  })
 }
 
 export function findPiSessionFile(sessionId: string): string | null {
-  const all = listPiSessions()
-  const found = all.find(s => s.sessionId === sessionId)
-  return found?.sessionFile ?? null
+  const seenFiles = new Set<string>()
+  for (const candidate of collectFallbackCandidates(seenFiles)) {
+    if (candidate.sessionId === sessionId) return candidate.sessionFile
+  }
+  return null
+}
+
+export function resolveStoredPiSessionFile(stored: StoredSession | null): string | null {
+  if (!stored) return null
+  if (!isAbsolute(stored.sessionFile)) return stored.sessionFile
+  const candidate = getCandidateFromFile(stored.sessionFile)
+  if (!candidate || candidate.sessionId !== stored.sessionId) return null
+  return candidate.sessionFile
 }

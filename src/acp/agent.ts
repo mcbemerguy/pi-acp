@@ -24,7 +24,7 @@ import { getAuthMethods } from './auth.js'
 import { SessionManager } from './session.js'
 import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
-import { listPiSessions, findPiSessionFile } from './pi-sessions.js'
+import { listPiSessions, findPiSessionFile, resolveStoredPiSessionFile } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
 import { toolResultToText } from './translate/pi-tools.js'
 import { promptToPiMessage } from './translate/prompt.js'
@@ -819,10 +819,7 @@ export class PiAcpAgent implements ACPAgent {
     // ACP: filter by cwd if provided.
     // Zed currently sends `{}` (no cwd), so we default to the last session cwd to
     // emulate pi's `/resume` picker (project-scoped).
-    const all = listPiSessions()
-
     const effectiveCwd = (params as any).cwd ?? this.lastSessionCwd
-    const filtered = effectiveCwd ? all.filter(s => s.cwd === effectiveCwd) : all
 
     // Cursor-based pagination (opaque cursor). For MVP, we use a simple numeric offset.
     // If cursor is invalid, treat as 0.
@@ -830,7 +827,13 @@ export class PiAcpAgent implements ACPAgent {
     const start = Number.isFinite(offset) && offset > 0 ? offset : 0
 
     const PAGE_SIZE = 50
-    const page = filtered.slice(start, start + PAGE_SIZE)
+    const pagePlusOne = listPiSessions({
+      cwd: effectiveCwd,
+      cursor: params.cursor,
+      limit: PAGE_SIZE + 1,
+      storedSessions: this.store.list()
+    })
+    const page = pagePlusOne.slice(0, PAGE_SIZE)
 
     const sessions: SessionInfo[] = page.map(s => ({
       sessionId: s.sessionId,
@@ -839,7 +842,7 @@ export class PiAcpAgent implements ACPAgent {
       updatedAt: s.updatedAt
     }))
 
-    const nextCursor = start + PAGE_SIZE < filtered.length ? String(start + PAGE_SIZE) : null
+    const nextCursor = pagePlusOne.length > PAGE_SIZE ? String(start + PAGE_SIZE) : null
 
     return { sessions, nextCursor, _meta: {} }
   }
@@ -859,7 +862,7 @@ export class PiAcpAgent implements ACPAgent {
     // MVP: ignore mcpServers.
     // Prefer ACP-created mapping first (fast path), otherwise scan pi sessions dir.
     const stored = this.store.get(params.sessionId)
-    const sessionFile = stored?.sessionFile ?? findPiSessionFile(params.sessionId)
+    const sessionFile = resolveStoredPiSessionFile(stored) ?? findPiSessionFile(params.sessionId) ?? stored?.sessionFile
 
     if (!sessionFile) {
       throw RequestError.invalidParams(`Unknown sessionId: ${params.sessionId}`)
