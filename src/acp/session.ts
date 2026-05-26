@@ -347,6 +347,9 @@ export class PiAcpSession {
   }
 
   async cancel(): Promise<void> {
+    console.error(
+      `[pi-acp] session/cancel received sessionId=${this.sessionId} pendingTurn=${Boolean(this.pendingTurn)} queuedTurns=${this.turnQueue.length}`
+    )
     this.cancelRequested = true
 
     if (this.turnQueue.length) {
@@ -364,7 +367,11 @@ export class PiAcpSession {
     }
 
     if (!this.pendingTurn) {
-      await this.proc.abort().catch(() => {})
+      await this.proc.abort().catch(error => {
+        console.error(
+          `[pi-acp] pi RPC abort ignored with no pending turn: ${error instanceof Error ? error.message : String(error)}`
+        )
+      })
       return
     }
 
@@ -373,13 +380,17 @@ export class PiAcpSession {
       if (!this.interruptCompletingTurn('cancelled', { drainPiEvents: true })) {
         this.completeTurn('cancelled', { drainPiEvents: true })
       }
-    } catch {
+    } catch (error) {
+      console.error(
+        `[pi-acp] pi RPC abort timed out or failed; killing subprocess sessionId=${this.sessionId}: ${error instanceof Error ? error.message : String(error)}`
+      )
       this.emit({
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'Pi did not acknowledge cancellation; restarting the ACP subprocess.' }
       })
       if (!this.interruptCompletingTurn('cancelled')) this.completeTurn('cancelled')
       this.proc.dispose('SIGKILL')
+      console.error(`[pi-acp] pi subprocess killed after abort failure sessionId=${this.sessionId}`)
     }
   }
 

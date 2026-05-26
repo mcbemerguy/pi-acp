@@ -232,8 +232,15 @@ export class PiRpcProcess {
   }
 
   async abort(): Promise<void> {
-    const res = await this.request({ type: 'abort' }, ABORT_REQUEST_TIMEOUT_MS)
-    if (!res.success) throw new Error(`pi abort failed: ${res.error ?? JSON.stringify(res.data)}`)
+    console.error('[pi-acp] sending pi RPC abort')
+    try {
+      const res = await this.request({ type: 'abort' }, ABORT_REQUEST_TIMEOUT_MS)
+      if (!res.success) throw new Error(`pi abort failed: ${res.error ?? JSON.stringify(res.data)}`)
+      console.error('[pi-acp] pi RPC abort acknowledged')
+    } catch (error) {
+      console.error(`[pi-acp] pi RPC abort failed: ${error instanceof Error ? error.message : String(error)}`)
+      throw error
+    }
   }
 
   sendExtensionUiResponse(id: string, payload: Record<string, unknown>): Promise<void> {
