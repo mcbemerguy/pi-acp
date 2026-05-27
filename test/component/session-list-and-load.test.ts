@@ -43,6 +43,7 @@ test('PiAcpAgent: loadSession rejects stale absolute ACP mapping that points at 
 
     const conn = new FakeAgentSideConnection()
     const agent = new PiAcpAgent(asAgentConn(conn))
+    const deletedSessionIds: string[] = []
     ;(agent as any).store = {
       get: () => ({
         sessionId: 'wanted-session',
@@ -50,7 +51,8 @@ test('PiAcpAgent: loadSession rejects stale absolute ACP mapping that points at 
         sessionFile,
         updatedAt: '2026-02-11T00:00:00.000Z'
       }),
-      list: () => []
+      list: () => [],
+      delete: (sessionId: string) => deletedSessionIds.push(sessionId)
     }
 
     await assert.rejects(
@@ -64,6 +66,7 @@ test('PiAcpAgent: loadSession rejects stale absolute ACP mapping that points at 
       (err: any) => err?.data === 'Unknown sessionId: wanted-session'
     )
     assert.equal(spawned, false)
+    assert.deepEqual(deletedSessionIds, ['wanted-session'])
   } finally {
     PiRpcProcess.spawn = originalSpawn
     if (oldEnv === undefined) delete process.env.PI_CODING_AGENT_DIR

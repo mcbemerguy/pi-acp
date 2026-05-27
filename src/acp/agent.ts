@@ -918,7 +918,9 @@ export class PiAcpAgent implements ACPAgent {
     // MVP: ignore mcpServers.
     // Prefer ACP-created mapping first (fast path), otherwise scan pi sessions dir.
     const stored = this.store.get(params.sessionId)
-    const sessionFile = resolveStoredPiSessionFile(stored) ?? findPiSessionFile(params.sessionId)
+    const storedSessionFile = resolveStoredPiSessionFile(stored)
+    if (stored && !storedSessionFile) this.store.delete(params.sessionId)
+    const sessionFile = storedSessionFile ?? findPiSessionFile(params.sessionId)
 
     if (!sessionFile) {
       throw RequestError.invalidParams(`Unknown sessionId: ${params.sessionId}`)

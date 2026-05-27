@@ -3,6 +3,10 @@ import assert from 'node:assert/strict'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
+async function waitForMicrotasks(): Promise<void> {
+  await new Promise(resolve => setImmediate(resolve))
+}
+
 test('PiAcpSession: cancel clears queued prompts', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -94,5 +98,37 @@ test('PiAcpSession: cancel resolves current prompt when abort hangs', async () =
 
   assert.equal(proc.abortCount, 1)
   assert.equal(proc.disposeCount, 1)
+  assert.equal(await first, 'cancelled')
+})
+
+test('PiAcpSession: cancel waits until the current turn is locally settled', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  let releaseUpdates!: () => void
+  conn.sessionUpdateBlocker = new Promise<void>(resolve => {
+    releaseUpdates = resolve
+  })
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const first = session.prompt('one')
+  const cancelPromise = session.cancel()
+  let cancelSettled = false
+  cancelPromise.then(() => {
+    cancelSettled = true
+  })
+
+  await waitForMicrotasks()
+  assert.equal(cancelSettled, false)
+
+  releaseUpdates()
+  await cancelPromise
   assert.equal(await first, 'cancelled')
 })

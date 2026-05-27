@@ -705,8 +705,10 @@ test('PiAcpSession: cancel overrides an in-progress prompt failure completion', 
     for (let i = 0; i < 10 && !(session as any).completingTurn; i += 1) await wait(0)
     assert.equal((session as any).completingTurn, true)
 
-    await session.cancel()
+    const cancel = session.cancel()
+    await wait(0)
     unblockSessionUpdates()
+    await cancel
 
     const reason = await prompt
     assert.equal(reason, 'cancelled')

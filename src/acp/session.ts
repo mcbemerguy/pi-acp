@@ -255,6 +255,7 @@ export class PiAcpSession {
   private completionReasonOverride: StopReason | null = null
   private drainingCancelledTurn = false
   private cancelDrainTimer: NodeJS.Timeout | null = null
+  private turnSettledWaiters: Array<() => void> = []
 
   private editSnapshots = new Map<string, { path: string; oldText?: string; skippedReason?: string }>()
 
@@ -392,6 +393,8 @@ export class PiAcpSession {
       this.proc.dispose('SIGKILL')
       console.error(`[pi-acp] pi subprocess killed after abort failure sessionId=${this.sessionId}`)
     }
+
+    await this.waitForTurnSettlement()
   }
 
   wasCancelRequested(): boolean {
@@ -528,6 +531,17 @@ export class PiAcpSession {
     })
   }
 
+  private waitForTurnSettlement(): Promise<void> {
+    if (!this.pendingTurn && !this.completingTurn) return Promise.resolve()
+    return new Promise(resolve => this.turnSettledWaiters.push(resolve))
+  }
+
+  private resolveTurnSettledWaiters(): void {
+    if (this.pendingTurn || this.completingTurn) return
+    const waiters = this.turnSettledWaiters.splice(0, this.turnSettledWaiters.length)
+    for (const resolve of waiters) resolve()
+  }
+
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
     this.inAgentLoop = false
@@ -637,6 +651,7 @@ export class PiAcpSession {
       this.completionReasonOverride = null
       this.sawAgentActivity = false
       this.currentAgentMessageId = null
+      this.resolveTurnSettledWaiters()
 
       const proceedQueue = (opts.proceedQueue ?? true) && !this.drainingCancelledTurn
       const next = proceedQueue ? this.turnQueue.shift() : undefined
