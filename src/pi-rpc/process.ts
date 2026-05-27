@@ -60,6 +60,13 @@ type PiRpcResponse = {
   error?: string
 }
 
+type PendingRequest = {
+  command: string
+  writeCompleted: boolean
+  resolve: (v: PiRpcResponse) => void
+  reject: (e: unknown) => void
+}
+
 export type PiRpcEvent = Record<string, unknown>
 
 type SpawnParams = {
@@ -119,10 +126,7 @@ export function buildPiRpcSpawnEnv(env: NodeJS.ProcessEnv = process.env): NodeJS
 
 export class PiRpcProcess {
   private readonly child: ChildProcessWithoutNullStreams
-  private readonly pending = new Map<
-    string,
-    { command: string; resolve: (v: PiRpcResponse) => void; reject: (e: unknown) => void }
-  >()
+  private readonly pending = new Map<string, PendingRequest>()
   private eventHandlers: Array<(ev: PiRpcEvent) => void> = []
   private readonly preludeLines: string[] = []
   private readonly stderrTail = new DiagnosticTail()
@@ -175,14 +179,13 @@ export class PiRpcProcess {
       this.exited = true
       this.exitCode = code
       this.exitSignal = signal
-      this.rejectPendingForProcessExit()
     })
 
     child.on('close', (code, signal) => {
       this.closed = true
       this.closeCode = code
       this.closeSignal = signal
-      if (!this.exited) this.rejectPendingForProcessExit()
+      this.rejectPendingForProcessExit()
     })
 
     child.on('error', err => {
@@ -262,7 +265,10 @@ export class PiRpcProcess {
         mkdirSync(dirname(sessionFile), { recursive: true })
       }
     } catch (error) {
-      if (error instanceof PiRpcProcessLifecycleError) throw error
+      if (error instanceof PiRpcProcessLifecycleError) {
+        proc.dispose()
+        throw error
+      }
     }
 
     return proc
@@ -444,16 +450,20 @@ export class PiRpcProcess {
 
       this.pending.set(id, {
         command: cmd.type,
+        writeCompleted: false,
         resolve: v => finish(() => resolve(v)),
         reject: e => finish(() => reject(e))
       })
 
       try {
         this.writeLine(withId, err => {
+          const pending = this.pending.get(id)
           if (err) {
             this.pending.delete(id)
             finish(() => reject(err))
+            return
           }
+          if (pending) pending.writeCompleted = true
         })
       } catch (e) {
         this.pending.delete(id)
@@ -496,15 +506,28 @@ export class PiRpcProcess {
   }
 
   private rejectPendingForProcessExit(): void {
-    for (const [, pending] of this.pending) pending.reject(this.buildProcessExitError(pending.command))
+    for (const [, pending] of this.pending) pending.reject(this.buildProcessExitError(pending.command, pending))
     this.pending.clear()
   }
 
-  private buildProcessExitError(command: string): PiRpcProcessLifecycleError {
+  private buildProcessExitError(
+    command: string,
+    pending?: Pick<PendingRequest, 'writeCompleted'>
+  ): PiRpcProcessLifecycleError {
+    if (!pending) {
+      const prefix = isStartupCommand(command)
+        ? `Pi RPC process exited during startup before ${command} could be sent`
+        : `Pi RPC process exited before ${command} could be sent`
+      return new PiRpcProcessLifecycleError(`${prefix}. ${this.formatDiagnostics()}`)
+    }
+
     const prefix = isStartupCommand(command)
-      ? `Pi RPC process exited during startup before ${command} could be sent`
-      : `Pi RPC process exited before ${command} could be sent`
-    return new PiRpcProcessLifecycleError(`${prefix}. ${this.formatDiagnostics()}`)
+      ? `Pi RPC process exited during startup before a response to ${command} was received`
+      : `Pi RPC process exited before a response to ${command} was received`
+    const delivery = pending.writeCompleted
+      ? 'request write completed; delivery/processing state is ambiguous'
+      : 'request write had not completed; delivery state is ambiguous'
+    return new PiRpcProcessLifecycleError(`${prefix}; ${delivery}. ${this.formatDiagnostics()}`)
   }
 
   private buildWriteUnavailableError(command: string): PiRpcProcessLifecycleError {

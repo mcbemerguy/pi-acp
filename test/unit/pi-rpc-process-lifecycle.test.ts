@@ -31,6 +31,50 @@ test('PiRpcProcess: startup child exit surfaces bounded process diagnostics', as
   }
 })
 
+test('PiRpcProcess: prompt exit after write reports ambiguous delivery instead of unsent prompt', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-prompt-exit-'))
+  const piCommand = writeFakePiCommand(
+    root,
+    `import readline from 'node:readline'
+const rl = readline.createInterface({ input: process.stdin })
+const write = value => process.stdout.write(JSON.stringify(value) + '\\n')
+rl.on('line', line => {
+  const msg = JSON.parse(line)
+  if (msg.type === 'get_state') {
+    write({ type: 'response', id: msg.id, command: 'get_state', success: true, data: {} })
+    return
+  }
+  if (msg.type === 'prompt') {
+    setTimeout(() => {
+      process.stderr.write('prompt-exit sentinel\\n')
+      process.exit(23)
+    }, 20)
+  }
+})
+`
+  )
+
+  const proc = await PiRpcProcess.spawn({ cwd: root, piCommand })
+
+  try {
+    await assert.rejects(
+      () => proc.prompt('hello'),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error)
+        assert.match(message, /before a response to prompt was received/)
+        assert.match(message, /delivery\/processing state is ambiguous/)
+        assert.match(message, /prompt-exit sentinel/)
+        assert.match(message, /code=23|closeCode=23/)
+        assert.doesNotMatch(message, /before prompt could be sent/)
+        return true
+      }
+    )
+  } finally {
+    proc.dispose()
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 })
+  }
+})
+
 test('PiRpcProcess: write after child exit fails before destroyed-stream errors and includes stderr tail', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-write-after-exit-'))
   const piCommand = writeFakePiCommand(
