@@ -64,7 +64,7 @@ test('PiAcpSession: emits agent_thought_chunk for thinking_delta', async () => {
   })
 })
 
-test('PiAcpSession: emits tool_call + tool_call_update + completes', async () => {
+test('PiAcpSession: emits exactly start and terminal updates for a normal live tool', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -92,7 +92,7 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
 
   await new Promise(r => setTimeout(r, 0))
 
-  assert.equal(conn.updates.length, 3)
+  assert.equal(conn.updates.length, 2)
 
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
   assert.equal((conn.updates[0]!.update as any).toolCallId, 't1')
@@ -103,13 +103,7 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
   assert.equal((conn.updates[1]!.update as any).toolCallId, 't1')
   assert.equal((conn.updates[1]!.update as any).title, 'bash')
   assert.equal((conn.updates[1]!.update as any).kind, 'execute')
-  assert.equal((conn.updates[1]!.update as any).status, 'in_progress')
-
-  assert.equal(conn.updates[2]!.update.sessionUpdate, 'tool_call_update')
-  assert.equal((conn.updates[2]!.update as any).toolCallId, 't1')
-  assert.equal((conn.updates[2]!.update as any).title, 'bash')
-  assert.equal((conn.updates[2]!.update as any).kind, 'execute')
-  assert.equal((conn.updates[2]!.update as any).status, 'completed')
+  assert.equal((conn.updates[1]!.update as any).status, 'completed')
 })
 
 test('PiAcpSession: emits tool locations from pi path args', async () => {
@@ -530,7 +524,7 @@ test('PiAcpSession: preserves ordering when auto_retry_start is interleaved with
   )
 })
 
-test('PiAcpSession: emits streamed tool locations from pi path args', async () => {
+test('PiAcpSession: ignores streamed toolcall message updates while preserving text and thought', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -543,23 +537,47 @@ test('PiAcpSession: emits streamed tool locations from pi path args', async () =
     fileCommands: []
   })
 
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'hello ' } })
   proc.emit({
     type: 'message_update',
     assistantMessageEvent: {
       type: 'toolcall_start',
-      toolCall: {
-        id: 't1',
-        name: 'write',
-        arguments: { path: '/tmp/test.txt', content: 'hello' }
-      }
+      toolCall: { id: 't1', name: 'write', arguments: { path: '/tmp/test.txt', content: 'hello' } }
     }
   })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_delta',
+      toolCall: { id: 't1', partialArgs: '{"content":"hello world"}' }
+    }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_end',
+      toolCall: { id: 't1' }
+    }
+  })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'thinking' } })
 
   await new Promise(r => setTimeout(r, 0))
 
-  assert.equal(conn.updates.length, 1)
-  assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
-  assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: '/tmp/test.txt' }])
+  assert.deepEqual(
+    conn.updates.map(u => u.update),
+    [
+      { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hello ' } },
+      { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thinking' } }
+    ]
+  )
+  assert.equal(
+    conn.updates.some(u => u.update.sessionUpdate === 'tool_call'),
+    false
+  )
+  assert.equal(
+    conn.updates.some(u => u.update.sessionUpdate === 'tool_call_update'),
+    false
+  )
 })
 
 test('PiAcpSession: emits edit tool line when oldText matches uniquely', async () => {
@@ -1048,7 +1066,7 @@ test('PiAcpSession: defers unnamed streamed tool calls and corrects metadata on 
   assert.equal((conn.updates[0]!.update as any).status, 'in_progress')
 })
 
-test('PiAcpSession: execution start updates streamed tool title and kind', async () => {
+test('PiAcpSession: execution start ignores prior streamed tool title and kind', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -1072,11 +1090,8 @@ test('PiAcpSession: execution start updates streamed tool title and kind', async
 
   await new Promise(r => setTimeout(r, 0))
 
-  assert.equal(conn.updates.length, 2)
+  assert.equal(conn.updates.length, 1)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
-  assert.equal((conn.updates[0]!.update as any).title, 'read')
-  assert.equal((conn.updates[0]!.update as any).kind, 'read')
-  assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
-  assert.equal((conn.updates[1]!.update as any).title, 'bash')
-  assert.equal((conn.updates[1]!.update as any).kind, 'execute')
+  assert.equal((conn.updates[0]!.update as any).title, 'bash')
+  assert.equal((conn.updates[0]!.update as any).kind, 'execute')
 })
