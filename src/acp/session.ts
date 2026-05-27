@@ -755,11 +755,6 @@ export class PiAcpSession {
   private handlePiEvent(ev: PiRpcEvent) {
     const type = String((ev as any).type ?? '')
 
-    if (this.drainingCancelledTurn) {
-      if (type === 'agent_end') this.stopCancelledTurnDrain()
-      return
-    }
-
     switch (type) {
       case 'extension_ui_request': {
         this.handleExtensionUiRequest(ev)
@@ -1002,7 +997,9 @@ export class PiAcpSession {
       }
 
       case 'agent_end': {
+        const wasDrainingCancelledTurn = this.drainingCancelledTurn
         this.completeTurn(this.cancelRequested ? 'cancelled' : 'end_turn')
+        if (wasDrainingCancelledTurn) this.stopCancelledTurnDrain()
         break
       }
 

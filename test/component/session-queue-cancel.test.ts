@@ -75,7 +75,7 @@ test('PiAcpSession: cancel clears queued prompts', async () => {
   assert.equal(proc.prompts.length, 1)
 })
 
-test('PiAcpSession: cancel suppresses late events and waits for drain before returning', async () => {
+test('PiAcpSession: cancel forwards late events and waits for drain before returning', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -101,19 +101,35 @@ test('PiAcpSession: cancel suppresses late events and waits for drain before ret
   const second = session.prompt('two')
   assert.equal(proc.prompts.length, 1)
 
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'late thought' } } as any)
   proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'late text' } } as any)
+  proc.emit({ type: 'tool_execution_start', toolCallId: 'late-tool', toolName: 'read', args: { path: 'package.json' } })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'late-tool',
+    toolName: 'read',
+    result: { content: [{ type: 'text', text: 'late tool result' }] }
+  })
   await waitForMicrotasks()
   assert.equal(cancelSettled, false)
   assert.equal(proc.prompts.length, 1)
+  assert.equal(
+    conn.updates.some(u => JSON.stringify(u).includes('late thought')),
+    true
+  )
+  assert.equal(
+    conn.updates.some(u => JSON.stringify(u).includes('late text')),
+    true
+  )
+  assert.equal(
+    conn.updates.some(u => JSON.stringify(u).includes('late tool result')),
+    true
+  )
 
   proc.emit({ type: 'agent_end' })
 
   await cancelPromise
   assert.equal(proc.prompts.length, 2)
-  assert.equal(
-    conn.updates.some(u => JSON.stringify(u).includes('late text')),
-    false
-  )
 
   proc.emit({ type: 'agent_end' })
   assert.equal(await second, 'end_turn')
