@@ -10,7 +10,7 @@ import { RequestError } from '@agentclientprotocol/sdk'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { readFileSync, statSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
-import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
+import { PiRpcProcess, PiRpcProcessLifecycleError, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
 import { SessionStore } from './session-store.js'
 import {
   TOOL_PRESENTATION_LIMITS,
@@ -162,6 +162,9 @@ export class SessionManager {
     } catch (e) {
       if (e instanceof PiRpcSpawnError) {
         throw RequestError.internalError({ code: e.code }, e.message)
+      }
+      if (e instanceof PiRpcProcessLifecycleError) {
+        throw RequestError.internalError({}, e.message)
       }
       throw e
     }

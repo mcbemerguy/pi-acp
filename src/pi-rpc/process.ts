@@ -15,6 +15,14 @@ export class PiRpcSpawnError extends Error {
   }
 }
 
+export class PiRpcProcessLifecycleError extends Error {
+  constructor(message: string, opts?: { cause?: unknown }) {
+    super(message)
+    this.name = 'PiRpcProcessLifecycleError'
+    ;(this as any).cause = opts?.cause
+  }
+}
+
 type PiRpcCommand =
   | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
   | { type: 'steer'; id?: string; message: string; images?: unknown[] }
@@ -65,6 +73,41 @@ type SpawnParams = {
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 const PROMPT_REQUEST_TIMEOUT_MS = 0
 const ABORT_REQUEST_TIMEOUT_MS = 3_000
+const DIAGNOSTIC_TAIL_MAX_CHARS = 4_000
+const DIAGNOSTIC_TAIL_MAX_LINES = 40
+
+class DiagnosticTail {
+  private text = ''
+
+  push(value: unknown): void {
+    const raw = Buffer.isBuffer(value) ? value.toString('utf8') : String(value ?? '')
+    const cleaned = stripAnsi(raw)
+    if (!cleaned) return
+    this.text = (this.text + cleaned).slice(-DIAGNOSTIC_TAIL_MAX_CHARS * 2)
+  }
+
+  get(): string {
+    const lines = this.text
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+      .split('\n')
+      .map(line => line.trimEnd())
+      .filter(Boolean)
+      .slice(-DIAGNOSTIC_TAIL_MAX_LINES)
+
+    let tail = lines.join('\n')
+    if (tail.length > DIAGNOSTIC_TAIL_MAX_CHARS) tail = `…${tail.slice(-DIAGNOSTIC_TAIL_MAX_CHARS)}`
+    return tail
+  }
+}
+
+function isStartupCommand(type: string): boolean {
+  return type === 'get_state' || type === 'get_available_models'
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
 
 export function buildPiRpcSpawnEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   return {
@@ -76,12 +119,27 @@ export function buildPiRpcSpawnEnv(env: NodeJS.ProcessEnv = process.env): NodeJS
 
 export class PiRpcProcess {
   private readonly child: ChildProcessWithoutNullStreams
-  private readonly pending = new Map<string, { resolve: (v: PiRpcResponse) => void; reject: (e: unknown) => void }>()
+  private readonly pending = new Map<
+    string,
+    { command: string; resolve: (v: PiRpcResponse) => void; reject: (e: unknown) => void }
+  >()
   private eventHandlers: Array<(ev: PiRpcEvent) => void> = []
   private readonly preludeLines: string[] = []
+  private readonly stderrTail = new DiagnosticTail()
+  private readonly stdoutPreludeTail = new DiagnosticTail()
+  private spawned = true
+  private exited = false
+  private closed = false
+  private exitCode: number | null = null
+  private exitSignal: NodeJS.Signals | null = null
+  private closeCode: number | null = null
+  private closeSignal: NodeJS.Signals | null = null
+  private childError: Error | null = null
 
   private constructor(child: ChildProcessWithoutNullStreams) {
     this.child = child
+
+    child.stderr.on('data', chunk => this.stderrTail.push(chunk))
 
     const rl = readline.createInterface({ input: child.stdout })
     rl.on('line', line => {
@@ -90,10 +148,11 @@ export class PiRpcProcess {
       try {
         msg = JSON.parse(line)
       } catch {
-        // pi may emit a human-readable prelude on stdout before NDJSON starts.
-        // Capture it so the ACP adapter can surface it on session start.
         const cleaned = stripAnsi(String(line)).trimEnd()
-        if (cleaned) this.preludeLines.push(cleaned)
+        if (cleaned) {
+          this.preludeLines.push(cleaned)
+          this.stdoutPreludeTail.push(`${cleaned}\n`)
+        }
         return
       }
 
@@ -113,13 +172,23 @@ export class PiRpcProcess {
     })
 
     child.on('exit', (code, signal) => {
-      const err = new Error(`pi process exited (code=${code}, signal=${signal})`)
-      for (const [, p] of this.pending) p.reject(err)
-      this.pending.clear()
+      this.exited = true
+      this.exitCode = code
+      this.exitSignal = signal
+      this.rejectPendingForProcessExit()
+    })
+
+    child.on('close', (code, signal) => {
+      this.closed = true
+      this.closeCode = code
+      this.closeSignal = signal
+      if (!this.exited) this.rejectPendingForProcessExit()
     })
 
     child.on('error', err => {
-      for (const [, p] of this.pending) p.reject(err)
+      this.childError = err
+      const wrapped = this.buildWriteFailureError('process', err)
+      for (const [, p] of this.pending) p.reject(wrapped)
       this.pending.clear()
     })
   }
@@ -178,10 +247,6 @@ export class PiRpcProcess {
       throw new PiRpcSpawnError(`Could not start pi (command: ${cmd}).`, { code, cause: e })
     }
 
-    child.stderr.on('data', () => {
-      // leave stderr untouched; ACP clients may capture it.
-    })
-
     const proc = new PiRpcProcess(child)
 
     // Best-effort handshake.
@@ -196,8 +261,8 @@ export class PiRpcProcess {
         const { dirname } = await import('node:path')
         mkdirSync(dirname(sessionFile), { recursive: true })
       }
-    } catch {
-      // ignore for now
+    } catch (error) {
+      if (error instanceof PiRpcProcessLifecycleError) throw error
     }
 
     return proc
@@ -378,6 +443,7 @@ export class PiRpcProcess {
       }
 
       this.pending.set(id, {
+        command: cmd.type,
         resolve: v => finish(() => resolve(v)),
         reject: e => finish(() => reject(e))
       })
@@ -397,6 +463,87 @@ export class PiRpcProcess {
   }
 
   private writeLine(msg: PiRpcCommand, cb?: (err?: Error | null) => void): void {
-    this.child.stdin.write(`${JSON.stringify(msg)}\n`, cb)
+    const guarded = this.getWriteGuardError(msg.type)
+    if (guarded) {
+      if (cb) {
+        queueMicrotask(() => cb(guarded))
+        return
+      }
+      throw guarded
+    }
+
+    const line = `${JSON.stringify(msg)}\n`
+
+    try {
+      this.child.stdin.write(line, err => {
+        cb?.(err ? this.buildWriteFailureError(msg.type, err) : null)
+      })
+    } catch (error) {
+      throw this.buildWriteFailureError(msg.type, error)
+    }
+  }
+
+  private getWriteGuardError(command: string): Error | null {
+    if (!this.spawned) return new PiRpcProcessLifecycleError(`Pi RPC process is not spawned; cannot send ${command}.`)
+    if (this.exited || this.closed) return this.buildProcessExitError(command)
+
+    const stdin = this.child.stdin
+    if ((stdin as any).destroyed || !stdin.writable || stdin.writableEnded) {
+      return this.buildWriteUnavailableError(command)
+    }
+
+    return null
+  }
+
+  private rejectPendingForProcessExit(): void {
+    for (const [, pending] of this.pending) pending.reject(this.buildProcessExitError(pending.command))
+    this.pending.clear()
+  }
+
+  private buildProcessExitError(command: string): PiRpcProcessLifecycleError {
+    const prefix = isStartupCommand(command)
+      ? `Pi RPC process exited during startup before ${command} could be sent`
+      : `Pi RPC process exited before ${command} could be sent`
+    return new PiRpcProcessLifecycleError(`${prefix}. ${this.formatDiagnostics()}`)
+  }
+
+  private buildWriteUnavailableError(command: string): PiRpcProcessLifecycleError {
+    const prefix = isStartupCommand(command)
+      ? `Pi RPC process exited during startup before ${command} could be sent`
+      : `Pi RPC stdin is not writable before ${command} could be sent`
+    return new PiRpcProcessLifecycleError(`${prefix}. ${this.formatDiagnostics({ includeStdin: true })}`)
+  }
+
+  private buildWriteFailureError(command: string, cause: unknown): PiRpcProcessLifecycleError {
+    const message = errorMessage(cause)
+    const prefix = isStartupCommand(command)
+      ? `Pi RPC process exited during startup while sending ${command}`
+      : `Pi RPC write failed while sending ${command}`
+    return new PiRpcProcessLifecycleError(`${prefix}: ${message}. ${this.formatDiagnostics({ includeStdin: true })}`, {
+      cause
+    })
+  }
+
+  private formatDiagnostics(opts: { includeStdin?: boolean } = {}): string {
+    const parts = [
+      `process status: spawned=${this.spawned}, exited=${this.exited}, closed=${this.closed}, code=${this.exitCode}, signal=${this.exitSignal}, closeCode=${this.closeCode}, closeSignal=${this.closeSignal}`
+    ]
+
+    if (opts.includeStdin) {
+      const stdin = this.child.stdin
+      parts.push(
+        `stdin status: writable=${stdin.writable}, destroyed=${Boolean((stdin as any).destroyed)}, writableEnded=${stdin.writableEnded}`
+      )
+    }
+
+    if (this.childError) parts.push(`process error: ${errorMessage(this.childError)}`)
+
+    const stderr = this.stderrTail.get()
+    if (stderr) parts.push(`stderr tail:\n${stderr}`)
+
+    const stdout = this.stdoutPreludeTail.get()
+    if (stdout) parts.push(`stdout/prelude tail:\n${stdout}`)
+
+    return parts.join('\n')
   }
 }
