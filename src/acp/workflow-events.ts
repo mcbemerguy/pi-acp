@@ -1,11 +1,17 @@
 import type { ContentBlock, SessionUpdate, ToolCallContent, ToolKind } from '@agentclientprotocol/sdk'
 import { createHash } from 'node:crypto'
 import { closeSync, openSync, readFileSync, readdirSync, readSync, statSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { isAbsolute, join, resolve, sep } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { pathToFileURL } from 'node:url'
 import { getAgentDir } from './pi-settings.js'
-import { safePresentationValue, toolResultToPresentationText, type PresentationSource } from './translate/pi-tools.js'
+import {
+  TOOL_PRESENTATION_LIMITS,
+  presentationDiagnostic,
+  safePresentationValue,
+  toolResultToPresentationText,
+  type PresentationSource
+} from './translate/pi-tools.js'
 import { toToolCallLocations, toToolKind } from './translate/tool-metadata.js'
 
 type EmitSessionUpdate = (update: SessionUpdate) => void
@@ -91,6 +97,12 @@ type ChildToolMetadata = {
   kind: ToolKind
 }
 
+type EditSnapshot = {
+  path: string
+  oldText?: string
+  skippedReason?: string
+}
+
 export function isWorkflowCommandPrompt(message: string): boolean {
   return /^\s*\/workflow:[^\s]+(?:\s|$)/.test(message)
 }
@@ -118,6 +130,7 @@ export class WorkflowEventMapper {
   private readonly steps = new Map<string, StepPlan>()
   private readonly childTools = new Set<string>()
   private readonly childToolMetadata = new Map<string, ChildToolMetadata>()
+  private readonly editSnapshots = new Map<string, EditSnapshot>()
   private readonly childTextDeltas = new Set<string>()
   private readonly pendingNoIdTextDeltas = new Set<string>()
   private readonly noIdMessageSequences = new Map<string, number>()
@@ -314,6 +327,7 @@ export class WorkflowEventMapper {
     if (childType === 'tool_execution_start') {
       if (this.childTools.has(toolCallId)) return []
       const metadata = { title: toolName, kind: toToolKind(toolName) }
+      this.captureEditSnapshot(toolCallId, toolName, args)
       this.childTools.add(toolCallId)
       this.childToolMetadata.set(toolCallId, metadata)
       updates.push({
@@ -352,9 +366,11 @@ export class WorkflowEventMapper {
     }
 
     const text = toolResultToPresentationText(result, source)
-    const content = text
-      ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
-      : undefined
+    const content = childType === 'tool_execution_end'
+      ? this.toolEndContent(toolCallId, Boolean(event.isError), text, source)
+      : text
+        ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
+        : undefined
     updates.push({
       sessionUpdate: 'tool_call_update',
       toolCallId,
@@ -364,8 +380,78 @@ export class WorkflowEventMapper {
       rawOutput: withWorkflowMeta(safePresentationValue(result, source), meta),
       _meta: { piWorkflow: meta }
     })
-    if (childType === 'tool_execution_end') this.childToolMetadata.delete(toolCallId)
+    if (childType === 'tool_execution_end') {
+      this.childToolMetadata.delete(toolCallId)
+      this.editSnapshots.delete(toolCallId)
+    }
     return updates
+  }
+
+  private captureEditSnapshot(toolCallId: string, toolName: string, args: unknown): void {
+    if (toolName !== 'edit' || !isObject(args)) return
+    const targetPath = stringField(args.path)
+    if (!targetPath) return
+    try {
+      const absolutePath = isAbsolute(targetPath) ? targetPath : resolve(this.cwd, targetPath)
+      const stat = statSync(absolutePath)
+      if (stat.size <= TOOL_PRESENTATION_LIMITS.diffFileBytes) {
+        this.editSnapshots.set(toolCallId, { path: targetPath, oldText: readFileSync(absolutePath, 'utf8') })
+      } else {
+        this.editSnapshots.set(toolCallId, {
+          path: targetPath,
+          skippedReason: `structured diff omitted because pre-edit file is ${stat.size} bytes`
+        })
+      }
+    } catch {
+      this.editSnapshots.delete(toolCallId)
+    }
+  }
+
+  private toolEndContent(
+    toolCallId: string,
+    isError: boolean,
+    text: string,
+    source: PresentationSource
+  ): ToolCallContent[] | undefined {
+    const textContent = text
+      ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
+      : []
+    if (isError) return textContent.length ? textContent : undefined
+
+    const snapshot = this.editSnapshots.get(toolCallId)
+    if (!snapshot) return textContent.length ? textContent : undefined
+    if (snapshot.skippedReason) {
+      return [
+        {
+          type: 'content',
+          content: { type: 'text', text: presentationDiagnostic(snapshot.skippedReason, source) }
+        },
+        ...textContent
+      ]
+    }
+    if (snapshot.oldText === undefined) return textContent.length ? textContent : undefined
+
+    try {
+      const absolutePath = isAbsolute(snapshot.path) ? snapshot.path : resolve(this.cwd, snapshot.path)
+      const stat = statSync(absolutePath)
+      if (stat.size > TOOL_PRESENTATION_LIMITS.diffFileBytes) {
+        return [
+          {
+            type: 'content',
+            content: {
+              type: 'text',
+              text: presentationDiagnostic(`structured diff omitted because post-edit file is ${stat.size} bytes`, source)
+            }
+          },
+          ...textContent
+        ]
+      }
+      const newText = readFileSync(absolutePath, 'utf8')
+      if (newText === snapshot.oldText) return textContent.length ? textContent : undefined
+      return [{ type: 'diff', path: snapshot.path, oldText: snapshot.oldText, newText }, ...textContent]
+    } catch {
+      return textContent.length ? textContent : undefined
+    }
   }
 
   private mapChildMessageUpdate(
@@ -627,6 +713,19 @@ export class WorkflowEventMonitor {
     this.tails.set(eventsPath, createTail(eventsPath))
   }
 
+  private acceptLinkedSubWorkflowRun(record: Record<string, unknown>): void {
+    const type = stringField(record.type)
+    if (type !== 'subworkflow_call_start' && type !== 'subworkflow_call_end') return
+    const runDir = stringField(record.childRunDir)
+    if (!runDir) return
+    const resolvedRunDir = resolve(runDir)
+    const resolvedRoot = resolve(this.workflowRunsDir)
+    if (resolvedRunDir !== resolvedRoot && !resolvedRunDir.startsWith(`${resolvedRoot}${sep}`)) return
+    const eventsPath = join(resolvedRunDir, 'events.jsonl')
+    if (this.tails.has(eventsPath)) return
+    this.tails.set(eventsPath, createTail(eventsPath))
+  }
+
   private matchRunDir(dir: string, runDir: string): RunMatch {
     if (this.acceptedRunDir) return dir === this.acceptedRunDir ? 'accept' : 'reject'
     if (!this.target) return 'accept'
@@ -675,6 +774,7 @@ export class WorkflowEventMonitor {
         this.ingestion.recordsObserved += 1
         this.onRecord?.(record, this.ingestion.recordsObserved - 1)
       }
+      if (isObject(record)) this.acceptLinkedSubWorkflowRun(record)
       const sourceIdentity = {
         sourceKey: tailSourceKey(tail),
         startOffset: line.startOffset,

@@ -652,6 +652,93 @@ test('WorkflowEventMapper maps child tool events with correlated stable IDs', ()
   assert.equal((updates[1] as any).content[0].content.text, 'done')
 })
 
+test('WorkflowEventMapper includes structured diffs for nested edit tool completion', () => {
+  const root = join(tmpdir(), `pi-acp-workflow-edit-${process.pid}-${Date.now()}`)
+  mkdirSync(root, { recursive: true })
+  const filePath = join(root, 'a.txt')
+  writeFileSync(filePath, 'before\n', 'utf8')
+  const mapper = new WorkflowEventMapper(root)
+
+  mapper.map({
+    type: 'child_pi_event',
+    timestamp: 't1',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'code',
+    childSessionId: 'child',
+    childEventType: 'tool_execution_start',
+    event: { type: 'tool_execution_start', toolCallId: 'tool-1', toolName: 'edit', args: { path: 'a.txt' } }
+  })
+  writeFileSync(filePath, 'after\n', 'utf8')
+  const updates = mapper.map({
+    type: 'child_pi_event',
+    timestamp: 't2',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'code',
+    childSessionId: 'child',
+    childEventType: 'tool_execution_end',
+    event: {
+      type: 'tool_execution_end',
+      toolCallId: 'tool-1',
+      toolName: 'edit',
+      isError: false,
+      result: { content: [{ type: 'text', text: 'edited' }] }
+    }
+  })
+
+  const toolUpdate = updates.find(update => update.sessionUpdate === 'tool_call_update') as any
+  assert.equal(toolUpdate.content[0].type, 'diff')
+  assert.equal(toolUpdate.content[0].path, 'a.txt')
+  assert.equal(toolUpdate.content[0].oldText, 'before\n')
+  assert.equal(toolUpdate.content[0].newText, 'after\n')
+  assert.equal(toolUpdate.content[1].content.text, 'edited')
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('WorkflowEventMonitor tails explicitly linked subworkflow run artifacts', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-linked-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  const parentRunDir = join(workflowRunsDir, 'parent')
+  const childRunDir = join(workflowRunsDir, 'child')
+  const updates: any[] = []
+  const monitor = new WorkflowEventMonitor('/repo', update => updates.push(update), {
+    workflowRunsDir,
+    pollIntervalMs: 5,
+    graceMs: 20
+  })
+
+  try {
+    monitor.start()
+    mkdirSync(parentRunDir, { recursive: true })
+    mkdirSync(childRunDir, { recursive: true })
+    writeFileSync(
+      join(parentRunDir, 'events.jsonl'),
+      `${JSON.stringify({ type: 'run_start', timestamp: 't1', runId: 'parent', workflowId: 'root', cwd: '/repo' })}\n${JSON.stringify({ type: 'subworkflow_call_start', timestamp: 't2', runId: 'parent', workflowId: 'root', stepId: 'orchestrate', toolName: 'code_review_fix', childWorkflowId: 'code-review-fix', startedAt: 'started', childRunId: 'child', childRunDir, status: 'running' })}\n`,
+      'utf8'
+    )
+    writeFileSync(
+      join(childRunDir, 'events.jsonl'),
+      `${JSON.stringify({ type: 'run_start', timestamp: 't3', runId: 'child', workflowId: 'code-review-fix', cwd: '/repo' })}\n${JSON.stringify({ type: 'run_end', timestamp: 't4', runId: 'child', workflowId: 'code-review-fix', status: 'completed' })}\n`,
+      'utf8'
+    )
+
+    await waitUntil(() => updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:child'))
+    appendFileSync(
+      join(parentRunDir, 'events.jsonl'),
+      `${JSON.stringify({ type: 'run_end', timestamp: 't5', runId: 'parent', workflowId: 'root', status: 'completed' })}\n`,
+      'utf8'
+    )
+    await monitor.waitForRunEndAfterPromptResolution()
+
+    assert.ok(updates.some(update => update.sessionUpdate === 'tool_call' && update.toolCallId === 'workflow:child'))
+    assert.ok(updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:child'))
+  } finally {
+    monitor.dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('WorkflowEventMonitor tails new run artifacts and tolerates malformed partial and duplicate lines', async () => {
   const root = join(tmpdir(), `pi-acp-workflow-${process.pid}-${Date.now()}`)
   const workflowRunsDir = join(root, 'workflow-runs')
