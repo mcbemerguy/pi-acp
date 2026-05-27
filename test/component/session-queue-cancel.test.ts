@@ -7,6 +7,39 @@ async function waitForMicrotasks(): Promise<void> {
   await new Promise(resolve => setImmediate(resolve))
 }
 
+test('PiAcpSession: invokes prompt acceptance hook before turn completion', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  let acceptedState: unknown = undefined
+  const promptPromise = session.prompt('one', [], {
+    onAccepted: state => {
+      acceptedState = state
+    }
+  })
+
+  await waitForMicrotasks()
+  assert.deepEqual(acceptedState, {})
+
+  let promptSettled = false
+  promptPromise.then(() => {
+    promptSettled = true
+  })
+  await waitForMicrotasks()
+  assert.equal(promptSettled, false)
+
+  proc.emit({ type: 'agent_end' })
+  assert.equal(await promptPromise, 'end_turn')
+})
+
 test('PiAcpSession: cancel clears queued prompts', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()

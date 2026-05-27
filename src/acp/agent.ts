@@ -830,7 +830,11 @@ export class PiAcpAgent implements ACPAgent {
       }
     }
 
-    const result = await session.prompt(message, images)
+    const result = await session.prompt(message, images, {
+      onAccepted: state => {
+        this.refreshSessionMapFromPiState(session.sessionId, session.cwd, state, session)
+      }
+    })
     const { stats, state } = await getSessionUsageInputsIfAvailable(session)
     this.refreshSessionMapFromPiState(session.sessionId, session.cwd, state, session)
     if (stats !== undefined) {

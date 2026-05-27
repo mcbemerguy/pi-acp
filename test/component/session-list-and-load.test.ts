@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { PiAcpAgent } from '../../src/acp/agent.js'
+import { validatePiSessionFile } from '../../src/acp/pi-sessions.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 
 // We mock PiRpcProcess.spawn so loadSession doesn't actually spawn `pi`.
@@ -274,6 +275,45 @@ test('PiAcpAgent: loadSession rejects and deletes empty ACP mapping before spawn
   }
 })
 
+test('validatePiSessionFile: rejects headers pi cannot load safely', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-header-validation-'))
+  const writeHeader = (name: string, header: Record<string, unknown>) => {
+    const file = join(root, `${name}.jsonl`)
+    writeFileSync(file, `${JSON.stringify(header)}\n`, { encoding: 'utf8' })
+    return file
+  }
+
+  const baseHeader = {
+    type: 'session',
+    version: 3,
+    id: 'session-1',
+    timestamp: '2026-02-11T00:00:00.000Z',
+    cwd: '/tmp/project'
+  }
+
+  assert.equal(validatePiSessionFile(writeHeader('valid-v3', baseHeader)).ok, true)
+  assert.equal(validatePiSessionFile(writeHeader('valid-legacy-v1', { ...baseHeader, version: undefined })).ok, true)
+  assert.deepEqual(validatePiSessionFile(writeHeader('future-version', { ...baseHeader, version: 999 })), {
+    ok: false,
+    reason: 'invalid'
+  })
+  assert.deepEqual(validatePiSessionFile(writeHeader('missing-timestamp', { ...baseHeader, timestamp: undefined })), {
+    ok: false,
+    reason: 'invalid'
+  })
+  assert.deepEqual(
+    validatePiSessionFile(writeHeader('invalid-timestamp', { ...baseHeader, timestamp: 'not-a-date' })),
+    {
+      ok: false,
+      reason: 'invalid'
+    }
+  )
+  assert.deepEqual(validatePiSessionFile(writeHeader('invalid-parent', { ...baseHeader, parentSession: 42 })), {
+    ok: false,
+    reason: 'invalid'
+  })
+})
+
 test('PiAcpAgent: prompt refreshes ACP session map from pi state', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-prompt-map-'))
   const sessionFile = join(root, 'session.jsonl')
@@ -312,6 +352,60 @@ test('PiAcpAgent: prompt refreshes ACP session map from pi state', async () => {
       proc: {
         getSessionStats: async () => undefined,
         getState: async () => ({ sessionId: 'prompt-session', sessionFile })
+      }
+    })
+  }
+
+  const response = await agent.prompt({ sessionId: 'prompt-session', prompt: [{ type: 'text', text: 'hi' }] } as any)
+
+  assert.equal(response.stopReason, 'end_turn')
+  assert.deepEqual(upserts, [{ sessionId: 'prompt-session', cwd: '/tmp/project', sessionFile }])
+  assert.equal(updatedSessionFile, sessionFile)
+})
+
+test('PiAcpAgent: prompt refreshes ACP session map as soon as prompt is accepted', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-prompt-accepted-map-'))
+  const sessionFile = join(root, 'session.jsonl')
+  writeFileSync(
+    sessionFile,
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'prompt-session',
+      timestamp: '2026-02-11T00:00:00.000Z',
+      cwd: '/tmp/project'
+    }) + '\n',
+    { encoding: 'utf8' }
+  )
+
+  const conn = new FakeAgentSideConnection()
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  const upserts: Array<{ sessionId: string; cwd: string; sessionFile: string }> = []
+  let updatedSessionFile: string | null = null
+
+  ;(agent as any).store = {
+    get: () => null,
+    list: () => [],
+    delete: () => {},
+    upsert: (entry: { sessionId: string; cwd: string; sessionFile: string }) => upserts.push(entry)
+  }
+  ;(agent as any).sessions = {
+    get: () => ({
+      sessionId: 'prompt-session',
+      cwd: '/tmp/project',
+      prompt: async (_message: string, _images: unknown[], lifecycle?: { onAccepted?: (state: unknown) => void }) => {
+        lifecycle?.onAccepted?.({ sessionId: 'prompt-session', sessionFile })
+        assert.deepEqual(upserts, [{ sessionId: 'prompt-session', cwd: '/tmp/project', sessionFile }])
+        assert.equal(updatedSessionFile, sessionFile)
+        return 'end_turn'
+      },
+      wasCancelRequested: () => false,
+      updateSessionFile: (value: string | null) => {
+        updatedSessionFile = value
+      },
+      proc: {
+        getSessionStats: async () => undefined,
+        getState: async () => ({ sessionId: 'prompt-session' })
       }
     })
   }

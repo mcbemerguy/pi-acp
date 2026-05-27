@@ -22,6 +22,7 @@ export type PiSessionListOptions = {
 const DEFAULT_TAIL_BYTES = 256 * 1024
 const DEFAULT_HEAD_BYTES = 64 * 1024
 const DEFAULT_INFO_SCAN_BYTES = 1024 * 1024
+const CURRENT_PI_SESSION_VERSION = 3
 
 export type PiSessionHeader = { sessionId: string; cwd: string }
 export type PiSessionFileValidation =
@@ -118,10 +119,23 @@ function readTail(path: string, tailBytes = DEFAULT_TAIL_BYTES): string {
 function parseSessionHeader(firstLine: string): SessionHeader | null {
   try {
     const obj = JSON.parse(firstLine) as any
-    if (obj?.type !== 'session') return null
-    const sessionId = typeof obj?.id === 'string' ? obj.id : null
-    const cwd = typeof obj?.cwd === 'string' ? obj.cwd : null
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null
+    if (obj.type !== 'session') return null
+
+    const version = obj.version ?? 1
+    if (!Number.isInteger(version) || version < 1 || version > CURRENT_PI_SESSION_VERSION) return null
+
+    const sessionId = typeof obj.id === 'string' && obj.id.trim() ? obj.id : null
+    const cwd = typeof obj.cwd === 'string' && obj.cwd.trim() ? obj.cwd : null
     if (!sessionId || !cwd) return null
+
+    const timestamp = typeof obj.timestamp === 'string' && obj.timestamp.trim() ? obj.timestamp : null
+    if (!timestamp) return null
+    const timestampMs = new Date(timestamp).getTime()
+    if (!Number.isFinite(timestampMs)) return null
+
+    if (obj.parentSession !== undefined && typeof obj.parentSession !== 'string') return null
+
     return { sessionId, cwd }
   } catch {
     return null

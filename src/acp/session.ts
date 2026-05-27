@@ -48,11 +48,16 @@ type PendingTurn = {
   reject: (err: unknown) => void
 }
 
+type PromptLifecycleOptions = {
+  onAccepted?: (state: unknown) => void | Promise<void>
+}
+
 type QueuedTurn = {
   message: string
   images: unknown[]
   resolve: (reason: StopReason) => void
   reject: (err: unknown) => void
+  lifecycle?: PromptLifecycleOptions
 }
 
 type ToolMetadata = {
@@ -315,12 +320,12 @@ export class PiAcpSession {
     this.proc.dispose?.()
   }
 
-  async prompt(message: string, images: unknown[] = []): Promise<StopReason> {
+  async prompt(message: string, images: unknown[] = [], lifecycle?: PromptLifecycleOptions): Promise<StopReason> {
     // pi RPC mode disables slash command expansion, so we do it here.
     const expandedMessage = expandSlashCommand(message, this.fileCommands)
 
     const turnPromise = new Promise<StopReason>((resolve, reject) => {
-      const queued: QueuedTurn = { message: expandedMessage, images, resolve, reject }
+      const queued: QueuedTurn = { message: expandedMessage, images, resolve, reject, lifecycle }
 
       // If a turn is already running, enqueue.
       if (this.pendingTurn || this.drainingCancelledTurn) {
@@ -585,6 +590,7 @@ export class PiAcpSession {
     this.proc
       .prompt(t.message, t.images)
       .then(() => {
+        this.handlePromptAccepted(t)
         this.promptAckFallbackTimer = setTimeout(() => {
           this.promptAckFallbackTimer = null
           if (!this.inAgentLoop && !this.sawAgentActivity) {
@@ -609,6 +615,20 @@ export class PiAcpSession {
         })
         this.completeTurn('error', { reject: RequestError.internalError({}, message), proceedQueue: false })
       })
+  }
+
+  private handlePromptAccepted(t: QueuedTurn): void {
+    const onAccepted = t.lifecycle?.onAccepted
+    if (!onAccepted) return
+
+    void (async () => {
+      const state = await this.proc.getState().catch(() => null)
+      await onAccepted(state)
+    })().catch(error => {
+      console.error(
+        `[pi-acp] prompt acceptance hook failed sessionId=${this.sessionId}: ${error instanceof Error ? error.message : String(error)}`
+      )
+    })
   }
 
   private interruptCompletingTurn(reason: StopReason, opts: { drainPiEvents?: boolean } = {}): boolean {
