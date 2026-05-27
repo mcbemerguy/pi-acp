@@ -1,18 +1,38 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 
 class FakeStore {
+  constructor(private readonly sessionFile: string) {}
+
   get(_sessionId: string) {
-    return { sessionId: 's1', cwd: '/tmp/project', sessionFile: '/tmp/s.jsonl', updatedAt: new Date().toISOString() }
+    return { sessionId: 's1', cwd: '/tmp/project', sessionFile: this.sessionFile, updatedAt: new Date().toISOString() }
   }
   upsert() {}
+  delete() {}
 }
 
 test('PiAcpAgent: loadSession replays toolResult as tool_call + tool_call_update', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-toolresult-'))
+  const sessionFile = join(root, 's.jsonl')
+  writeFileSync(
+    sessionFile,
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 's1',
+      timestamp: '2026-02-11T00:00:00.000Z',
+      cwd: '/tmp/project'
+    }) + '\n',
+    { encoding: 'utf8' }
+  )
+
   const originalSpawn = PiRpcProcess.spawn
   ;(PiRpcProcess as any).spawn = async () => {
     return {
@@ -29,14 +49,14 @@ test('PiAcpAgent: loadSession replays toolResult as tool_call + tool_call_update
         ]
       }),
       getAvailableModels: async () => ({ models: [] }),
-      getState: async () => ({ thinkingLevel: 'medium' })
+      getState: async () => ({ thinkingLevel: 'medium', sessionId: 's1', sessionFile })
     } as any
   }
 
   try {
     const conn = new FakeAgentSideConnection()
     const agent = new PiAcpAgent(asAgentConn(conn))
-    ;(agent as any).store = new FakeStore()
+    ;(agent as any).store = new FakeStore(sessionFile)
 
     await agent.loadSession({ sessionId: 's1', cwd: '/tmp/project', mcpServers: [] } as any)
 

@@ -963,7 +963,8 @@ test('PiAcpSession: cancel clears queued prompts', async () => {
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
-    fileCommands: []
+    fileCommands: [],
+    cancelDrainTimeoutMs: 5
   })
 
   const first = session.prompt('one')

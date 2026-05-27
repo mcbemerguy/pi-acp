@@ -199,7 +199,10 @@ export class SessionManager {
    * Used by session/load: create a session object bound to an existing sessionId/proc
    * if it isn't already registered.
    */
-  getOrCreate(sessionId: string, params: SessionCreateParams & { proc: PiRpcProcess }): PiAcpSession {
+  getOrCreate(
+    sessionId: string,
+    params: SessionCreateParams & { proc: PiRpcProcess; sessionFile?: string | null }
+  ): PiAcpSession {
     const existing = this.sessions.get(sessionId)
     if (existing) return existing
 
@@ -210,7 +213,7 @@ export class SessionManager {
       proc: params.proc,
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
-      sessionFile: null
+      sessionFile: params.sessionFile ?? null
     })
 
     this.sessions.set(sessionId, session)
@@ -229,7 +232,8 @@ export class PiAcpSession {
   private readonly conn: AgentSideConnection
   private readonly fileCommands: FileSlashCommand[]
   private readonly cancelAbortTimeoutMs: number
-  private readonly sessionFile: string | null
+  private readonly cancelDrainTimeoutMs: number
+  private sessionFile: string | null
 
   // Used to map abort semantics to ACP stopReason.
   // Applies to the currently running turn.
@@ -282,6 +286,7 @@ export class PiAcpSession {
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
     cancelAbortTimeoutMs?: number
+    cancelDrainTimeoutMs?: number
     sessionFile?: string | null
   }) {
     this.sessionId = opts.sessionId
@@ -291,6 +296,7 @@ export class PiAcpSession {
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
     this.cancelAbortTimeoutMs = opts.cancelAbortTimeoutMs ?? CANCEL_ABORT_TIMEOUT_MS
+    this.cancelDrainTimeoutMs = opts.cancelDrainTimeoutMs ?? CANCEL_DRAIN_TIMEOUT_MS
     this.sessionFile = opts.sessionFile ?? null
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
@@ -373,6 +379,7 @@ export class PiAcpSession {
           `[pi-acp] pi RPC abort ignored with no pending turn: ${error instanceof Error ? error.message : String(error)}`
         )
       })
+      await this.waitForTurnSettlement()
       return
     }
 
@@ -399,6 +406,10 @@ export class PiAcpSession {
 
   wasCancelRequested(): boolean {
     return this.cancelRequested
+  }
+
+  updateSessionFile(sessionFile: string | null): void {
+    this.sessionFile = sessionFile
   }
 
   publishUsageUpdateFromStats(stats: unknown): void {
@@ -532,12 +543,12 @@ export class PiAcpSession {
   }
 
   private waitForTurnSettlement(): Promise<void> {
-    if (!this.pendingTurn && !this.completingTurn) return Promise.resolve()
+    if (!this.pendingTurn && !this.completingTurn && !this.drainingCancelledTurn) return Promise.resolve()
     return new Promise(resolve => this.turnSettledWaiters.push(resolve))
   }
 
   private resolveTurnSettledWaiters(): void {
-    if (this.pendingTurn || this.completingTurn) return
+    if (this.pendingTurn || this.completingTurn || this.drainingCancelledTurn) return
     const waiters = this.turnSettledWaiters.splice(0, this.turnSettledWaiters.length)
     for (const resolve of waiters) resolve()
   }
@@ -673,7 +684,7 @@ export class PiAcpSession {
   private startCancelledTurnDrain(): void {
     this.drainingCancelledTurn = true
     if (this.cancelDrainTimer) clearTimeout(this.cancelDrainTimer)
-    this.cancelDrainTimer = setTimeout(() => this.stopCancelledTurnDrain(), CANCEL_DRAIN_TIMEOUT_MS)
+    this.cancelDrainTimer = setTimeout(() => this.stopCancelledTurnDrain(), this.cancelDrainTimeoutMs)
   }
 
   private stopCancelledTurnDrain(): void {
@@ -683,6 +694,8 @@ export class PiAcpSession {
       clearTimeout(this.cancelDrainTimer)
       this.cancelDrainTimer = null
     }
+
+    this.resolveTurnSettledWaiters()
 
     if (!this.pendingTurn && this.turnQueue.length) {
       const next = this.turnQueue.shift()

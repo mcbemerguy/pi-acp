@@ -17,14 +17,14 @@ test('PiAcpSession: cancel clears queued prompts', async () => {
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
-    fileCommands: []
+    fileCommands: [],
+    cancelDrainTimeoutMs: 5
   })
 
   const first = session.prompt('one')
   const second = session.prompt('two')
   const third = session.prompt('three')
 
-  // first started, second+third queued
   assert.equal(proc.prompts.length, 1)
 
   await session.cancel()
@@ -39,11 +39,10 @@ test('PiAcpSession: cancel clears queued prompts', async () => {
   proc.emit({ type: 'turn_end' })
   proc.emit({ type: 'agent_end' })
 
-  // queue should have been cleared, so no further prompt started
   assert.equal(proc.prompts.length, 1)
 })
 
-test('PiAcpSession: cancel suppresses late events until cancelled agent ends', async () => {
+test('PiAcpSession: cancel suppresses late events and waits for drain before returning', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -53,19 +52,30 @@ test('PiAcpSession: cancel suppresses late events until cancelled agent ends', a
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
-    fileCommands: []
+    fileCommands: [],
+    cancelDrainTimeoutMs: 50
   })
 
   const first = session.prompt('one')
-  await session.cancel()
+  const cancelPromise = session.cancel()
+  let cancelSettled = false
+  cancelPromise.then(() => {
+    cancelSettled = true
+  })
+
   assert.equal(await first, 'cancelled')
 
   const second = session.prompt('two')
   assert.equal(proc.prompts.length, 1)
 
   proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'late text' } } as any)
+  await waitForMicrotasks()
+  assert.equal(cancelSettled, false)
+  assert.equal(proc.prompts.length, 1)
+
   proc.emit({ type: 'agent_end' })
 
+  await cancelPromise
   assert.equal(proc.prompts.length, 2)
   assert.equal(
     conn.updates.some(u => JSON.stringify(u).includes('late text')),
@@ -88,7 +98,8 @@ test('PiAcpSession: cancel resolves current prompt when abort hangs', async () =
     proc: proc as any,
     conn: asAgentConn(conn),
     fileCommands: [],
-    cancelAbortTimeoutMs: 5
+    cancelAbortTimeoutMs: 5,
+    cancelDrainTimeoutMs: 5
   })
 
   const first = session.prompt('one')
@@ -115,7 +126,8 @@ test('PiAcpSession: cancel waits until the current turn is locally settled', asy
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
-    fileCommands: []
+    fileCommands: [],
+    cancelDrainTimeoutMs: 5
   })
 
   const first = session.prompt('one')

@@ -187,3 +187,189 @@ test('PiAcpAgent: listSessions lists pi sessions and loadSession replays history
     else process.env.PI_CODING_AGENT_DIR = oldEnv
   }
 })
+
+test('PiAcpAgent: loadSession rejects and deletes missing ACP mapping before spawn', async () => {
+  const originalSpawn = PiRpcProcess.spawn
+  let spawned = false
+
+  try {
+    ;(PiRpcProcess as any).spawn = async () => {
+      spawned = true
+      throw new Error('spawn should not be called')
+    }
+
+    const conn = new FakeAgentSideConnection()
+    const agent = new PiAcpAgent(asAgentConn(conn))
+    const deletedSessionIds: string[] = []
+    ;(agent as any).store = {
+      get: () => ({
+        sessionId: 'missing-session',
+        cwd: '/tmp/project',
+        sessionFile: join(tmpdir(), `pi-acp-missing-${Date.now()}.jsonl`),
+        updatedAt: '2026-02-11T00:00:00.000Z'
+      }),
+      list: () => [],
+      delete: (sessionId: string) => deletedSessionIds.push(sessionId)
+    }
+
+    await assert.rejects(
+      () =>
+        agent.loadSession({
+          sessionId: 'missing-session',
+          cwd: '/tmp/project',
+          mcpServers: [],
+          _meta: null
+        } as any),
+      (err: any) => err?.data === 'Unknown sessionId: missing-session'
+    )
+    assert.equal(spawned, false)
+    assert.deepEqual(deletedSessionIds, ['missing-session'])
+  } finally {
+    PiRpcProcess.spawn = originalSpawn
+  }
+})
+
+test('PiAcpAgent: loadSession rejects and deletes empty ACP mapping before spawn', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-empty-map-'))
+  const sessionFile = join(root, 'empty.jsonl')
+  writeFileSync(sessionFile, '', { encoding: 'utf8' })
+
+  const originalSpawn = PiRpcProcess.spawn
+  let spawned = false
+
+  try {
+    ;(PiRpcProcess as any).spawn = async () => {
+      spawned = true
+      throw new Error('spawn should not be called')
+    }
+
+    const conn = new FakeAgentSideConnection()
+    const agent = new PiAcpAgent(asAgentConn(conn))
+    const deletedSessionIds: string[] = []
+    ;(agent as any).store = {
+      get: () => ({
+        sessionId: 'empty-session',
+        cwd: '/tmp/project',
+        sessionFile,
+        updatedAt: '2026-02-11T00:00:00.000Z'
+      }),
+      list: () => [],
+      delete: (sessionId: string) => deletedSessionIds.push(sessionId)
+    }
+
+    await assert.rejects(
+      () =>
+        agent.loadSession({
+          sessionId: 'empty-session',
+          cwd: '/tmp/project',
+          mcpServers: [],
+          _meta: null
+        } as any),
+      (err: any) => err?.data === 'Unknown sessionId: empty-session'
+    )
+    assert.equal(spawned, false)
+    assert.deepEqual(deletedSessionIds, ['empty-session'])
+  } finally {
+    PiRpcProcess.spawn = originalSpawn
+  }
+})
+
+test('PiAcpAgent: prompt refreshes ACP session map from pi state', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-prompt-map-'))
+  const sessionFile = join(root, 'session.jsonl')
+  writeFileSync(
+    sessionFile,
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'prompt-session',
+      timestamp: '2026-02-11T00:00:00.000Z',
+      cwd: '/tmp/project'
+    }) + '\n',
+    { encoding: 'utf8' }
+  )
+
+  const conn = new FakeAgentSideConnection()
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  const upserts: Array<{ sessionId: string; cwd: string; sessionFile: string }> = []
+  let updatedSessionFile: string | null = null
+
+  ;(agent as any).store = {
+    get: () => null,
+    list: () => [],
+    delete: () => {},
+    upsert: (entry: { sessionId: string; cwd: string; sessionFile: string }) => upserts.push(entry)
+  }
+  ;(agent as any).sessions = {
+    get: () => ({
+      sessionId: 'prompt-session',
+      cwd: '/tmp/project',
+      prompt: async () => 'end_turn',
+      wasCancelRequested: () => false,
+      updateSessionFile: (value: string | null) => {
+        updatedSessionFile = value
+      },
+      proc: {
+        getSessionStats: async () => undefined,
+        getState: async () => ({ sessionId: 'prompt-session', sessionFile })
+      }
+    })
+  }
+
+  const response = await agent.prompt({ sessionId: 'prompt-session', prompt: [{ type: 'text', text: 'hi' }] } as any)
+
+  assert.equal(response.stopReason, 'end_turn')
+  assert.deepEqual(upserts, [{ sessionId: 'prompt-session', cwd: '/tmp/project', sessionFile }])
+  assert.equal(updatedSessionFile, sessionFile)
+})
+
+test('PiAcpAgent: loadSession rejects and deletes invalid ACP mapping before spawn', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-invalid-map-'))
+  const sessionFile = join(root, 'invalid.jsonl')
+  writeFileSync(
+    sessionFile,
+    JSON.stringify({ type: 'message', message: { role: 'user', content: 'not a header' } }) + '\n',
+    {
+      encoding: 'utf8'
+    }
+  )
+
+  const originalSpawn = PiRpcProcess.spawn
+  let spawned = false
+
+  try {
+    ;(PiRpcProcess as any).spawn = async () => {
+      spawned = true
+      throw new Error('spawn should not be called')
+    }
+
+    const conn = new FakeAgentSideConnection()
+    const agent = new PiAcpAgent(asAgentConn(conn))
+    const deletedSessionIds: string[] = []
+    ;(agent as any).store = {
+      get: () => ({
+        sessionId: 'invalid-session',
+        cwd: '/tmp/project',
+        sessionFile,
+        updatedAt: '2026-02-11T00:00:00.000Z'
+      }),
+      list: () => [],
+      delete: (sessionId: string) => deletedSessionIds.push(sessionId)
+    }
+
+    await assert.rejects(
+      () =>
+        agent.loadSession({
+          sessionId: 'invalid-session',
+          cwd: '/tmp/project',
+          mcpServers: [],
+          _meta: null
+        } as any),
+      (err: any) => err?.data === 'Unknown sessionId: invalid-session'
+    )
+    assert.equal(spawned, false)
+    assert.deepEqual(deletedSessionIds, ['invalid-session'])
+  } finally {
+    PiRpcProcess.spawn = originalSpawn
+  }
+})

@@ -1,6 +1,6 @@
 import { readdirSync, statSync, openSync, readSync, closeSync, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, resolve, isAbsolute, relative } from 'node:path'
+import { join, resolve, isAbsolute } from 'node:path'
 import type { StoredSession } from './session-store.js'
 import { readJsonObjectCached } from './file-cache.js'
 
@@ -23,7 +23,12 @@ const DEFAULT_TAIL_BYTES = 256 * 1024
 const DEFAULT_HEAD_BYTES = 64 * 1024
 const DEFAULT_INFO_SCAN_BYTES = 1024 * 1024
 
-type SessionHeader = { sessionId: string; cwd: string }
+export type PiSessionHeader = { sessionId: string; cwd: string }
+export type PiSessionFileValidation =
+  | { ok: true; header: PiSessionHeader; sessionFile: string }
+  | { ok: false; reason: 'missing' | 'empty' | 'invalid' | 'wrong-session' | 'wrong-cwd' }
+
+type SessionHeader = PiSessionHeader
 type SessionCandidate = SessionHeader & {
   sessionFile: string
   mtimeIso: string | null
@@ -229,16 +234,39 @@ function pickFallbackTitleFromHead(path: string): string | null {
   return null
 }
 
-function getCandidateFromFile(file: string): SessionCandidate | null {
+export function validatePiSessionFile(
+  file: string,
+  expected?: { sessionId?: string | null; cwd?: string | null }
+): PiSessionFileValidation {
+  if (!existsSync(file)) return { ok: false, reason: 'missing' }
+
+  let size = 0
+  try {
+    size = statSync(file).size
+  } catch {
+    return { ok: false, reason: 'missing' }
+  }
+  if (size <= 0) return { ok: false, reason: 'empty' }
+
   const first = readFirstLine(file)
-  if (!first) return null
+  if (!first) return { ok: false, reason: 'empty' }
+
   const header = parseSessionHeader(first)
-  if (!header) return null
+  if (!header) return { ok: false, reason: 'invalid' }
+  if (expected?.sessionId && header.sessionId !== expected.sessionId) return { ok: false, reason: 'wrong-session' }
+  if (expected?.cwd && header.cwd !== expected.cwd) return { ok: false, reason: 'wrong-cwd' }
+
+  return { ok: true, header, sessionFile: file }
+}
+
+function getCandidateFromFile(file: string): SessionCandidate | null {
+  const validation = validatePiSessionFile(file)
+  if (!validation.ok) return null
 
   try {
     const st = statSync(file)
     return {
-      ...header,
+      ...validation.header,
       sessionFile: file,
       mtimeIso: st.mtime.toISOString(),
       mtimeMs: st.mtimeMs,
@@ -351,26 +379,24 @@ export function listPiSessions(options: PiSessionListOptions = {}): PiSessionLis
   })
 }
 
-export function findPiSessionFile(sessionId: string): string | null {
+export function findPiSessionFile(sessionId: string, cwd?: string | null): string | null {
   const seenFiles = new Set<string>()
   for (const candidate of collectFallbackCandidates(seenFiles)) {
-    if (candidate.sessionId === sessionId) return candidate.sessionFile
+    if (candidate.sessionId === sessionId && (!cwd || candidate.cwd === cwd)) return candidate.sessionFile
   }
   return null
 }
 
-function isWithinDir(path: string, dir: string): boolean {
-  const rel = relative(dir, path)
-  return rel === '' || (!!rel && !rel.startsWith('..') && !isAbsolute(rel))
-}
-
-export function resolveStoredPiSessionFile(stored: StoredSession | null): string | null {
+export function resolveStoredPiSessionFile(
+  stored: StoredSession | null,
+  expected?: { cwd?: string | null }
+): string | null {
   if (!stored) return null
-  if (!isAbsolute(stored.sessionFile)) return stored.sessionFile
-  if (!existsSync(stored.sessionFile)) {
-    return isWithinDir(stored.sessionFile, getPiSessionsDir()) ? null : stored.sessionFile
-  }
-  const candidate = getCandidateFromFile(stored.sessionFile)
-  if (!candidate || candidate.sessionId !== stored.sessionId) return null
-  return candidate.sessionFile
+  if (!stored.sessionFile || !isAbsolute(stored.sessionFile)) return null
+
+  const cwd = expected?.cwd ?? stored.cwd
+  const validation = validatePiSessionFile(stored.sessionFile, { sessionId: stored.sessionId, cwd })
+  if (!validation.ok) return null
+
+  return validation.sessionFile
 }

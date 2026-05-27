@@ -25,7 +25,7 @@ import { getAuthMethods } from './auth.js'
 import { SessionManager } from './session.js'
 import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
-import { listPiSessions, findPiSessionFile, resolveStoredPiSessionFile } from './pi-sessions.js'
+import { findPiSessionFile, listPiSessions, resolveStoredPiSessionFile, validatePiSessionFile } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
 import { toolResultToText } from './translate/pi-tools.js'
 import { promptToPiMessage } from './translate/prompt.js'
@@ -187,6 +187,29 @@ export class PiAcpAgent implements ACPAgent {
     this.store.delete(sessionId)
   }
 
+  private refreshSessionMapFromPiState(
+    sessionId: string,
+    cwd: string,
+    state: unknown,
+    session?: { updateSessionFile(sessionFile: string | null): void }
+  ): string | null {
+    const data = state && typeof state === 'object' ? (state as Record<string, unknown>) : null
+    const stateSessionId = typeof data?.sessionId === 'string' && data.sessionId.trim() ? data.sessionId : null
+    const sessionFile = typeof data?.sessionFile === 'string' && data.sessionFile.trim() ? data.sessionFile : null
+
+    if (stateSessionId && stateSessionId !== sessionId) return null
+    if (!sessionFile) return null
+
+    if (existsSync(sessionFile)) {
+      const validation = validatePiSessionFile(sessionFile, { sessionId, cwd })
+      if (!validation.ok) return null
+    }
+
+    this.store.upsert({ sessionId, cwd, sessionFile })
+    session?.updateSessionFile(sessionFile)
+    return sessionFile
+  }
+
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
     // We currently only support ACP protocol version 1.
     const supportedVersion = 1
@@ -308,6 +331,8 @@ export class PiAcpAgent implements ACPAgent {
         'Configure an API key or log in with an OAuth provider.'
       )
     }
+
+    this.refreshSessionMapFromPiState(session.sessionId, session.cwd, state, session)
 
     const configOptions = await getSessionConfigOptions(session.proc, { state, availableModels })
 
@@ -807,6 +832,7 @@ export class PiAcpAgent implements ACPAgent {
 
     const result = await session.prompt(message, images)
     const { stats, state } = await getSessionUsageInputsIfAvailable(session)
+    this.refreshSessionMapFromPiState(session.sessionId, session.cwd, state, session)
     if (stats !== undefined) {
       session.publishUsageUpdateFromStats(stats)
       session.publishPiUsageTelemetryFromStats(stats, state)
@@ -918,9 +944,9 @@ export class PiAcpAgent implements ACPAgent {
     // MVP: ignore mcpServers.
     // Prefer ACP-created mapping first (fast path), otherwise scan pi sessions dir.
     const stored = this.store.get(params.sessionId)
-    const storedSessionFile = resolveStoredPiSessionFile(stored)
+    const storedSessionFile = resolveStoredPiSessionFile(stored, { cwd: params.cwd })
     if (stored && !storedSessionFile) this.store.delete(params.sessionId)
-    const sessionFile = storedSessionFile ?? findPiSessionFile(params.sessionId)
+    const sessionFile = storedSessionFile ?? findPiSessionFile(params.sessionId, params.cwd)
 
     if (!sessionFile) {
       throw RequestError.invalidParams(`Unknown sessionId: ${params.sessionId}`)
@@ -941,6 +967,16 @@ export class PiAcpAgent implements ACPAgent {
       throw e
     }
 
+    const loadedState = await proc.getState().catch(() => null)
+    const stateSessionId =
+      loadedState && typeof loadedState === 'object' && typeof (loadedState as any).sessionId === 'string'
+        ? String((loadedState as any).sessionId)
+        : null
+    if (stateSessionId && stateSessionId !== params.sessionId) {
+      proc.dispose()
+      throw RequestError.invalidParams(`Loaded pi session ${stateSessionId} did not match ${params.sessionId}`)
+    }
+
     const fileCommands = loadSlashCommands(params.cwd)
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
 
@@ -949,19 +985,21 @@ export class PiAcpAgent implements ACPAgent {
       mcpServers: params.mcpServers,
       conn: this.conn,
       proc,
-      fileCommands
+      fileCommands,
+      sessionFile
     })
 
     // Policy: within a single ACP connection (one Zed window), keep only one live pi subprocess.
     // (Tests sometimes stub out `this.sessions`, so guard the call.)
     ;(this.sessions as any).closeAllExcept?.(session.sessionId)
 
-    // (Optional) ensure mapping stays fresh.
-    this.store.upsert({
-      sessionId: params.sessionId,
-      cwd: params.cwd,
-      sessionFile
-    })
+    if (!this.refreshSessionMapFromPiState(params.sessionId, params.cwd, loadedState, session)) {
+      this.store.upsert({
+        sessionId: params.sessionId,
+        cwd: params.cwd,
+        sessionFile
+      })
+    }
 
     if (this.replayLoadSessionHistory) {
       const data = (await proc.getMessages()) as any
