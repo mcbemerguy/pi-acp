@@ -102,17 +102,6 @@ function findUniqueLineNumber(text: string, needle: string): number | undefined 
   return line
 }
 
-function toolCallName(toolCall: unknown): string | undefined {
-  const value = toolCall as {
-    name?: unknown
-    toolName?: unknown
-    function?: { name?: unknown }
-  } | null
-
-  const name = value?.name ?? value?.toolName ?? value?.function?.name
-  return typeof name === 'string' && name.trim() ? name : undefined
-}
-
 export class SessionManager {
   private sessions = new Map<string, PiAcpSession>()
   private readonly store = new SessionStore()
@@ -250,10 +239,8 @@ export class PiAcpSession {
   // Current in-flight turn (if any). Additional prompts are queued.
   private pendingTurn: PendingTurn | null = null
   private readonly turnQueue: QueuedTurn[] = []
-  // Track tool call statuses and ensure they are monotonic (pending -> in_progress -> completed).
-  // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
-  // and clients may hide progress if we ever downgrade back to `pending`.
-  private currentToolCalls = new Map<string, 'pending' | 'in_progress'>()
+  // Track started tool calls so duplicated or out-of-order events do not produce extra ACP lifecycle notifications.
+  private currentToolCalls = new Map<string, 'in_progress'>()
   private currentToolMetadata = new Map<string, ToolMetadata>()
 
   // pi can emit multiple `turn_end` events for a single user prompt (e.g. after tool_use).
@@ -776,68 +763,7 @@ export class PiAcpSession {
           break
         }
 
-        // Surface tool calls ASAP so clients (e.g. Zed) can show a tool-in-use/loading UI
-        // while the model is still streaming tool call args.
         if (ame?.type === 'toolcall_start' || ame?.type === 'toolcall_delta' || ame?.type === 'toolcall_end') {
-          const toolCall =
-            // pi sometimes includes the tool call directly on the event
-            (ame as any)?.toolCall ??
-            // ...and always includes it in the partial assistant message at contentIndex
-            (ame as any)?.partial?.content?.[(ame as any)?.contentIndex ?? 0]
-
-          const toolCallId = String((toolCall as any)?.id ?? '')
-          const toolName = toolCallName(toolCall)
-
-          if (toolCallId) {
-            const rawInput =
-              (toolCall as any)?.arguments && typeof (toolCall as any).arguments === 'object'
-                ? (toolCall as any).arguments
-                : (() => {
-                    const s = String((toolCall as any)?.partialArgs ?? '')
-                    if (!s) return undefined
-                    try {
-                      return JSON.parse(s)
-                    } catch {
-                      return { partialArgs: s }
-                    }
-                  })()
-
-            const locations = toToolCallLocations(rawInput, this.cwd)
-            const existingStatus = this.currentToolCalls.get(toolCallId)
-            // IMPORTANT: never downgrade status (e.g. if we already marked in_progress via tool_execution_start).
-            const status = existingStatus ?? 'pending'
-
-            if (!existingStatus) {
-              if (toolName) {
-                const metadata = { title: toolName, kind: toToolKind(toolName) }
-                this.currentToolCalls.set(toolCallId, 'pending')
-                this.currentToolMetadata.set(toolCallId, metadata)
-                this.emit({
-                  sessionUpdate: 'tool_call',
-                  toolCallId,
-                  title: metadata.title,
-                  kind: metadata.kind,
-                  status,
-                  locations,
-                  rawInput: this.rawPresentation(rawInput, toolCallId, 'message_update')
-                })
-              }
-            } else {
-              const metadata = toolName
-                ? { title: toolName, kind: toToolKind(toolName) }
-                : this.currentToolMetadata.get(toolCallId)
-              if (metadata) this.currentToolMetadata.set(toolCallId, metadata)
-              this.emit({
-                sessionUpdate: 'tool_call_update',
-                toolCallId,
-                ...(metadata ? { title: metadata.title, kind: metadata.kind } : {}),
-                status,
-                locations,
-                rawInput: this.rawPresentation(rawInput, toolCallId, 'message_update')
-              })
-            }
-          }
-
           break
         }
 
@@ -881,22 +807,10 @@ export class PiAcpSession {
         const metadata = { title: toolName, kind: toToolKind(toolName) }
         this.currentToolMetadata.set(toolCallId, metadata)
 
-        // If we already surfaced the tool call while the model streamed it, just transition.
         if (!this.currentToolCalls.has(toolCallId)) {
           this.currentToolCalls.set(toolCallId, 'in_progress')
           this.emit({
             sessionUpdate: 'tool_call',
-            toolCallId,
-            title: metadata.title,
-            kind: metadata.kind,
-            status: 'in_progress',
-            locations,
-            rawInput: this.rawPresentation(args, toolCallId, 'tool_execution_start')
-          })
-        } else {
-          this.currentToolCalls.set(toolCallId, 'in_progress')
-          this.emit({
-            sessionUpdate: 'tool_call_update',
             toolCallId,
             title: metadata.title,
             kind: metadata.kind,
@@ -910,23 +824,6 @@ export class PiAcpSession {
       }
 
       case 'tool_execution_update': {
-        const toolCallId = String((ev as any).toolCallId ?? '')
-        if (!toolCallId) break
-
-        const partial = (ev as any).partialResult
-        const text = toolResultToPresentationText(partial, this.toolSource(toolCallId, 'tool_execution_update'))
-        const metadata = this.currentToolMetadata.get(toolCallId)
-
-        this.emit({
-          sessionUpdate: 'tool_call_update',
-          toolCallId,
-          ...(metadata ? { title: metadata.title, kind: metadata.kind } : {}),
-          status: 'in_progress',
-          content: text
-            ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
-            : undefined,
-          rawOutput: this.rawPresentation(partial, toolCallId, 'tool_execution_update')
-        })
         break
       }
 
