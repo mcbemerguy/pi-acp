@@ -242,6 +242,7 @@ export class PiAcpSession {
   // Track started tool calls so duplicated or out-of-order events do not produce extra ACP lifecycle notifications.
   private currentToolCalls = new Map<string, 'in_progress'>()
   private currentToolMetadata = new Map<string, ToolMetadata>()
+  private currentToolUpdateResults = new Map<string, unknown[]>()
 
   // pi can emit multiple `turn_end` events for a single user prompt (e.g. after tool_use).
   // The overall agent loop completes when `agent_end` is emitted.
@@ -727,6 +728,30 @@ export class PiAcpSession {
     return safePresentationValue(value, this.toolSource(toolCallId, eventType))
   }
 
+  private setToolMetadataFromName(toolCallId: string, toolName: unknown): ToolMetadata | undefined {
+    if (typeof toolName !== 'string' || !toolName) return undefined
+    const metadata = { title: toolName, kind: toToolKind(toolName) }
+    this.currentToolMetadata.set(toolCallId, metadata)
+    return metadata
+  }
+
+  private toolUpdatePresentationText(toolCallId: string): string {
+    const updates = this.currentToolUpdateResults.get(toolCallId)
+    if (!updates?.length) return ''
+
+    const source = this.toolSource(toolCallId, 'tool_execution_update')
+    const text = updates
+      .map(update => {
+        if (typeof update === 'string') return update
+        return toolResultToPresentationText(update, source)
+      })
+      .filter(Boolean)
+      .join('\n')
+      .trimEnd()
+
+    return text ? toolResultToPresentationText({ content: [{ type: 'text', text }] }, source) : ''
+  }
+
   private handlePiEvent(ev: PiRpcEvent) {
     const type = String((ev as any).type ?? '')
 
@@ -804,8 +829,7 @@ export class PiAcpSession {
 
         const locations = toToolCallLocations(args, this.cwd, line)
 
-        const metadata = { title: toolName, kind: toToolKind(toolName) }
-        this.currentToolMetadata.set(toolCallId, metadata)
+        const metadata = this.setToolMetadataFromName(toolCallId, toolName)!
 
         if (!this.currentToolCalls.has(toolCallId)) {
           this.currentToolCalls.set(toolCallId, 'in_progress')
@@ -824,6 +848,17 @@ export class PiAcpSession {
       }
 
       case 'tool_execution_update': {
+        const toolCallId = String((ev as any).toolCallId ?? '')
+        if (!toolCallId) break
+
+        this.setToolMetadataFromName(toolCallId, (ev as any).toolName)
+
+        const updates = this.currentToolUpdateResults.get(toolCallId) ?? []
+        const partial = (ev as any).partialResult
+        const update = (ev as any).update
+        if (partial !== undefined) updates.push(partial)
+        if (update !== undefined) updates.push(update)
+        if (updates.length) this.currentToolUpdateResults.set(toolCallId, updates)
         break
       }
 
@@ -833,7 +868,8 @@ export class PiAcpSession {
 
         const result = (ev as any).result
         const isError = Boolean((ev as any).isError)
-        const text = toolResultToPresentationText(result, this.toolSource(toolCallId, 'tool_execution_end'))
+        const finalText = toolResultToPresentationText(result, this.toolSource(toolCallId, 'tool_execution_end'))
+        const text = finalText || this.toolUpdatePresentationText(toolCallId)
 
         const snapshot = this.editSnapshots.get(toolCallId)
         let content: ToolCallContent[] | undefined
@@ -895,7 +931,9 @@ export class PiAcpSession {
           content = [{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[]
         }
 
-        const metadata = this.currentToolMetadata.get(toolCallId)
+        const metadata =
+          this.currentToolMetadata.get(toolCallId) ?? this.setToolMetadataFromName(toolCallId, (ev as any).toolName)
+        const rawOutput = result !== undefined ? result : this.currentToolUpdateResults.get(toolCallId)
 
         this.emit({
           sessionUpdate: 'tool_call_update',
@@ -903,11 +941,12 @@ export class PiAcpSession {
           ...(metadata ? { title: metadata.title, kind: metadata.kind } : {}),
           status: isError ? 'failed' : 'completed',
           content,
-          rawOutput: this.rawPresentation(result, toolCallId, 'tool_execution_end')
+          rawOutput: this.rawPresentation(rawOutput, toolCallId, 'tool_execution_end')
         })
 
         this.currentToolCalls.delete(toolCallId)
         this.currentToolMetadata.delete(toolCallId)
+        this.currentToolUpdateResults.delete(toolCallId)
         this.editSnapshots.delete(toolCallId)
         break
       }
