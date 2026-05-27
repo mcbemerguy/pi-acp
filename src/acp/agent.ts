@@ -835,6 +835,11 @@ export class PiAcpAgent implements ACPAgent {
         this.refreshSessionMapFromPiState(session.sessionId, session.cwd, state, session)
       }
     })
+
+    if (result === 'cancelled' || (result === 'error' && session.wasCancelRequested())) {
+      return { stopReason: 'cancelled' }
+    }
+
     const { stats, state } = await getSessionUsageInputsIfAvailable(session)
     this.refreshSessionMapFromPiState(session.sessionId, session.cwd, state, session)
     if (stats !== undefined) {
@@ -844,7 +849,6 @@ export class PiAcpAgent implements ACPAgent {
     const usage = usageFromPiSessionStats(stats)
 
     if (result === 'error') {
-      if (session.wasCancelRequested()) return { stopReason: 'cancelled', ...(usage ? { usage } : {}) }
       throw RequestError.internalError({}, 'Pi prompt failed before completing the turn.')
     }
 

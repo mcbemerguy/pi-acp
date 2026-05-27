@@ -363,6 +363,44 @@ test('PiAcpAgent: prompt refreshes ACP session map from pi state', async () => {
   assert.equal(updatedSessionFile, sessionFile)
 })
 
+test('PiAcpAgent: cancelled prompt does not wait for post-turn usage refresh', async () => {
+  const conn = new FakeAgentSideConnection()
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  let statsRequested = false
+  let stateRequested = false
+
+  ;(agent as any).sessions = {
+    get: () => ({
+      sessionId: 'prompt-session',
+      cwd: '/tmp/project',
+      prompt: async () => 'cancelled',
+      wasCancelRequested: () => true,
+      updateSessionFile: () => {},
+      publishUsageUpdateFromStats: () => {},
+      publishPiUsageTelemetryFromStats: () => {},
+      proc: {
+        getSessionStats: async () => {
+          statsRequested = true
+          await new Promise(() => {})
+        },
+        getState: async () => {
+          stateRequested = true
+          await new Promise(() => {})
+        }
+      }
+    })
+  }
+
+  const response = await Promise.race([
+    agent.prompt({ sessionId: 'prompt-session', prompt: [{ type: 'text', text: 'hi' }] } as any),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('prompt timed out')), 50))
+  ])
+
+  assert.equal(response.stopReason, 'cancelled')
+  assert.equal(statsRequested, false)
+  assert.equal(stateRequested, false)
+})
+
 test('PiAcpAgent: prompt refreshes ACP session map as soon as prompt is accepted', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-prompt-accepted-map-'))
   const sessionFile = join(root, 'session.jsonl')
