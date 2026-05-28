@@ -28,6 +28,7 @@ import { PiRpcProcess, PiRpcProcessLifecycleError, PiRpcSpawnError } from '../pi
 import { findPiSessionFile, listPiSessions, resolveStoredPiSessionFile, validatePiSessionFile } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
 import { toolResultToText } from './translate/pi-tools.js'
+import { toToolKind } from './translate/tool-metadata.js'
 import { promptToPiMessage } from './translate/prompt.js'
 import { zContentBlock } from '@agentclientprotocol/sdk/dist/schema/zod.gen.js'
 import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slash-commands.js'
@@ -1071,7 +1072,7 @@ export class PiAcpAgent implements ACPAgent {
               sessionUpdate: 'tool_call',
               toolCallId,
               title: toolName,
-              kind: toolName === 'read' ? 'read' : toolName === 'write' || toolName === 'edit' ? 'edit' : 'other',
+              kind: toToolKind(toolName),
               status: 'completed',
               rawInput: null,
               rawOutput: m
