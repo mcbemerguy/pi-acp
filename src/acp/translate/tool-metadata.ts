@@ -7,7 +7,7 @@ export function toToolKind(toolName: string): ToolKind {
   if (normalized === 'read') return 'read'
   if (normalized === 'write' || normalized === 'edit') return 'edit'
   if (normalized === 'bash') return 'execute'
-  if (normalized === 'grep' || normalized === 'find') return 'search'
+  if (normalized === 'grep' || normalized === 'find' || normalized === 'ls') return 'search'
   if (normalized.startsWith('web_fetch') || normalized.startsWith('browser_fetch')) return 'fetch'
 
   return 'other'
