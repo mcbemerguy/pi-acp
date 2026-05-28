@@ -64,6 +64,74 @@ test('PiAcpSession: emits agent_thought_chunk for thinking_delta', async () => {
   })
 })
 
+test('PiAcpSession: refreshes usage after tool result message end', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.sessionStats = {
+    tokens: { input: 100, output: 25, cacheRead: 5, cacheWrite: 0, total: 130 },
+    contextUsage: { tokens: 240, contextWindow: 1000 },
+    cost: 0.12
+  }
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'message_end', message: { role: 'toolResult' } })
+
+  await wait(350)
+
+  assert.equal(proc.getSessionStatsCount, 1)
+  assert.deepEqual(conn.updates[0]!.update, {
+    sessionUpdate: 'usage_update',
+    used: 240,
+    size: 1000,
+    cost: { amount: 0.12, currency: 'USD' }
+  })
+  assert.deepEqual(conn.extNotifications, [
+    {
+      method: '_pi/session_usage_update',
+      params: {
+        sessionId: 's1',
+        usage: {
+          context: { usedTokens: 240, maxTokens: 1000 },
+          totals: { totalTokens: 130, inputTokens: 100, outputTokens: 25, cachedReadTokens: 5, cachedWriteTokens: 0 },
+          cost: { amount: 0.12, currency: 'USD' }
+        }
+      }
+    }
+  ])
+})
+
+test('PiAcpSession: coalesces rapid usage refresh boundaries', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'thinking_end' } })
+  proc.emit({ type: 'message_end', message: { role: 'assistant' } })
+  proc.emit({ type: 'message_end', message: { role: 'toolResult' } })
+
+  await wait(350)
+
+  assert.equal(proc.getSessionStatsCount, 1)
+  assert.equal(conn.updates.filter(entry => entry.update.sessionUpdate === 'usage_update').length, 1)
+  assert.equal(conn.extNotifications.filter(entry => entry.method === '_pi/session_usage_update').length, 1)
+})
+
 test('PiAcpSession: emits exactly start and terminal updates for a normal live tool', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()

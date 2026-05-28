@@ -32,6 +32,8 @@ import { PI_USAGE_UPDATE_METHOD, piUsageTelemetryFromPiSessionStats, usageUpdate
 
 const CANCEL_ABORT_TIMEOUT_MS = 3_500
 const CANCEL_DRAIN_TIMEOUT_MS = 2_000
+const USAGE_REFRESH_DEBOUNCE_MS = 150
+const USAGE_REFRESH_MIN_INTERVAL_MS = 250
 
 type SessionCreateParams = {
   cwd: string
@@ -50,6 +52,11 @@ type PendingTurn = {
 
 type PromptLifecycleOptions = {
   onAccepted?: (state: unknown) => void | Promise<void>
+}
+
+type UsageRefreshResult = {
+  stats?: unknown
+  state?: unknown
 }
 
 type QueuedTurn = {
@@ -274,6 +281,14 @@ export class PiAcpSession {
     diagnostics: 0
   }
 
+  private cachedPiState: unknown
+  private usageRefreshTimer: NodeJS.Timeout | null = null
+  private usageRefreshInFlight = false
+  private usageRefreshQueued = false
+  private lastUsageRefreshAt = 0
+  private lastUsageUpdateKey: string | null = null
+  private lastPiUsageTelemetryKey: string | null = null
+
   constructor(opts: {
     sessionId: string
     cwd: string
@@ -306,6 +321,10 @@ export class PiAcpSession {
     if (this.cancelDrainTimer) {
       clearTimeout(this.cancelDrainTimer)
       this.cancelDrainTimer = null
+    }
+    if (this.usageRefreshTimer) {
+      clearTimeout(this.usageRefreshTimer)
+      this.usageRefreshTimer = null
     }
     this.drainingCancelledTurn = false
     this.proc.dispose?.()
@@ -408,14 +427,48 @@ export class PiAcpSession {
     this.sessionFile = sessionFile
   }
 
-  publishUsageUpdateFromStats(stats: unknown): void {
-    const update = usageUpdateFromPiSessionStats(stats)
-    if (update) this.emit(update)
+  updateCachedPiState(state: unknown): void {
+    if (state !== undefined) this.cachedPiState = state
   }
 
-  publishPiUsageTelemetryFromStats(stats: unknown, state?: unknown): void {
+  async refreshUsageTelemetry(opts: { includeState?: boolean; force?: boolean } = {}): Promise<UsageRefreshResult> {
+    if (opts.force && this.usageRefreshTimer) {
+      clearTimeout(this.usageRefreshTimer)
+      this.usageRefreshTimer = null
+      this.usageRefreshQueued = false
+    }
+
+    const [stats, state] = await Promise.all([
+      this.proc.getSessionStats().catch(() => undefined),
+      opts.includeState ? this.proc.getState().catch(() => undefined) : Promise.resolve(this.cachedPiState)
+    ])
+
+    if (state !== undefined) this.cachedPiState = state
+    if (stats !== undefined) {
+      this.publishUsageUpdateFromStats(stats, { force: opts.force })
+      this.publishPiUsageTelemetryFromStats(stats, state, { force: opts.force })
+      this.lastUsageRefreshAt = Date.now()
+    }
+
+    return { stats, state }
+  }
+
+  publishUsageUpdateFromStats(stats: unknown, opts: { force?: boolean } = {}): void {
+    const update = usageUpdateFromPiSessionStats(stats)
+    if (!update) return
+    const key = stableUsageKey(update)
+    if (!opts.force && key === this.lastUsageUpdateKey) return
+    this.lastUsageUpdateKey = key
+    this.emit(update)
+  }
+
+  publishPiUsageTelemetryFromStats(stats: unknown, state?: unknown, opts: { force?: boolean } = {}): void {
     const usage = piUsageTelemetryFromPiSessionStats(stats, state)
-    if (usage) this.emitCustomNotification(PI_USAGE_UPDATE_METHOD, { sessionId: this.sessionId, usage })
+    if (!usage) return
+    const key = stableUsageKey(usage)
+    if (!opts.force && key === this.lastPiUsageTelemetryKey) return
+    this.lastPiUsageTelemetryKey = key
+    this.emitCustomNotification(PI_USAGE_UPDATE_METHOD, { sessionId: this.sessionId, usage })
   }
 
   getOutboundPressureSnapshot(): OutboundPressureSnapshot {
@@ -437,12 +490,19 @@ export class PiAcpSession {
   }
 
   private coalesceOutbound(item: OutboundQueueItem): boolean {
-    if (item.kind !== 'sessionUpdate' || !item.update || item.resolve || item.reject) return false
+    if (item.resolve || item.reject) return false
     const previous = this.outboundQueue[this.outboundQueue.length - 1]
-    if (!previous || previous.kind !== 'sessionUpdate' || !previous.update) return false
+    if (!previous) return false
 
-    if (mergeTextChunkUpdate(previous.update, item.update)) return true
-    if (replaceRoutinePresentationUpdate(previous, item)) return true
+    if (item.kind === 'sessionUpdate' && item.update && previous.kind === 'sessionUpdate' && previous.update) {
+      if (mergeTextChunkUpdate(previous.update, item.update)) return true
+      if (replaceRoutinePresentationUpdate(previous, item)) return true
+      if (replacePendingUsageUpdate(previous, item)) return true
+    }
+
+    if (item.kind === 'extNotification' && previous.kind === 'extNotification') {
+      if (replacePendingUsageNotification(previous, item)) return true
+    }
 
     return false
   }
@@ -526,6 +586,37 @@ export class PiAcpSession {
   private async flushEmits(): Promise<void> {
     if (this.currentOutboundPending() === 0) return
     await new Promise<void>(resolve => this.outboundDrainWaiters.push(resolve))
+  }
+
+  private scheduleUsageRefresh(): void {
+    if (this.usageRefreshTimer) return
+
+    const elapsed = Date.now() - this.lastUsageRefreshAt
+    const delay = Math.max(USAGE_REFRESH_DEBOUNCE_MS, USAGE_REFRESH_MIN_INTERVAL_MS - elapsed)
+    this.usageRefreshTimer = setTimeout(() => {
+      this.usageRefreshTimer = null
+      void this.runScheduledUsageRefresh()
+    }, delay)
+  }
+
+  private async runScheduledUsageRefresh(): Promise<void> {
+    if (this.usageRefreshInFlight) {
+      this.usageRefreshQueued = true
+      return
+    }
+
+    this.usageRefreshInFlight = true
+    try {
+      await this.refreshUsageTelemetry()
+      this.lastUsageRefreshAt = Date.now()
+    } finally {
+      this.usageRefreshInFlight = false
+    }
+
+    if (this.usageRefreshQueued) {
+      this.usageRefreshQueued = false
+      this.scheduleUsageRefresh()
+    }
   }
 
   private withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -614,6 +705,7 @@ export class PiAcpSession {
 
     void (async () => {
       const state = await this.proc.getState().catch(() => null)
+      this.updateCachedPiState(state)
       await onAccepted(state)
     })().catch(error => {
       console.error(
@@ -783,11 +875,22 @@ export class PiAcpSession {
           break
         }
 
+        if (ame?.type === 'thinking_end') {
+          this.scheduleUsageRefresh()
+          break
+        }
+
         if (ame?.type === 'toolcall_start' || ame?.type === 'toolcall_delta' || ame?.type === 'toolcall_end') {
           break
         }
 
         // Ignore other delta/event types for now.
+        break
+      }
+
+      case 'message_end': {
+        const role = String((ev as any).message?.role ?? '')
+        if (role === 'assistant' || role === 'toolResult') this.scheduleUsageRefresh()
         break
       }
 
@@ -981,6 +1084,7 @@ export class PiAcpSession {
             text: 'Automatic compaction finished; context was summarized to continue the session.'
           } satisfies ContentBlock
         })
+        this.scheduleUsageRefresh()
         break
       }
 
@@ -1048,6 +1152,25 @@ function replaceRoutinePresentationUpdate(previous: OutboundQueueItem, next: Out
 
   previous.update = next.update
   return true
+}
+
+function replacePendingUsageUpdate(previous: OutboundQueueItem, next: OutboundQueueItem): boolean {
+  if (!previous.update || !next.update) return false
+  if (previous.update.sessionUpdate !== 'usage_update' || next.update.sessionUpdate !== 'usage_update') return false
+
+  previous.update = next.update
+  return true
+}
+
+function replacePendingUsageNotification(previous: OutboundQueueItem, next: OutboundQueueItem): boolean {
+  if (previous.method !== PI_USAGE_UPDATE_METHOD || next.method !== PI_USAGE_UPDATE_METHOD) return false
+
+  previous.params = next.params
+  return true
+}
+
+function stableUsageKey(value: unknown): string {
+  return JSON.stringify(value) ?? ''
 }
 
 function shouldRespondToExtensionUiRequest(method: string): boolean {

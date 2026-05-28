@@ -55,6 +55,12 @@ export class FakePiRpcProcess {
   }> = []
   abortCount = 0
   disposeCount = 0
+  getSessionStatsCount = 0
+  sessionStats: unknown = {
+    tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, total: 15 },
+    contextUsage: { tokens: 15, contextWindow: 1000 },
+    cost: 0
+  }
   abortPromise: Promise<void> | null = null
   promptError: unknown = null
 
@@ -104,6 +110,11 @@ export class FakePiRpcProcess {
 
   async getState(): Promise<any> {
     return {}
+  }
+
+  async getSessionStats(): Promise<unknown> {
+    this.getSessionStatsCount += 1
+    return this.sessionStats
   }
 
   async getAvailableModels(): Promise<any> {

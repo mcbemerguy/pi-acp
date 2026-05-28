@@ -91,13 +91,34 @@ function builtinAvailableCommands(): AvailableCommand[] {
   ]
 }
 
-async function getSessionUsageInputsIfAvailable(session: {
-  proc: Pick<PiRpcProcess, 'getSessionStats' | 'getState'>
-}): Promise<{ stats?: unknown; state?: unknown }> {
+async function refreshSessionUsageInputsIfAvailable(
+  session: unknown,
+  opts: { includeState?: boolean; force?: boolean } = {}
+): Promise<{ stats?: unknown; state?: unknown }> {
+  const candidate = session as {
+    refreshUsageTelemetry?: (opts?: {
+      includeState?: boolean
+      force?: boolean
+    }) => Promise<{ stats?: unknown; state?: unknown }>
+    publishUsageUpdateFromStats?: (stats: unknown, opts?: { force?: boolean }) => void
+    publishPiUsageTelemetryFromStats?: (stats: unknown, state?: unknown, opts?: { force?: boolean }) => void
+    proc?: Pick<PiRpcProcess, 'getSessionStats' | 'getState'>
+  }
+
+  if (typeof candidate.refreshUsageTelemetry === 'function') {
+    return candidate.refreshUsageTelemetry(opts)
+  }
+
   const [stats, state] = await Promise.all([
-    session.proc.getSessionStats().catch(() => undefined),
-    session.proc.getState().catch(() => undefined)
+    candidate.proc?.getSessionStats().catch(() => undefined) ?? Promise.resolve(undefined),
+    opts.includeState ? (candidate.proc?.getState().catch(() => undefined) ?? Promise.resolve(undefined)) : undefined
   ])
+
+  if (stats !== undefined) {
+    candidate.publishUsageUpdateFromStats?.(stats, { force: opts.force })
+    candidate.publishPiUsageTelemetryFromStats?.(stats, state, { force: opts.force })
+  }
+
   return { stats, state }
 }
 
@@ -420,10 +441,8 @@ export class PiAcpAgent implements ACPAgent {
       }
 
       if (cmd === 'session') {
-        const { stats, state } = await getSessionUsageInputsIfAvailable(session)
+        const { stats } = await refreshSessionUsageInputsIfAvailable(session, { includeState: true, force: true })
         if (stats === undefined) throw RequestError.internalError({}, 'pi get_session_stats failed')
-        session.publishUsageUpdateFromStats(stats)
-        session.publishPiUsageTelemetryFromStats(stats, state)
         const statsRecord = stats && typeof stats === 'object' ? (stats as Record<string, unknown>) : null
 
         const lines: string[] = []
@@ -840,12 +859,8 @@ export class PiAcpAgent implements ACPAgent {
       return { stopReason: 'cancelled' }
     }
 
-    const { stats, state } = await getSessionUsageInputsIfAvailable(session)
+    const { stats, state } = await refreshSessionUsageInputsIfAvailable(session, { includeState: true, force: true })
     this.refreshSessionMapFromPiState(session.sessionId, session.cwd, state, session)
-    if (stats !== undefined) {
-      session.publishUsageUpdateFromStats(stats)
-      session.publishPiUsageTelemetryFromStats(stats, state)
-    }
     const usage = usageFromPiSessionStats(stats)
 
     if (result === 'error') {
