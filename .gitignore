@@ -9,3 +9,5 @@ dist
 
 /agentDocs
 .DS_Store
+.pi-launch-build.stamp
+.pi-launch-install.stamp
