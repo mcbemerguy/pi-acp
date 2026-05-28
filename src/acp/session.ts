@@ -57,6 +57,7 @@ type PromptLifecycleOptions = {
 type UsageRefreshResult = {
   stats?: unknown
   state?: unknown
+  stale?: boolean
 }
 
 type QueuedTurn = {
@@ -285,6 +286,9 @@ export class PiAcpSession {
   private usageRefreshTimer: NodeJS.Timeout | null = null
   private usageRefreshInFlight = false
   private usageRefreshQueued = false
+  private usageRefreshSequence = 0
+  private latestForcedUsageRefreshSequence = 0
+  private forcedUsageRefreshInFlight = 0
   private lastUsageRefreshAt = 0
   private lastUsageUpdateKey: string | null = null
   private lastPiUsageTelemetryKey: string | null = null
@@ -432,25 +436,39 @@ export class PiAcpSession {
   }
 
   async refreshUsageTelemetry(opts: { includeState?: boolean; force?: boolean } = {}): Promise<UsageRefreshResult> {
-    if (opts.force && this.usageRefreshTimer) {
-      clearTimeout(this.usageRefreshTimer)
-      this.usageRefreshTimer = null
+    const sequence = ++this.usageRefreshSequence
+    const startedDuringForcedRefresh = !opts.force && this.forcedUsageRefreshInFlight > 0
+
+    if (opts.force) {
+      this.latestForcedUsageRefreshSequence = sequence
+      this.forcedUsageRefreshInFlight += 1
       this.usageRefreshQueued = false
+      if (this.usageRefreshTimer) {
+        clearTimeout(this.usageRefreshTimer)
+        this.usageRefreshTimer = null
+      }
     }
 
-    const [stats, state] = await Promise.all([
-      this.proc.getSessionStats().catch(() => undefined),
-      opts.includeState ? this.proc.getState().catch(() => undefined) : Promise.resolve(this.cachedPiState)
-    ])
+    try {
+      const [stats, state] = await Promise.all([
+        this.proc.getSessionStats().catch(() => undefined),
+        opts.includeState ? this.proc.getState().catch(() => undefined) : Promise.resolve(this.cachedPiState)
+      ])
 
-    if (state !== undefined) this.cachedPiState = state
-    if (stats !== undefined) {
-      this.publishUsageUpdateFromStats(stats, { force: opts.force })
-      this.publishPiUsageTelemetryFromStats(stats, state, { force: opts.force })
-      this.lastUsageRefreshAt = Date.now()
+      if (sequence < this.latestForcedUsageRefreshSequence || startedDuringForcedRefresh)
+        return { stats, state, stale: true }
+
+      if (state !== undefined) this.cachedPiState = state
+      if (stats !== undefined) {
+        this.publishUsageUpdateFromStats(stats, { force: opts.force })
+        this.publishPiUsageTelemetryFromStats(stats, state, { force: opts.force })
+        this.lastUsageRefreshAt = Date.now()
+      }
+
+      return { stats, state }
+    } finally {
+      if (opts.force) this.forcedUsageRefreshInFlight = Math.max(0, this.forcedUsageRefreshInFlight - 1)
     }
-
-    return { stats, state }
   }
 
   publishUsageUpdateFromStats(stats: unknown, opts: { force?: boolean } = {}): void {
@@ -607,8 +625,8 @@ export class PiAcpSession {
 
     this.usageRefreshInFlight = true
     try {
-      await this.refreshUsageTelemetry()
-      this.lastUsageRefreshAt = Date.now()
+      const result = await this.refreshUsageTelemetry()
+      if (!result.stale) this.lastUsageRefreshAt = Date.now()
     } finally {
       this.usageRefreshInFlight = false
     }

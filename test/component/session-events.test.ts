@@ -132,6 +132,71 @@ test('PiAcpSession: coalesces rapid usage refresh boundaries', async () => {
   assert.equal(conn.extNotifications.filter(entry => entry.method === '_pi/session_usage_update').length, 1)
 })
 
+test('PiAcpSession: drops stale live usage refresh results after a forced refresh starts', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const staleStats = {
+    tokens: { input: 10, output: 5, total: 15 },
+    contextUsage: { tokens: 15, contextWindow: 1000 },
+    cost: 0.01
+  }
+  const finalStats = {
+    tokens: { input: 100, output: 50, total: 150 },
+    contextUsage: { tokens: 150, contextWindow: 1000 },
+    cost: 0.1
+  }
+  let statsCalls = 0
+  let releaseStaleRefresh!: () => void
+  const staleRefreshStarted = new Promise<void>(resolve => {
+    proc.getSessionStats = async () => {
+      statsCalls += 1
+      if (statsCalls === 1) {
+        resolve()
+        await new Promise<void>(release => {
+          releaseStaleRefresh = release
+        })
+        return staleStats
+      }
+      return finalStats
+    }
+  })
+  proc.getState = async () => ({ model: { name: 'final-model' } })
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+  session.updateCachedPiState({ model: { name: 'stale-model' } })
+
+  proc.emit({ type: 'message_end', message: { role: 'assistant' } })
+  await staleRefreshStarted
+
+  await session.refreshUsageTelemetry({ includeState: true, force: true })
+  releaseStaleRefresh()
+  await wait(25)
+
+  const usageUpdates = conn.updates.filter(entry => entry.update.sessionUpdate === 'usage_update')
+  assert.equal(statsCalls, 2)
+  assert.deepEqual(
+    usageUpdates.map(entry => entry.update),
+    [{ sessionUpdate: 'usage_update', used: 150, size: 1000, cost: { amount: 0.1, currency: 'USD' } }]
+  )
+  assert.equal(conn.extNotifications.length, 1)
+  assert.deepEqual(conn.extNotifications[0]!.params, {
+    sessionId: 's1',
+    usage: {
+      context: { usedTokens: 150, maxTokens: 1000 },
+      totals: { totalTokens: 150, inputTokens: 100, outputTokens: 50 },
+      cost: { amount: 0.1, currency: 'USD' },
+      model: { name: 'final-model' }
+    }
+  })
+})
+
 test('PiAcpSession: emits exactly start and terminal updates for a normal live tool', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
