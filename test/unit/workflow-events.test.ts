@@ -119,6 +119,52 @@ test('WorkflowEventMapper maps workflow run events and step plan updates to ACP 
   assert.equal(link.content.uri, pathToFileURL('/runs/r1/audit.md').href)
 })
 
+test('WorkflowEventMapper maps workflow context usage records to ACP usage updates and telemetry', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+  const mapped = mapper.mapRecord({
+    type: 'context_usage_update',
+    timestamp: 't1',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'code',
+    childSessionId: 'child-session',
+    childSessionPath: '/runs/r1/sessions/child.jsonl',
+    parentSessionId: 'parent-session',
+    usage: {
+      context: { usedTokens: 12_345, maxTokens: 200_000 },
+      lastRequest: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+      cost: { amount: 0.01, currency: 'USD' },
+      model: { name: 'gpt-test', provider: 'openai' }
+    }
+  })
+
+  assert.equal(mapped.updates.length, 1)
+  assert.equal(mapped.updates[0]!.sessionUpdate, 'usage_update')
+  assert.equal((mapped.updates[0] as any).used, 12_345)
+  assert.equal((mapped.updates[0] as any).size, 200_000)
+  assert.equal(mapped.usageTelemetry?.sessionId, 'parent-session')
+  assert.equal(mapped.usageTelemetry?.contextSessionId, 'child-session')
+  assert.equal(mapped.usageTelemetry?.workflow.stepId, 'code')
+  assert.equal(mapped.usageTelemetry?.workflow.childSessionPath, '/runs/r1/sessions/child.jsonl')
+  assert.deepEqual(mapped.usageTelemetry?.usage.context, { usedTokens: 12_345, maxTokens: 200_000 })
+})
+
+test('WorkflowEventMapper emits custom context telemetry even when max context size is unavailable', () => {
+  const mapper = new WorkflowEventMapper('/repo')
+  const mapped = mapper.mapRecord({
+    type: 'context_usage_update',
+    timestamp: 't1',
+    runId: 'r1',
+    workflowId: 'wf',
+    stepId: 'code',
+    childSessionId: 'child-session',
+    usage: { context: { usedTokens: 12_345 }, model: { name: 'gpt-test' } }
+  })
+
+  assert.equal(mapped.updates.length, 0)
+  assert.deepEqual(mapped.usageTelemetry?.usage.context, { usedTokens: 12_345 })
+})
+
 test('WorkflowEventMapper maps inline subworkflow completion to a completed plan entry', () => {
   const mapper = new WorkflowEventMapper('/repo')
   const updates = [
@@ -723,7 +769,9 @@ test('WorkflowEventMonitor tails explicitly linked subworkflow run artifacts', a
       'utf8'
     )
 
-    await waitUntil(() => updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:child'))
+    await waitUntil(() =>
+      updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:child')
+    )
     appendFileSync(
       join(parentRunDir, 'events.jsonl'),
       `${JSON.stringify({ type: 'run_end', timestamp: 't5', runId: 'parent', workflowId: 'root', status: 'completed' })}\n`,
@@ -732,7 +780,9 @@ test('WorkflowEventMonitor tails explicitly linked subworkflow run artifacts', a
     await monitor.waitForRunEndAfterPromptResolution()
 
     assert.ok(updates.some(update => update.sessionUpdate === 'tool_call' && update.toolCallId === 'workflow:child'))
-    assert.ok(updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:child'))
+    assert.ok(
+      updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:child')
+    )
   } finally {
     monitor.dispose()
     rmSync(root, { recursive: true, force: true })

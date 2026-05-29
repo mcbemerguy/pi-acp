@@ -13,8 +13,17 @@ import {
   type PresentationSource
 } from './translate/pi-tools.js'
 import { toToolCallLocations, toToolKind } from './translate/tool-metadata.js'
+import { usageUpdateFromPiUsageTelemetry, type PiUsageTelemetry } from './usage.js'
 
 type EmitSessionUpdate = (update: SessionUpdate) => void
+
+type WorkflowUsageTelemetry = {
+  sessionId?: string
+  contextSessionId?: string
+  usage: PiUsageTelemetry
+  workflow: WorkflowMeta
+  rawPayload: Record<string, unknown>
+}
 
 export type WorkflowEventMonitorTarget = {
   workflowId: string
@@ -30,6 +39,7 @@ type WorkflowEventMonitorOptions = {
   runEndMaxWaitMs?: number
   target?: WorkflowEventMonitorTarget | null
   onRecord?: (record: Record<string, unknown>, sequence: number) => void
+  onUsageTelemetry?: (event: WorkflowUsageTelemetry) => void
 }
 
 type WorkflowEventSourceIdentity = {
@@ -78,6 +88,7 @@ type WorkflowMeta = {
   auditPath?: string
   stepId?: string
   childSessionId?: string
+  childSessionPath?: string
   source?: WorkflowEventSourceIdentity
 }
 
@@ -140,38 +151,49 @@ export class WorkflowEventMapper {
   }
 
   map(record: unknown, sourceIdentity?: WorkflowEventSourceIdentity): SessionUpdate[] {
-    if (!isObject(record)) return []
+    return this.mapRecord(record, sourceIdentity).updates
+  }
+
+  mapRecord(
+    record: unknown,
+    sourceIdentity?: WorkflowEventSourceIdentity
+  ): { updates: SessionUpdate[]; usageTelemetry?: WorkflowUsageTelemetry } {
+    if (!isObject(record)) return { updates: [] }
     const type = stringField(record.type)
     const runId = stringField(record.runId)
-    if (!type || !runId) return []
+    if (!type || !runId) return { updates: [] }
 
     const identity = eventDedupeIdentity(record, sourceIdentity)
-    if (identity && !this.acceptIdentity(identity)) return []
+    if (identity && !this.acceptIdentity(identity)) return { updates: [] }
 
     switch (type) {
       case 'run_start':
-        return this.mapRunStart(record, runId)
+        return { updates: this.mapRunStart(record, runId) }
       case 'run_end':
-        return this.mapRunEnd(record, runId)
+        return { updates: this.mapRunEnd(record, runId) }
       case 'step_start':
       case 'step_update':
       case 'step_end':
-        return this.mapStep(record, runId, type)
+        return { updates: this.mapStep(record, runId, type) }
       case 'inline_subworkflow_start':
-        return this.mapStep({ ...record, stepType: 'workflow', status: 'running' }, runId, 'step_start')
+        return { updates: this.mapStep({ ...record, stepType: 'workflow', status: 'running' }, runId, 'step_start') }
       case 'inline_subworkflow_end':
-        return this.mapStep(
-          { ...record, stepType: 'workflow', status: stringField(record.status) ?? 'completed' },
-          runId,
-          'step_end'
-        )
+        return {
+          updates: this.mapStep(
+            { ...record, stepType: 'workflow', status: stringField(record.status) ?? 'completed' },
+            runId,
+            'step_end'
+          )
+        }
       case 'subworkflow_call_start':
       case 'subworkflow_call_end':
-        return this.mapSubWorkflowCall(record, runId, type)
+        return { updates: this.mapSubWorkflowCall(record, runId, type) }
       case 'child_pi_event':
-        return this.mapChildPiEvent(record, runId, sourceIdentity)
+        return { updates: this.mapChildPiEvent(record, runId, sourceIdentity) }
+      case 'context_usage_update':
+        return this.mapContextUsageUpdate(record, sourceIdentity)
       default:
-        return []
+        return { updates: [] }
     }
   }
 
@@ -298,6 +320,26 @@ export class WorkflowEventMapper {
     return plan ? [plan] : []
   }
 
+  private mapContextUsageUpdate(
+    record: Record<string, unknown>,
+    sourceIdentity?: WorkflowEventSourceIdentity
+  ): { updates: SessionUpdate[]; usageTelemetry?: WorkflowUsageTelemetry } {
+    const usage = piUsageTelemetryFromWorkflowRecord(record)
+    if (!usage) return { updates: [] }
+    const meta = metaFromRecord(record, sourceIdentity)
+    const update = usageUpdateFromPiUsageTelemetry(usage)
+    return {
+      updates: update ? [{ ...update, _meta: { piWorkflow: meta } } as SessionUpdate] : [],
+      usageTelemetry: {
+        sessionId: stringField(record.parentSessionId),
+        contextSessionId: stringField(record.childSessionId),
+        usage,
+        workflow: meta,
+        rawPayload: record
+      }
+    }
+  }
+
   private mapChildPiEvent(
     record: Record<string, unknown>,
     runId: string,
@@ -366,11 +408,12 @@ export class WorkflowEventMapper {
     }
 
     const text = toolResultToPresentationText(result, source)
-    const content = childType === 'tool_execution_end'
-      ? this.toolEndContent(toolCallId, Boolean(event.isError), text, source)
-      : text
-        ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
-        : undefined
+    const content =
+      childType === 'tool_execution_end'
+        ? this.toolEndContent(toolCallId, Boolean(event.isError), text, source)
+        : text
+          ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
+          : undefined
     updates.push({
       sessionUpdate: 'tool_call_update',
       toolCallId,
@@ -413,9 +456,7 @@ export class WorkflowEventMapper {
     text: string,
     source: PresentationSource
   ): ToolCallContent[] | undefined {
-    const textContent = text
-      ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
-      : []
+    const textContent = text ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[]) : []
     if (isError) return textContent.length ? textContent : undefined
 
     const snapshot = this.editSnapshots.get(toolCallId)
@@ -440,7 +481,10 @@ export class WorkflowEventMapper {
             type: 'content',
             content: {
               type: 'text',
-              text: presentationDiagnostic(`structured diff omitted because post-edit file is ${stat.size} bytes`, source)
+              text: presentationDiagnostic(
+                `structured diff omitted because post-edit file is ${stat.size} bytes`,
+                source
+              )
             }
           },
           ...textContent
@@ -610,6 +654,7 @@ export class WorkflowEventMonitor {
   private readonly target: WorkflowEventMonitorTarget | null
   private readonly cwdKey: string
   private readonly onRecord?: (record: Record<string, unknown>, sequence: number) => void
+  private readonly onUsageTelemetry?: (event: WorkflowUsageTelemetry) => void
   private readonly ingestion: WorkflowIngestionSnapshot = {
     recordsObserved: 0,
     newBytesObserved: 0,
@@ -638,6 +683,7 @@ export class WorkflowEventMonitor {
     this.target = options.target ?? null
     this.cwdKey = cwdComparableKey(cwd)
     this.onRecord = options.onRecord
+    this.onUsageTelemetry = options.onUsageTelemetry
   }
 
   start(): void {
@@ -780,7 +826,9 @@ export class WorkflowEventMonitor {
         startOffset: line.startOffset,
         endOffset: line.endOffset
       }
-      for (const update of this.mapper.map(record, sourceIdentity)) this.emit(update)
+      const mapped = this.mapper.mapRecord(record, sourceIdentity)
+      for (const update of mapped.updates) this.emit(update)
+      if (mapped.usageTelemetry) this.onUsageTelemetry?.(mapped.usageTelemetry)
       if (isObject(record) && record.type === 'run_end') tail.ended = true
     }
   }
@@ -813,7 +861,9 @@ export class WorkflowEventMonitor {
     }
     if (!this.shouldEmitTerminalRunJsonFallback(this.terminalRunJsonFallback, now)) return
 
-    for (const update of this.mapper.map(record)) this.emit(update)
+    const mapped = this.mapper.mapRecord(record)
+    for (const update of mapped.updates) this.emit(update)
+    if (mapped.usageTelemetry) this.onUsageTelemetry?.(mapped.usageTelemetry)
     for (const tail of activeTails) tail.ended = true
     this.terminalRunJsonFallback = null
   }
@@ -847,7 +897,9 @@ export class WorkflowEventMonitor {
       status: 'failed',
       error: message
     }
-    for (const update of this.mapper.map(fallbackRecord)) this.emit(update)
+    const mapped = this.mapper.mapRecord(fallbackRecord)
+    for (const update of mapped.updates) this.emit(update)
+    if (mapped.usageTelemetry) this.onUsageTelemetry?.(mapped.usageTelemetry)
     for (const tail of this.tails.values()) tail.ended = true
   }
 
@@ -1142,6 +1194,100 @@ function stringField(value: unknown): string | undefined {
   return typeof value === 'string' && value ? value : undefined
 }
 
+function nonNegativeInt(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined
+}
+
+function positiveInt(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined
+}
+
+function finiteNonNegativeNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+function hasOwnKeys(value: object): boolean {
+  return Object.keys(value).length > 0
+}
+
+function usageTokenDetails(
+  value: Record<string, unknown> | undefined
+): NonNullable<PiUsageTelemetry['lastRequest']> | undefined {
+  if (!value) return undefined
+  const details = {
+    ...(nonNegativeInt(value.totalTokens ?? value.total) !== undefined
+      ? { totalTokens: nonNegativeInt(value.totalTokens ?? value.total)! }
+      : {}),
+    ...(nonNegativeInt(value.inputTokens ?? value.input) !== undefined
+      ? { inputTokens: nonNegativeInt(value.inputTokens ?? value.input)! }
+      : {}),
+    ...(nonNegativeInt(value.outputTokens ?? value.output) !== undefined
+      ? { outputTokens: nonNegativeInt(value.outputTokens ?? value.output)! }
+      : {}),
+    ...(nonNegativeInt(value.reasoningTokens ?? value.thoughtTokens ?? value.thought ?? value.reasoning) !== undefined
+      ? {
+          reasoningTokens: nonNegativeInt(
+            value.reasoningTokens ?? value.thoughtTokens ?? value.thought ?? value.reasoning
+          )!
+        }
+      : {}),
+    ...(nonNegativeInt(value.cachedReadTokens ?? value.cacheRead) !== undefined
+      ? { cachedReadTokens: nonNegativeInt(value.cachedReadTokens ?? value.cacheRead)! }
+      : {}),
+    ...(nonNegativeInt(value.cachedWriteTokens ?? value.cacheWrite) !== undefined
+      ? { cachedWriteTokens: nonNegativeInt(value.cachedWriteTokens ?? value.cacheWrite)! }
+      : {})
+  }
+  return hasOwnKeys(details) ? details : undefined
+}
+
+function piUsageTelemetryFromWorkflowRecord(record: Record<string, unknown>): PiUsageTelemetry | undefined {
+  const rawUsage = isObject(record.usage) ? record.usage : undefined
+  if (!rawUsage) return undefined
+
+  const rawContext = isObject(rawUsage.context) ? rawUsage.context : undefined
+  const rawTotals = isObject(rawUsage.totals) ? rawUsage.totals : undefined
+  const rawLastRequest = isObject(rawUsage.lastRequest) ? rawUsage.lastRequest : undefined
+  const rawCost = isObject(rawUsage.cost) ? rawUsage.cost : undefined
+  const rawModel = isObject(rawUsage.model) ? rawUsage.model : undefined
+  const rawCache = isObject(rawUsage.cache) ? rawUsage.cache : undefined
+  const rawAutoCompaction = isObject(rawUsage.autoCompaction) ? rawUsage.autoCompaction : undefined
+
+  const usedTokens = nonNegativeInt(rawContext?.usedTokens)
+  const maxTokens = positiveInt(rawContext?.maxTokens)
+  const context =
+    usedTokens !== undefined || maxTokens !== undefined
+      ? {
+          ...(usedTokens !== undefined ? { usedTokens } : {}),
+          ...(maxTokens !== undefined ? { maxTokens } : {})
+        }
+      : undefined
+  const totals = usageTokenDetails(rawTotals)
+  const lastRequest = usageTokenDetails(rawLastRequest)
+  const amount = finiteNonNegativeNumber(rawCost?.amount)
+  const currency = stringField(rawCost?.currency) ?? (amount !== undefined ? 'USD' : undefined)
+  const model = {
+    ...(stringField(rawModel?.name) ? { name: stringField(rawModel?.name) } : {}),
+    ...(stringField(rawModel?.provider) ? { provider: stringField(rawModel?.provider) } : {}),
+    ...(stringField(rawModel?.effort) ? { effort: stringField(rawModel?.effort) } : {})
+  }
+  const cache = {
+    ...(stringField(rawCache?.status) ? { status: stringField(rawCache?.status) } : {})
+  }
+  const autoCompactionEnabled = typeof rawAutoCompaction?.enabled === 'boolean' ? rawAutoCompaction.enabled : undefined
+  const usage = {
+    ...(context ? { context } : {}),
+    ...(totals ? { totals } : {}),
+    ...(lastRequest ? { lastRequest } : {}),
+    ...(amount !== undefined && currency ? { cost: { amount, currency } } : {}),
+    ...(hasOwnKeys(model) ? { model } : {}),
+    ...(hasOwnKeys(cache) ? { cache } : {}),
+    ...(autoCompactionEnabled !== undefined ? { autoCompaction: { enabled: autoCompactionEnabled } } : {})
+  } satisfies PiUsageTelemetry
+
+  return hasOwnKeys(usage) ? usage : undefined
+}
+
 function eventDedupeIdentity(
   record: Record<string, unknown>,
   sourceIdentity: WorkflowEventSourceIdentity | undefined
@@ -1327,6 +1473,7 @@ function metaFromRecord(record: Record<string, unknown>, source?: WorkflowEventS
     auditPath: stringField(record.auditPath),
     stepId: stringField(record.stepId),
     childSessionId: stringField(record.childSessionId),
+    childSessionPath: stringField(record.childSessionPath),
     ...(source ? { source } : {})
   }
 }

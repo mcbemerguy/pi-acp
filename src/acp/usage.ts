@@ -249,8 +249,7 @@ export function piUsageTelemetryFromPiSessionStats(stats: unknown, state?: unkno
   return hasKeys(telemetry) ? telemetry : undefined
 }
 
-export function usageUpdateFromPiSessionStats(stats: unknown): SessionUpdate | undefined {
-  const telemetry = piUsageTelemetryFromPiSessionStats(stats)
+export function usageUpdateFromPiUsageTelemetry(telemetry: PiUsageTelemetry | undefined): SessionUpdate | undefined {
   const used = telemetry?.context?.usedTokens
   const size = telemetry?.context?.maxTokens
 
@@ -262,4 +261,8 @@ export function usageUpdateFromPiSessionStats(stats: unknown): SessionUpdate | u
     size,
     ...(telemetry?.cost ? { cost: telemetry.cost } : {})
   }
+}
+
+export function usageUpdateFromPiSessionStats(stats: unknown): SessionUpdate | undefined {
+  return usageUpdateFromPiUsageTelemetry(piUsageTelemetryFromPiSessionStats(stats))
 }

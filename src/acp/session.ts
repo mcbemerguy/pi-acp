@@ -674,7 +674,14 @@ export class PiAcpSession {
     const workflowTarget = parseWorkflowCommandPrompt(t.message)
     this.currentWorkflowMonitor = isWorkflowCommandPrompt(t.message)
       ? new WorkflowEventMonitor(this.cwd, update => this.emit(update), {
-          target: workflowTarget ? { ...workflowTarget, parentSessionId: this.sessionId } : null
+          target: workflowTarget ? { ...workflowTarget, parentSessionId: this.sessionId } : null,
+          onUsageTelemetry: event =>
+            this.emitCustomNotification(PI_USAGE_UPDATE_METHOD, {
+              sessionId: this.sessionId,
+              ...(event.contextSessionId ? { contextSessionId: event.contextSessionId } : {}),
+              ...(event.workflow ? { workflow: event.workflow } : {}),
+              usage: event.usage
+            })
         })
       : null
     this.currentWorkflowMonitor?.start()
