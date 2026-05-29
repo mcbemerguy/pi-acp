@@ -142,6 +142,8 @@ test('WorkflowEventMapper maps workflow context usage records to ACP usage updat
   assert.equal(mapped.updates[0]!.sessionUpdate, 'usage_update')
   assert.equal((mapped.updates[0] as any).used, 12_345)
   assert.equal((mapped.updates[0] as any).size, 200_000)
+  assert.equal((mapped.updates[0] as any)._meta?.piWorkflow?.childSessionId, 'child-session')
+  assert.equal((mapped.updates[0] as any)._meta?.piWorkflow?.stepId, 'code')
   assert.equal(mapped.usageTelemetry?.sessionId, 'parent-session')
   assert.equal(mapped.usageTelemetry?.contextSessionId, 'child-session')
   assert.equal(mapped.usageTelemetry?.workflow.stepId, 'code')
