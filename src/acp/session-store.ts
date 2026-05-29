@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { getPiAcpSessionMapPath } from './paths.js'
 
@@ -45,12 +45,22 @@ export class SessionStore {
 
   get(sessionId: string): StoredSession | null {
     const db = loadFile(this.path)
-    return db.sessions[sessionId] ?? null
+    const entry = db.sessions[sessionId] ?? null
+    if (!entry) return null
+    if (existsSync(entry.sessionFile)) return entry
+
+    delete db.sessions[sessionId]
+    saveFile(this.path, db)
+    return null
   }
 
   list(): StoredSession[] {
     const db = loadFile(this.path)
-    return Object.values(db.sessions)
+    const sessions = Object.values(db.sessions).filter(entry => existsSync(entry.sessionFile))
+    if (sessions.length !== Object.keys(db.sessions).length) {
+      saveFile(this.path, { version: 1, sessions: Object.fromEntries(sessions.map(entry => [entry.sessionId, entry])) })
+    }
+    return sessions
   }
 
   upsert(entry: { sessionId: string; cwd: string; sessionFile: string }): void {

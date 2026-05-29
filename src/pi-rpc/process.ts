@@ -41,6 +41,9 @@ type PiRpcCommand =
   // Compaction
   | { type: 'compact'; id?: string; customInstructions?: string }
   | { type: 'set_auto_compaction'; id?: string; enabled: boolean }
+  // Retry
+  | { type: 'set_auto_retry'; id?: string; enabled: boolean }
+  | { type: 'abort_retry'; id?: string }
   // Session
   | { type: 'get_session_stats'; id?: string }
   | { type: 'set_session_name'; id?: string; name: string }
@@ -388,6 +391,16 @@ export class PiRpcProcess {
   async setAutoCompaction(enabled: boolean): Promise<void> {
     const res = await this.request({ type: 'set_auto_compaction', enabled })
     if (!res.success) throw new Error(`pi set_auto_compaction failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  async setAutoRetry(enabled: boolean): Promise<void> {
+    const res = await this.request({ type: 'set_auto_retry', enabled })
+    if (!res.success) throw new Error(`pi set_auto_retry failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  async abortRetry(): Promise<void> {
+    const res = await this.request({ type: 'abort_retry' })
+    if (!res.success) throw new Error(`pi abort_retry failed: ${res.error ?? JSON.stringify(res.data)}`)
   }
 
   async getSessionStats(): Promise<unknown> {

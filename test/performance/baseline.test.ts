@@ -193,12 +193,11 @@ test('phase 4: ACP session outbound pressure coalesces thought chunks without me
 
 test('phase 4: outbound diagnostics are included in enqueue accounting', async () => {
   const records: PiRpcEvent[] = Array.from({ length: 260 }, (_, sequence) => ({
-    type: 'message_update',
+    type: 'tool_execution_start',
     sequence,
-    assistantMessageEvent: {
-      type: 'toolcall_start',
-      toolCall: { id: `tool-${sequence}`, name: 'read' }
-    }
+    toolCallId: `tool-${sequence}`,
+    toolName: 'read',
+    args: { path: `file-${sequence}.txt` }
   }))
   const conn = new FakeAgentSideConnection()
   let unblock!: () => void

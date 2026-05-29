@@ -34,6 +34,7 @@ const CANCEL_ABORT_TIMEOUT_MS = 3_500
 const CANCEL_DRAIN_TIMEOUT_MS = 2_000
 const USAGE_REFRESH_DEBOUNCE_MS = 150
 const USAGE_REFRESH_MIN_INTERVAL_MS = 250
+const AGENT_END_RETRY_GRACE_MS = 100
 
 type SessionCreateParams = {
   cwd: string
@@ -232,6 +233,8 @@ export class PiAcpSession {
   readonly mcpServers: McpServer[]
 
   private currentAgentMessageId: string | null = null
+  private currentAgentMessageText = ''
+  private currentAgentMessageOpen = false
 
   readonly proc: PiRpcProcess
   private readonly conn: AgentSideConnection
@@ -258,6 +261,8 @@ export class PiAcpSession {
   private completingTurn = false
   private sawAgentActivity = false
   private promptAckFallbackTimer: NodeJS.Timeout | null = null
+  private agentEndFallbackTimer: NodeJS.Timeout | null = null
+  private promptLifecycleActive = false
   private currentWorkflowMonitor: WorkflowEventMonitor | null = null
   private completingWorkflowMonitor: WorkflowEventMonitor | null = null
   private completionReasonOverride: StopReason | null = null
@@ -330,6 +335,7 @@ export class PiAcpSession {
       clearTimeout(this.usageRefreshTimer)
       this.usageRefreshTimer = null
     }
+    this.clearAgentEndFallbackTimer()
     this.drainingCancelledTurn = false
     this.proc.dispose?.()
   }
@@ -665,12 +671,15 @@ export class PiAcpSession {
     this.completingWorkflowMonitor = null
     this.completionReasonOverride = null
     this.sawAgentActivity = false
+    this.promptLifecycleActive = false
     if (this.promptAckFallbackTimer) {
       clearTimeout(this.promptAckFallbackTimer)
       this.promptAckFallbackTimer = null
     }
+    this.clearAgentEndFallbackTimer()
     this.stopCancelledTurnDrain()
-    this.currentAgentMessageId = crypto.randomUUID()
+    this.resetAgentMessageStream()
+    this.beginAgentMessageStream()
     const workflowTarget = parseWorkflowCommandPrompt(t.message)
     this.currentWorkflowMonitor = isWorkflowCommandPrompt(t.message)
       ? new WorkflowEventMonitor(this.cwd, update => this.emit(update), {
@@ -785,11 +794,13 @@ export class PiAcpSession {
 
       this.pendingTurn = null
       this.inAgentLoop = false
+      this.promptLifecycleActive = false
+      this.clearAgentEndFallbackTimer()
       this.completingTurn = false
       this.completingWorkflowMonitor = null
       this.completionReasonOverride = null
       this.sawAgentActivity = false
-      this.currentAgentMessageId = null
+      this.resetAgentMessageStream()
       this.resolveTurnSettledWaiters()
 
       const proceedQueue = (opts.proceedQueue ?? true) && !this.drainingCancelledTurn
@@ -869,10 +880,100 @@ export class PiAcpSession {
     return text ? toolResultToPresentationText({ content: [{ type: 'text', text }] }, source) : ''
   }
 
+  private beginAgentMessageStream(): void {
+    this.currentAgentMessageId = crypto.randomUUID()
+    this.currentAgentMessageText = ''
+    this.currentAgentMessageOpen = true
+  }
+
+  private resetAgentMessageStream(): void {
+    this.currentAgentMessageId = null
+    this.currentAgentMessageText = ''
+    this.currentAgentMessageOpen = false
+  }
+
+  private ensureAgentMessageStream(): void {
+    if (!this.pendingTurn) return
+    if (!this.currentAgentMessageId || !this.currentAgentMessageOpen) this.beginAgentMessageStream()
+  }
+
+  private clearAgentEndFallbackTimer(): void {
+    if (!this.agentEndFallbackTimer) return
+    clearTimeout(this.agentEndFallbackTimer)
+    this.agentEndFallbackTimer = null
+  }
+
+  private scheduleAgentEndFallbackCompletion(): void {
+    this.clearAgentEndFallbackTimer()
+    this.agentEndFallbackTimer = setTimeout(() => {
+      this.agentEndFallbackTimer = null
+      this.finishAgentEnd()
+    }, AGENT_END_RETRY_GRACE_MS)
+  }
+
+  private finishAgentEnd(): void {
+    const wasDrainingCancelledTurn = this.drainingCancelledTurn
+    this.completeTurn(this.cancelRequested ? 'cancelled' : 'end_turn')
+    if (wasDrainingCancelledTurn) this.stopCancelledTurnDrain()
+  }
+
+  private reconcileAssistantMessageEnd(message: unknown): void {
+    const finalText = extractAssistantText(message)
+    if (!finalText || isRetryableAssistantError(message)) return
+
+    const streamedText = this.currentAgentMessageText
+    if (streamedText === finalText) return
+    if (streamedText && !finalText.startsWith(streamedText)) return
+
+    const missingText = streamedText ? finalText.slice(streamedText.length) : finalText
+    if (!missingText) return
+
+    this.emit({
+      sessionUpdate: 'agent_message_chunk',
+      ...(this.currentAgentMessageId ? { messageId: this.currentAgentMessageId } : {}),
+      content: { type: 'text', text: missingText } satisfies ContentBlock
+    })
+    this.currentAgentMessageText = finalText
+  }
+
+  private completePromptLifecycle(ev: PiRpcEvent): void {
+    this.clearAgentEndFallbackTimer()
+    const stopReason = String((ev as any).stopReason ?? '')
+    const success = (ev as any).success
+
+    if (this.cancelRequested || stopReason === 'cancelled') {
+      const wasDrainingCancelledTurn = this.drainingCancelledTurn
+      this.completeTurn('cancelled')
+      if (wasDrainingCancelledTurn) this.stopCancelledTurnDrain()
+      return
+    }
+
+    if (success === false || stopReason === 'error') {
+      const message = typeof (ev as any).error === 'string' ? (ev as any).error : 'Pi prompt failed.'
+      this.completeTurn('error', { reject: RequestError.internalError({}, message), proceedQueue: false })
+      return
+    }
+
+    this.finishAgentEnd()
+  }
+
   private handlePiEvent(ev: PiRpcEvent) {
     const type = String((ev as any).type ?? '')
 
     switch (type) {
+      case 'prompt_start': {
+        this.promptLifecycleActive = true
+        this.sawAgentActivity = true
+        this.clearAgentEndFallbackTimer()
+        break
+      }
+
+      case 'prompt_end': {
+        this.promptLifecycleActive = true
+        this.completePromptLifecycle(ev)
+        break
+      }
+
       case 'extension_ui_request': {
         this.handleExtensionUiRequest(ev)
         break
@@ -884,6 +985,8 @@ export class PiAcpSession {
 
         // Stream assistant text.
         if (ame?.type === 'text_delta' && typeof ame.delta === 'string') {
+          this.ensureAgentMessageStream()
+          this.currentAgentMessageText += ame.delta
           this.emit({
             sessionUpdate: 'agent_message_chunk',
             ...(this.currentAgentMessageId ? { messageId: this.currentAgentMessageId } : {}),
@@ -913,9 +1016,22 @@ export class PiAcpSession {
         break
       }
 
+      case 'message_start': {
+        const role = String((ev as any).message?.role ?? '')
+        if (role === 'assistant' && this.pendingTurn) this.beginAgentMessageStream()
+        break
+      }
+
       case 'message_end': {
         const role = String((ev as any).message?.role ?? '')
-        if (role === 'assistant' || role === 'toolResult') this.scheduleUsageRefresh()
+        if (role === 'assistant') {
+          this.reconcileAssistantMessageEnd((ev as any).message)
+          this.currentAgentMessageOpen = false
+          this.currentAgentMessageText = ''
+          this.scheduleUsageRefresh()
+        } else if (role === 'toolResult') {
+          this.scheduleUsageRefresh()
+        }
         break
       }
 
@@ -1075,6 +1191,8 @@ export class PiAcpSession {
       }
 
       case 'auto_retry_start': {
+        this.clearAgentEndFallbackTimer()
+        this.resetAgentMessageStream()
         this.emit({
           sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: formatAutoRetryMessage(ev) } satisfies ContentBlock
@@ -1115,7 +1233,9 @@ export class PiAcpSession {
 
       case 'agent_start': {
         this.sawAgentActivity = true
+        if (this.inAgentLoop) this.resetAgentMessageStream()
         this.inAgentLoop = true
+        this.clearAgentEndFallbackTimer()
         break
       }
 
@@ -1126,9 +1246,16 @@ export class PiAcpSession {
       }
 
       case 'agent_end': {
-        const wasDrainingCancelledTurn = this.drainingCancelledTurn
-        this.completeTurn(this.cancelRequested ? 'cancelled' : 'end_turn')
-        if (wasDrainingCancelledTurn) this.stopCancelledTurnDrain()
+        if (this.promptLifecycleActive) break
+        if ((ev as any).willRetry === true) {
+          this.clearAgentEndFallbackTimer()
+          break
+        }
+        if ((ev as any).willRetry === false) {
+          this.finishAgentEnd()
+          break
+        }
+        this.scheduleAgentEndFallbackCompletion()
         break
       }
 
@@ -1196,6 +1323,27 @@ function replacePendingUsageNotification(previous: OutboundQueueItem, next: Outb
 
 function stableUsageKey(value: unknown): string {
   return JSON.stringify(value) ?? ''
+}
+
+function extractAssistantText(message: unknown): string {
+  const content = (message as { content?: unknown })?.content
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+
+  return content
+    .map(part => {
+      if (typeof part === 'string') return part
+      if ((part as { type?: unknown }).type === 'text' && typeof (part as { text?: unknown }).text === 'string') {
+        return (part as { text: string }).text
+      }
+      return ''
+    })
+    .join('')
+}
+
+function isRetryableAssistantError(message: unknown): boolean {
+  const msg = message as { stopReason?: unknown; errorMessage?: unknown }
+  return msg.stopReason === 'error' && typeof msg.errorMessage === 'string' && msg.errorMessage.length > 0
 }
 
 function shouldRespondToExtensionUiRequest(method: string): boolean {

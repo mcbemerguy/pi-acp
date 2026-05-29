@@ -801,9 +801,181 @@ test('PiAcpSession: prompt resolves end_turn on agent_end, not prompt ack', asyn
 
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'turn_end' })
-  proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_end', willRetry: false })
   const reason = await p
   assert.equal(reason, 'end_turn')
+})
+
+test('PiAcpSession: ignores retryable agent_end and resolves on final agent_end', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  proc.emit({ type: 'agent_start' })
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'timeout' }
+  })
+  proc.emit({ type: 'agent_end', willRetry: true })
+  await wait(150)
+  assert.equal(resolved, false)
+
+  proc.emit({ type: 'auto_retry_start', attempt: 2, maxAttempts: 3, delayMs: 1 })
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'done' }] } })
+  proc.emit({ type: 'agent_end', willRetry: false })
+
+  const reason = await p
+  assert.equal(reason, 'end_turn')
+})
+
+test('PiAcpSession: cancels legacy agent_end fallback when auto_retry_start arrives', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'auto_retry_start', attempt: 2, maxAttempts: 3, delayMs: 1 })
+  await wait(150)
+  assert.equal(resolved, false)
+
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end', willRetry: false })
+
+  const reason = await p
+  assert.equal(reason, 'end_turn')
+})
+
+test('PiAcpSession: waits for prompt_end when prompt lifecycle events are available', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  proc.emit({ type: 'prompt_start' })
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end', willRetry: false })
+  await wait(150)
+  assert.equal(resolved, false)
+
+  proc.emit({ type: 'prompt_end', success: true, stopReason: 'end_turn' })
+
+  const reason = await p
+  assert.equal(reason, 'end_turn')
+})
+
+test('PiAcpSession: emits missing assistant text from finalized message_end', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const p = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'message_start', message: { role: 'assistant' } })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'hello ' } })
+  proc.emit({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'hello world' }] } })
+  proc.emit({ type: 'agent_end', willRetry: false })
+
+  const reason = await p
+  assert.equal(reason, 'end_turn')
+  const text = conn.updates
+    .map(entry => entry.update)
+    .filter((update: any) => update.sessionUpdate === 'agent_message_chunk' && update.content?.type === 'text')
+    .map((update: any) => update.content.text)
+    .join('')
+  assert.equal(text, 'hello world')
+})
+
+test('PiAcpSession: starts a new ACP message stream after retry', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const p = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'message_start', message: { role: 'assistant' } })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'first' } })
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'timeout' }
+  })
+  proc.emit({ type: 'agent_end', willRetry: true })
+  proc.emit({ type: 'auto_retry_start', attempt: 2, maxAttempts: 3, delayMs: 1 })
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'message_start', message: { role: 'assistant' } })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'second' } })
+  proc.emit({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'second' }] } })
+  proc.emit({ type: 'agent_end', willRetry: false })
+
+  await p
+  const chunks = conn.updates
+    .map(entry => entry.update as any)
+    .filter(
+      update => update.sessionUpdate === 'agent_message_chunk' && ['first', 'second'].includes(update.content?.text)
+    )
+
+  assert.equal(chunks.length, 2)
+  assert.match(chunks[0]!.messageId, /^[0-9a-f-]{36}$/)
+  assert.match(chunks[1]!.messageId, /^[0-9a-f-]{36}$/)
+  assert.notEqual(chunks[0]!.messageId, chunks[1]!.messageId)
 })
 
 test('PiAcpSession: prompt rejects and surfaces message when pi prompt fails', async () => {
