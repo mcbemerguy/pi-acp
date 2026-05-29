@@ -82,6 +82,7 @@ type SpawnParams = {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 const PROMPT_REQUEST_TIMEOUT_MS = 0
+export const COMPACT_REQUEST_TIMEOUT_MS = 0
 const ABORT_REQUEST_TIMEOUT_MS = 3_000
 const DIAGNOSTIC_TAIL_MAX_CHARS = 4_000
 const DIAGNOSTIC_TAIL_MAX_LINES = 40
@@ -383,7 +384,7 @@ export class PiRpcProcess {
   }
 
   async compact(customInstructions?: string): Promise<unknown> {
-    const res = await this.request({ type: 'compact', customInstructions })
+    const res = await this.request({ type: 'compact', customInstructions }, COMPACT_REQUEST_TIMEOUT_MS)
     if (!res.success) throw new Error(`pi compact failed: ${res.error ?? JSON.stringify(res.data)}`)
     return res.data
   }

@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { RequestError } from '@agentclientprotocol/sdk'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
@@ -27,6 +28,32 @@ test('PiAcpAgent: /steering is handled adapter-side', async () => {
   assert.equal(proc.prompts.length, 0)
   const last = conn.updates.at(-1)
   assert.match((last as any).update.content.text, /Steering mode: one-at-a-time/)
+})
+
+test('PiAcpAgent: /compact surfaces pi compact failures in the JSON-RPC error message', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess() as any
+  proc.compact = async () => {
+    throw new Error('pi compact failed: Already compacted')
+  }
+
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).sessions = new FakeSessions({ sessionId: 's1', proc, fileCommands: [] }) as any
+
+  await assert.rejects(
+    () =>
+      agent.prompt({
+        sessionId: 's1',
+        prompt: [{ type: 'text', text: '/compact' }]
+      } as any),
+    (error: unknown) => {
+      assert.ok(error instanceof RequestError)
+      assert.equal(error.code, -32603)
+      assert.match(error.message, /Already compacted/)
+      assert.match(String((error.data as any)?.details), /Already compacted/)
+      return true
+    }
+  )
 })
 
 test('PiAcpAgent: /name sets session display name adapter-side', async () => {

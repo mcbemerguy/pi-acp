@@ -172,6 +172,11 @@ function shouldReplayLoadSessionHistory(params: InitializeRequest): boolean {
   return clientName !== 't3-code' && clientName !== 't3code'
 }
 
+function compactError(error: unknown): RequestError {
+  const message = error instanceof Error ? error.message : String(error)
+  return RequestError.internalError({ details: message }, message)
+}
+
 export class PiAcpAgent implements ACPAgent {
   private readonly conn: AgentSideConnection
   private readonly sessions = new SessionManager()
@@ -417,7 +422,12 @@ export class PiAcpAgent implements ACPAgent {
 
       if (cmd === 'compact') {
         const customInstructions = args.join(' ').trim() || undefined
-        const res = await session.proc.compact(customInstructions)
+        let res: unknown
+        try {
+          res = await session.proc.compact(customInstructions)
+        } catch (error) {
+          throw compactError(error)
+        }
 
         const r: any = res && typeof res === 'object' ? (res as any) : null
         const tokensBefore = typeof r?.tokensBefore === 'number' ? r.tokensBefore : null
