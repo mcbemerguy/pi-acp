@@ -177,7 +177,7 @@ If this cannot be smoke-tested manually, the unverified boundary is the browser 
 
 For detached Pi `/workflow:*` runs, `pi-acp` is a presenter/control bridge rather than the source of truth. Pi workflow artifacts remain authoritative: `run.json` stores the state machine, `events.jsonl` is the replayable event stream, child session artifacts prove final handoffs, and `audit.md` is the human-readable recovery record. Recovery does not depend on inserting workflow progress into model-visible context.
 
-On ACP `session/load`, the adapter uses the persisted session mapping and the loaded session cwd/id to discover recoverable workflow runs. It replays standard ACP `session/update` presentation from the last known workflow sequence when a richer client provides one, then tails live `events.jsonl` records. If a terminal `run_end` event was missed, the replay path can synthesize terminal presentation from terminal `run.json` state.
+On ACP `session/load`, the adapter uses the persisted session mapping and the loaded session cwd/id to discover recoverable workflow runs. Current `session/load` attaches those runs with a full standard ACP `session/update` replay, then tails live `events.jsonl` records. Pi-aware clients that store a workflow cursor, such as T3Code, suppress duplicate presentation with their saved last observed `sequence`; clients that need incremental event fetches can call `_pi/workflows/events` with `sinceSequence`. If a terminal `run_end` event was missed, the replay path can synthesize terminal presentation from terminal `run.json` state.
 
 The adapter advertises Pi workflow support under `_meta.piAcp` and supports these additive custom methods for clients that opt in:
 
@@ -188,7 +188,7 @@ The adapter advertises Pi workflow support under `_meta.piAcp` and supports thes
 - `_pi/workflows/pause`
 - `_pi/workflows/abort`
 
-Generic ACP clients can ignore those methods and still receive replayed standard updates plus audit/run links. They may not have UI affordances to pause, resume, or abort a workflow; the run remains recoverable from Pi artifacts or from a Pi-aware client. Ambiguous side-effecting child steps pause/interrupt instead of being automatically rerun. Use the end-to-end checklist at `/home/marcosb/.pi/agent/extensions/workflows/scripts/recovery-smoke.md` to validate T3Code UI reload, T3Code server restart, adapter restart, parent `pi --mode rpc` restart with `session/load`, child crashes before/after handoff, and interrupt/resume/abort behavior.
+Generic ACP clients can ignore those methods and still receive replayed standard updates plus audit/run links. They may not have UI affordances to pause, resume, or abort a workflow; the run remains recoverable from Pi artifacts or from a Pi-aware client. `_pi/workflows/pause` and `_pi/workflows/abort` update `run.json` and append control events. `_pi/workflows/resume` records a resume request/policy and transitions the run to `recovering`, but the adapter does not act as a background workflow executor; actual step continuation requires the Pi workflow engine resume/recovery path to be invoked for the run. Ambiguous side-effecting child steps pause/interrupt instead of being automatically rerun. Use the end-to-end checklist at `/home/marcosb/.pi/agent/extensions/workflows/scripts/recovery-smoke.md` to validate T3Code UI reload, T3Code server restart, adapter restart, parent `pi --mode rpc` restart with `session/load`, child crashes before/after handoff, and interrupt/resume/abort behavior.
 
 ### Slash commands
 
