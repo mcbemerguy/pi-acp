@@ -38,6 +38,23 @@ import { maybeAuthRequiredError } from './auth-required.js'
 import { PI_EXTENSION_UI_EVENT_METHOD } from './extension-ui.js'
 import { PI_USAGE_UPDATE_METHOD, usageFromPiSessionStats } from './usage.js'
 import {
+  PI_WORKFLOW_METHODS,
+  PI_WORKFLOWS_ABORT_METHOD,
+  PI_WORKFLOWS_EVENTS_METHOD,
+  PI_WORKFLOWS_GET_METHOD,
+  PI_WORKFLOWS_LIST_METHOD,
+  PI_WORKFLOWS_PAUSE_METHOD,
+  PI_WORKFLOWS_RESUME_METHOD,
+  abortWorkflowRun,
+  listRecoverableWorkflowRunsForSession,
+  listWorkflowRuns,
+  pauseWorkflowRun,
+  readWorkflowRun,
+  readWorkflowRunEvents,
+  resumeWorkflowRun,
+  type WorkflowRunStatus
+} from './workflows.js'
+import {
   getSessionConfigOptions,
   isThinkingLevel,
   MODEL_CONFIG_ID,
@@ -275,7 +292,10 @@ export class PiAcpAgent implements ACPAgent {
             usageTelemetryMethod: PI_USAGE_UPDATE_METHOD,
             steering: true,
             steeringMethod: PI_STEER_METHOD,
-            steeringModes: ['steer', 'follow_up']
+            steeringModes: ['steer', 'follow_up'],
+            workflows: true,
+            workflowMethods: PI_WORKFLOW_METHODS,
+            workflowEventsMethod: PI_WORKFLOWS_EVENTS_METHOD
           }
         }
       }
@@ -889,16 +909,67 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
-    if (method !== PI_STEER_METHOD) throw RequestError.methodNotFound(method)
+    if (method === PI_STEER_METHOD) {
+      const steerParams = this.parsePiSteerParams(params)
+      const session = this.sessions.get(steerParams.sessionId)
+      const { message, images } = promptToPiMessage(steerParams.prompt)
 
-    const steerParams = this.parsePiSteerParams(params)
-    const session = this.sessions.get(steerParams.sessionId)
-    const { message, images } = promptToPiMessage(steerParams.prompt)
+      if (steerParams.mode === 'steer') await session.proc.steer(message, images)
+      else await session.proc.followUp(message, images)
 
-    if (steerParams.mode === 'steer') await session.proc.steer(message, images)
-    else await session.proc.followUp(message, images)
+      return { accepted: true, mode: steerParams.mode }
+    }
 
-    return { accepted: true, mode: steerParams.mode }
+    if (PI_WORKFLOW_METHODS.includes(method as (typeof PI_WORKFLOW_METHODS)[number])) {
+      return this.handleWorkflowMethod(method, params)
+    }
+
+    throw RequestError.methodNotFound(method)
+  }
+
+  private handleWorkflowMethod(method: string, params: Record<string, unknown>): Record<string, unknown> {
+    try {
+      switch (method) {
+        case PI_WORKFLOWS_LIST_METHOD: {
+          const session = typeof params.sessionId === 'string' ? this.sessions.maybeGet(params.sessionId) : undefined
+          const status = parseWorkflowStatusFilter(params.status)
+          const runs = listWorkflowRuns({
+            cwd: stringParam(params.cwd) ?? session?.cwd ?? this.lastSessionCwd ?? undefined,
+            parentSessionId: stringParam(params.parentSessionId) ?? session?.sessionId,
+            status,
+            limit: numberParam(params.limit)
+          })
+          return { runs }
+        }
+        case PI_WORKFLOWS_GET_METHOD:
+          return { run: readWorkflowRun(workflowTargetParam(params)) }
+        case PI_WORKFLOWS_EVENTS_METHOD:
+          return {
+            ...readWorkflowRunEvents(workflowTargetParam(params), {
+              sinceSequence: numberParam(params.sinceSequence),
+              offset: numberParam(params.offset),
+              limit: numberParam(params.limit),
+              includeTerminalFallback: params.includeTerminalFallback !== false
+            })
+          }
+        case PI_WORKFLOWS_PAUSE_METHOD:
+          return { run: pauseWorkflowRun(workflowTargetParam(params), { reason: stringParam(params.reason) }) }
+        case PI_WORKFLOWS_RESUME_METHOD:
+          return {
+            run: resumeWorkflowRun(workflowTargetParam(params), {
+              reason: stringParam(params.reason),
+              policy: parseWorkflowResumePolicy(params.policy)
+            })
+          }
+        case PI_WORKFLOWS_ABORT_METHOD:
+          return { run: abortWorkflowRun(workflowTargetParam(params), { reason: stringParam(params.reason) }) }
+        default:
+          throw RequestError.methodNotFound(method)
+      }
+    } catch (error) {
+      if (error instanceof RequestError) throw error
+      throw compactError(error)
+    }
   }
 
   private parsePiSteerParams(params: Record<string, unknown>): PiSteerParams {
@@ -1104,6 +1175,12 @@ export class PiAcpAgent implements ACPAgent {
       }
     }
 
+    const recoverableWorkflowRuns = listRecoverableWorkflowRunsForSession({
+      cwd: params.cwd,
+      parentSessionId: params.sessionId
+    })
+    for (const run of recoverableWorkflowRuns) await session.attachWorkflowRun(run, 0)
+
     const configOptions = await getSessionConfigOptions(proc)
 
     const response = {
@@ -1178,6 +1255,32 @@ export class PiAcpAgent implements ACPAgent {
 
     return {}
   }
+}
+
+function workflowTargetParam(params: Record<string, unknown>): string {
+  const target = stringParam(params.runId) ?? stringParam(params.runDir)
+  if (!target) throw RequestError.invalidParams({}, 'runId or runDir must be a non-empty string')
+  return target
+}
+
+function stringParam(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+function numberParam(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+function parseWorkflowStatusFilter(value: unknown): WorkflowRunStatus | WorkflowRunStatus[] | undefined {
+  if (typeof value === 'string' && value.trim()) return value.trim() as WorkflowRunStatus
+  if (Array.isArray(value)) return value.filter(item => typeof item === 'string' && item.trim()) as WorkflowRunStatus[]
+  return undefined
+}
+
+function parseWorkflowResumePolicy(value: unknown): 'continue-existing-session' | 'redo-step' | 'manual' | undefined {
+  if (value === undefined || value === null) return undefined
+  if (value === 'continue-existing-session' || value === 'redo-step' || value === 'manual') return value
+  throw RequestError.invalidParams({}, 'policy must be "continue-existing-session", "redo-step", or "manual"')
 }
 
 function readNearestPackageJson(metaUrl: string): {

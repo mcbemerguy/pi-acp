@@ -744,6 +744,170 @@ test('WorkflowEventMapper includes structured diffs for nested edit tool complet
   rmSync(root, { recursive: true, force: true })
 })
 
+test('WorkflowEventMonitor attaches to a known active run and replays before tailing live events', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-attach-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  const runDir = join(workflowRunsDir, 'known')
+  mkdirSync(runDir, { recursive: true })
+  const eventsPath = join(runDir, 'events.jsonl')
+  writeFileSync(
+    eventsPath,
+    `${JSON.stringify({ type: 'run_start', sequence: 1, timestamp: 't1', runId: 'known', workflowId: 'wf', cwd: '/repo', status: 'running' })}\n${JSON.stringify({ type: 'step_start', sequence: 2, timestamp: 't2', runId: 'known', workflowId: 'wf', stepId: 'code', stepType: 'agent', status: 'running' })}\n`,
+    'utf8'
+  )
+  const updates: any[] = []
+  const observed: string[] = []
+  const monitor = new WorkflowEventMonitor('/repo', update => updates.push(update), {
+    workflowRunsDir,
+    pollIntervalMs: 5,
+    graceMs: 20,
+    attach: { runId: 'known', runDir, sinceSequence: 0 },
+    onRecord: record => observed.push(String(record.type))
+  })
+
+  try {
+    monitor.start()
+    await waitUntil(() => updates.some(update => update.sessionUpdate === 'plan'))
+    appendFileSync(
+      eventsPath,
+      `${JSON.stringify({ type: 'run_end', sequence: 3, timestamp: 't3', runId: 'known', workflowId: 'wf', status: 'completed' })}\n`,
+      'utf8'
+    )
+    await monitor.waitForRunEndAfterPromptResolution()
+
+    assert.deepEqual(observed, ['run_start', 'step_start', 'run_end'])
+    assert.deepEqual(
+      updates.filter(update => update.sessionUpdate === 'tool_call').map(update => update.toolCallId),
+      ['workflow:known']
+    )
+    assert.ok(
+      updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:known')
+    )
+  } finally {
+    monitor.dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('WorkflowEventMonitor replays only records after the known workflow sequence', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-sequence-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  const runDir = join(workflowRunsDir, 'known-sequence')
+  mkdirSync(runDir, { recursive: true })
+  const eventsPath = join(runDir, 'events.jsonl')
+  writeFileSync(
+    eventsPath,
+    [
+      { type: 'run_start', sequence: 1, timestamp: 't1', runId: 'known-sequence', workflowId: 'wf', status: 'running' },
+      {
+        type: 'child_pi_event',
+        sequence: 2,
+        timestamp: 't2',
+        runId: 'known-sequence',
+        workflowId: 'wf',
+        stepId: 'code',
+        childSessionId: 'child',
+        childEventType: 'message_update',
+        event: {
+          type: 'message_update',
+          messageId: 'old',
+          assistantMessageEvent: { type: 'text_delta', delta: 'old', partial: { id: 'old' } }
+        }
+      },
+      {
+        type: 'child_pi_event',
+        sequence: 3,
+        timestamp: 't3',
+        runId: 'known-sequence',
+        workflowId: 'wf',
+        stepId: 'code',
+        childSessionId: 'child',
+        childEventType: 'message_update',
+        event: {
+          type: 'message_update',
+          messageId: 'new',
+          assistantMessageEvent: { type: 'text_delta', delta: 'new', partial: { id: 'new' } }
+        }
+      }
+    ]
+      .map(record => JSON.stringify(record))
+      .join('\n') + '\n',
+    'utf8'
+  )
+  const updates: any[] = []
+  const monitor = new WorkflowEventMonitor('/repo', update => updates.push(update), {
+    workflowRunsDir,
+    pollIntervalMs: 5,
+    graceMs: 20,
+    attach: { runId: 'known-sequence', runDir, sinceSequence: 2 }
+  })
+
+  try {
+    monitor.start()
+    await waitUntil(() => updates.some(update => update.sessionUpdate === 'agent_message_chunk'))
+    appendFileSync(
+      eventsPath,
+      `${JSON.stringify({ type: 'run_end', sequence: 4, timestamp: 't4', runId: 'known-sequence', workflowId: 'wf', status: 'completed' })}\n`,
+      'utf8'
+    )
+    await monitor.waitForRunEndAfterPromptResolution()
+
+    assert.deepEqual(
+      updates
+        .filter(update => update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text')
+        .map(update => update.content.text),
+      ['new', 'Workflow wf completed.']
+    )
+  } finally {
+    monitor.dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('WorkflowEventMonitor attached replay emits terminal run.json fallback when run_end is missing', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-attach-terminal-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  const runDir = join(workflowRunsDir, 'terminal')
+  mkdirSync(runDir, { recursive: true })
+  writeFileSync(
+    join(runDir, 'events.jsonl'),
+    `${JSON.stringify({ type: 'run_start', sequence: 1, timestamp: 't1', runId: 'terminal', workflowId: 'wf', cwd: '/repo', status: 'running' })}\n`,
+    'utf8'
+  )
+  writeFileSync(
+    join(runDir, 'run.json'),
+    JSON.stringify({
+      id: 'terminal',
+      workflowId: 'wf',
+      cwd: '/repo',
+      runDir,
+      status: 'completed',
+      endedAt: '2026-05-30T00:00:00.000Z'
+    }),
+    'utf8'
+  )
+  const updates: any[] = []
+  const monitor = new WorkflowEventMonitor('/repo', update => updates.push(update), {
+    workflowRunsDir,
+    pollIntervalMs: 5,
+    graceMs: 20,
+    attach: { runId: 'terminal', runDir, sinceSequence: 0 }
+  })
+
+  try {
+    monitor.start()
+    await waitUntil(() => updates.some(update => update.sessionUpdate === 'tool_call_update'))
+    const finalUpdate = updates.find(
+      update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:terminal'
+    )
+    assert.equal(finalUpdate?.status, 'completed')
+    assert.equal(finalUpdate?.rawOutput?.status, 'completed')
+  } finally {
+    monitor.dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('WorkflowEventMonitor tails explicitly linked subworkflow run artifacts', async () => {
   const root = join(tmpdir(), `pi-acp-workflow-linked-${process.pid}-${Date.now()}`)
   const workflowRunsDir = join(root, 'workflow-runs')

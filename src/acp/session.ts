@@ -22,6 +22,7 @@ import {
 import { toToolCallLocations, toToolKind } from './translate/tool-metadata.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import { isWorkflowCommandPrompt, parseWorkflowCommandPrompt, WorkflowEventMonitor } from './workflow-events.js'
+import { PI_WORKFLOWS_EVENTS_METHOD, type WorkflowRunRecord } from './workflows.js'
 import {
   handleExtensionUiRequest,
   isDialogExtensionUiMethod,
@@ -265,6 +266,7 @@ export class PiAcpSession {
   private promptLifecycleActive = false
   private currentWorkflowMonitor: WorkflowEventMonitor | null = null
   private completingWorkflowMonitor: WorkflowEventMonitor | null = null
+  private readonly attachedWorkflowMonitors = new Map<string, WorkflowEventMonitor>()
   private completionReasonOverride: StopReason | null = null
   private drainingCancelledTurn = false
   private cancelDrainTimer: NodeJS.Timeout | null = null
@@ -327,6 +329,8 @@ export class PiAcpSession {
     this.currentWorkflowMonitor = null
     this.completingWorkflowMonitor?.dispose()
     this.completingWorkflowMonitor = null
+    for (const monitor of this.attachedWorkflowMonitors.values()) monitor.dispose()
+    this.attachedWorkflowMonitors.clear()
     if (this.cancelDrainTimer) {
       clearTimeout(this.cancelDrainTimer)
       this.cancelDrainTimer = null
@@ -607,6 +611,34 @@ export class PiAcpSession {
     this.enqueueOutbound({ kind: 'extNotification', method, params })
   }
 
+  private emitWorkflowEventNotification(record: Record<string, unknown>, observedSequence: number): void {
+    this.emitCustomNotification(PI_WORKFLOWS_EVENTS_METHOD, {
+      sessionId: this.sessionId,
+      runId: typeof record.runId === 'string' ? record.runId : undefined,
+      sequence: typeof record.sequence === 'number' ? record.sequence : observedSequence,
+      event: record
+    })
+  }
+
+  async attachWorkflowRun(run: Pick<WorkflowRunRecord, 'id' | 'runDir'>, sinceSequence = 0): Promise<void> {
+    const existing = this.attachedWorkflowMonitors.get(run.id)
+    existing?.dispose()
+    const monitor = new WorkflowEventMonitor(this.cwd, update => this.emit(update), {
+      attach: { runId: run.id, runDir: run.runDir, sinceSequence },
+      onRecord: (record, sequence) => this.emitWorkflowEventNotification(record, sequence),
+      onUsageTelemetry: event =>
+        this.emitCustomNotification(PI_USAGE_UPDATE_METHOD, {
+          sessionId: this.sessionId,
+          ...(event.contextSessionId ? { contextSessionId: event.contextSessionId } : {}),
+          ...(event.workflow ? { workflow: event.workflow } : {}),
+          usage: event.usage
+        })
+    })
+    this.attachedWorkflowMonitors.set(run.id, monitor)
+    monitor.start()
+    await this.flushEmits()
+  }
+
   private async flushEmits(): Promise<void> {
     if (this.currentOutboundPending() === 0) return
     await new Promise<void>(resolve => this.outboundDrainWaiters.push(resolve))
@@ -684,6 +716,7 @@ export class PiAcpSession {
     this.currentWorkflowMonitor = isWorkflowCommandPrompt(t.message)
       ? new WorkflowEventMonitor(this.cwd, update => this.emit(update), {
           target: workflowTarget ? { ...workflowTarget, parentSessionId: this.sessionId } : null,
+          onRecord: (record, sequence) => this.emitWorkflowEventNotification(record, sequence),
           onUsageTelemetry: event =>
             this.emitCustomNotification(PI_USAGE_UPDATE_METHOD, {
               sessionId: this.sessionId,

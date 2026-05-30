@@ -189,6 +189,171 @@ test('PiAcpAgent: listSessions lists pi sessions and loadSession replays history
   }
 })
 
+test('PiAcpAgent: loadSession replays and reattaches recoverable workflow runs', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-workflow-load-'))
+  const sessionsDir = join(root, 'sessions', '--tmp--project--')
+  const sessionFile = join(sessionsDir, '0000_workflow-session.jsonl')
+  const runDir = join(root, 'workflow-runs', 'wf-run')
+  mkdirSync(sessionsDir, { recursive: true })
+  mkdirSync(runDir, { recursive: true })
+  writeFileSync(
+    sessionFile,
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'workflow-session',
+      timestamp: '2026-02-11T00:00:00.000Z',
+      cwd: '/tmp/project'
+    }) + '\n',
+    'utf8'
+  )
+  writeFileSync(
+    join(runDir, 'run.json'),
+    JSON.stringify({
+      id: 'wf-run',
+      workflowId: 'review',
+      cwd: '/tmp/project',
+      parentSessionId: 'workflow-session',
+      runDir,
+      status: 'running',
+      startedAt: '2026-02-11T00:00:01.000Z'
+    }),
+    'utf8'
+  )
+  writeFileSync(
+    join(runDir, 'events.jsonl'),
+    [
+      {
+        type: 'run_start',
+        sequence: 1,
+        timestamp: 't1',
+        runId: 'wf-run',
+        workflowId: 'review',
+        cwd: '/tmp/project',
+        status: 'running'
+      },
+      {
+        type: 'step_start',
+        sequence: 2,
+        timestamp: 't2',
+        runId: 'wf-run',
+        workflowId: 'review',
+        stepId: 'code',
+        stepType: 'agent',
+        status: 'running'
+      }
+    ]
+      .map(record => JSON.stringify(record))
+      .join('\n') + '\n',
+    'utf8'
+  )
+
+  const oldEnv = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = root
+  const originalSpawn = PiRpcProcess.spawn
+
+  try {
+    ;(PiRpcProcess as any).spawn = async () =>
+      ({
+        onEvent: () => () => {},
+        getMessages: async () => ({ messages: [] }),
+        getState: async () => ({ sessionId: 'workflow-session', sessionFile }),
+        getAvailableModels: async () => ({ models: [] })
+      }) as any
+
+    const conn = new FakeAgentSideConnection()
+    const agent = new PiAcpAgent(asAgentConn(conn))
+    await agent.loadSession({ sessionId: 'workflow-session', cwd: '/tmp/project', mcpServers: [], _meta: null } as any)
+
+    const updates = conn.updates.map(item => item.update as any)
+    assert.deepEqual(
+      updates.filter(update => update.sessionUpdate === 'tool_call').map(update => update.toolCallId),
+      ['workflow:wf-run']
+    )
+    assert.equal(updates.filter(update => update.sessionUpdate === 'plan').length, 1)
+    assert.ok(
+      conn.extNotifications.some(item => item.method === '_pi/workflows/events' && item.params.runId === 'wf-run')
+    )
+  } finally {
+    PiRpcProcess.spawn = originalSpawn
+    if (oldEnv === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = oldEnv
+  }
+})
+
+test('PiAcpAgent: loadSession replays terminal workflow fallback without duplicate run_end updates', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-workflow-load-terminal-'))
+  const sessionsDir = join(root, 'sessions', '--tmp--project--')
+  const sessionFile = join(sessionsDir, '0000_workflow-terminal-session.jsonl')
+  const runDir = join(root, 'workflow-runs', 'wf-terminal')
+  mkdirSync(sessionsDir, { recursive: true })
+  mkdirSync(runDir, { recursive: true })
+  writeFileSync(
+    sessionFile,
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'workflow-terminal-session',
+      timestamp: '2026-02-11T00:00:00.000Z',
+      cwd: '/tmp/project'
+    }) + '\n',
+    'utf8'
+  )
+  writeFileSync(
+    join(runDir, 'run.json'),
+    JSON.stringify({
+      id: 'wf-terminal',
+      workflowId: 'review',
+      cwd: '/tmp/project',
+      parentSessionId: 'workflow-terminal-session',
+      runDir,
+      status: 'completed',
+      endedAt: '2026-02-11T00:00:02.000Z',
+      startedAt: '2026-02-11T00:00:01.000Z'
+    }),
+    'utf8'
+  )
+  writeFileSync(
+    join(runDir, 'events.jsonl'),
+    `${JSON.stringify({ type: 'run_start', sequence: 1, timestamp: 't1', runId: 'wf-terminal', workflowId: 'review', cwd: '/tmp/project', status: 'running' })}\n`,
+    'utf8'
+  )
+
+  const oldEnv = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = root
+  const originalSpawn = PiRpcProcess.spawn
+
+  try {
+    ;(PiRpcProcess as any).spawn = async () =>
+      ({
+        onEvent: () => () => {},
+        getMessages: async () => ({ messages: [] }),
+        getState: async () => ({ sessionId: 'workflow-terminal-session', sessionFile }),
+        getAvailableModels: async () => ({ models: [] })
+      }) as any
+
+    const conn = new FakeAgentSideConnection()
+    const agent = new PiAcpAgent(asAgentConn(conn))
+    await agent.loadSession({
+      sessionId: 'workflow-terminal-session',
+      cwd: '/tmp/project',
+      mcpServers: [],
+      _meta: null
+    } as any)
+
+    const finalUpdates = conn.updates
+      .map(item => item.update as any)
+      .filter(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:wf-terminal')
+    assert.equal(finalUpdates.length, 1)
+    assert.equal(finalUpdates[0].status, 'completed')
+    assert.equal(finalUpdates[0].rawOutput.status, 'completed')
+  } finally {
+    PiRpcProcess.spawn = originalSpawn
+    if (oldEnv === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = oldEnv
+  }
+})
+
 test('PiAcpAgent: loadSession rejects and deletes missing ACP mapping before spawn', async () => {
   const originalSpawn = PiRpcProcess.spawn
   let spawned = false

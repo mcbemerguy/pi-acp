@@ -32,12 +32,21 @@ export type WorkflowEventMonitorTarget = {
   parentSessionId?: string
 }
 
+export type WorkflowEventMonitorAttachTarget = {
+  runId?: string
+  runDir?: string
+  sinceSequence?: number
+  replay?: boolean
+  includeTerminalFallback?: boolean
+}
+
 type WorkflowEventMonitorOptions = {
   workflowRunsDir?: string
   pollIntervalMs?: number
   graceMs?: number
   runEndMaxWaitMs?: number
   target?: WorkflowEventMonitorTarget | null
+  attach?: WorkflowEventMonitorAttachTarget | null
   onRecord?: (record: Record<string, unknown>, sequence: number) => void
   onUsageTelemetry?: (event: WorkflowUsageTelemetry) => void
 }
@@ -652,6 +661,7 @@ export class WorkflowEventMonitor {
   private readonly emit: EmitSessionUpdate
   private readonly mapper: WorkflowEventMapper
   private readonly target: WorkflowEventMonitorTarget | null
+  private readonly attach: WorkflowEventMonitorAttachTarget | null
   private readonly cwdKey: string
   private readonly onRecord?: (record: Record<string, unknown>, sequence: number) => void
   private readonly onUsageTelemetry?: (event: WorkflowUsageTelemetry) => void
@@ -666,6 +676,7 @@ export class WorkflowEventMonitor {
   private readonly knownDirs = new Set<string>()
   private readonly tails = new Map<string, TailState>()
   private acceptedRunDir: string | null = null
+  private acceptedRunDirPath: string | null = null
   private interval: NodeJS.Timeout | null = null
   private stopPromise: Promise<void> | null = null
   private stopResolve: (() => void) | null = null
@@ -681,6 +692,7 @@ export class WorkflowEventMonitor {
     this.emit = emit
     this.mapper = new WorkflowEventMapper(cwd)
     this.target = options.target ?? null
+    this.attach = options.attach ?? null
     this.cwdKey = cwdComparableKey(cwd)
     this.onRecord = options.onRecord
     this.onUsageTelemetry = options.onUsageTelemetry
@@ -688,6 +700,7 @@ export class WorkflowEventMonitor {
 
   start(): void {
     this.snapshotKnownDirs()
+    this.attachKnownRun()
     this.interval = setInterval(() => this.tick(), this.pollIntervalMs)
     this.interval.unref?.()
     this.tick()
@@ -727,6 +740,17 @@ export class WorkflowEventMonitor {
     for (const dir of listRunDirs(this.workflowRunsDir)) this.knownDirs.add(dir)
   }
 
+  private attachKnownRun(): void {
+    if (!this.attach || this.acceptedRunDir) return
+    const runDir = resolveAttachRunDir(this.workflowRunsDir, this.attach)
+    if (!runDir) return
+    this.acceptRunDir(this.attach.runId ?? runDir.split(sep).pop() ?? runDir, runDir, {
+      sinceSequence: this.attach.sinceSequence,
+      replay: this.attach.replay ?? true,
+      includeTerminalFallback: this.attach.includeTerminalFallback
+    })
+  }
+
   private tick(): void {
     this.discoverRuns()
     this.ingestion.maxActiveTails = Math.max(
@@ -735,6 +759,7 @@ export class WorkflowEventMonitor {
     )
     for (const tail of this.tails.values()) this.readTail(tail)
     this.syncAcceptedRunJsonTerminalState()
+    this.maybeFinishAttachedRun()
     this.maybeFinish()
   }
 
@@ -753,10 +778,90 @@ export class WorkflowEventMonitor {
     }
   }
 
-  private acceptRunDir(dir: string, runDir: string): void {
+  private acceptRunDir(
+    dir: string,
+    runDir: string,
+    options: { sinceSequence?: number; replay?: boolean; includeTerminalFallback?: boolean } = { replay: false }
+  ): void {
     this.acceptedRunDir = dir
+    this.acceptedRunDirPath = runDir
     const eventsPath = join(runDir, 'events.jsonl')
-    this.tails.set(eventsPath, createTail(eventsPath))
+    const tail = createTail(eventsPath)
+    this.tails.set(eventsPath, tail)
+    if (options.replay !== true) return
+    this.replayTail(tail, runDir, options.sinceSequence, options.includeTerminalFallback ?? true)
+  }
+
+  private replayTail(
+    tail: TailState,
+    runDir: string,
+    sinceSequence: number | undefined,
+    includeTerminalFallback: boolean
+  ): void {
+    let stat: ReturnType<typeof statSync>
+    let buffer: Buffer
+    try {
+      stat = statSync(tail.filePath)
+      if (!stat.isFile()) return
+      buffer = readFileSync(tail.filePath)
+    } catch {
+      return
+    }
+
+    tail.dev = stat.dev
+    tail.ino = stat.ino
+    tail.offset = stat.size
+    let cursor = 0
+    let sawRunEnd = false
+    let maxSequence = 0
+    while (cursor < buffer.length) {
+      const lineStart = cursor
+      const newlineIndex = buffer.indexOf(0x0a, cursor)
+      const lineEnd = newlineIndex === -1 ? buffer.length : newlineIndex
+      const lineNextOffset = newlineIndex === -1 ? buffer.length : newlineIndex + 1
+      cursor = lineNextOffset
+      let contentEnd = lineEnd
+      if (contentEnd > lineStart && buffer[contentEnd - 1] === 0x0d) contentEnd -= 1
+      const trimmed = buffer.subarray(lineStart, contentEnd).toString('utf8').trim()
+      if (!trimmed) continue
+      let record: unknown
+      try {
+        record = JSON.parse(trimmed)
+      } catch {
+        this.ingestion.malformedLines += 1
+        continue
+      }
+      if (isObject(record)) {
+        this.ingestion.recordsObserved += 1
+        if (record.type === 'run_end') sawRunEnd = true
+        const sequence = nonNegativeInt(record.sequence)
+        if (sequence !== undefined) maxSequence = Math.max(maxSequence, sequence)
+        if (sinceSequence !== undefined && (sequence === undefined || sequence <= sinceSequence)) continue
+        this.onRecord?.(record, this.ingestion.recordsObserved - 1)
+        this.acceptLinkedSubWorkflowRun(record)
+      }
+      const sourceIdentity = {
+        sourceKey: tailSourceKey(tail),
+        startOffset: lineStart,
+        endOffset: lineNextOffset
+      }
+      const mapped = this.mapper.mapRecord(record, sourceIdentity)
+      for (const update of mapped.updates) this.emit(update)
+      if (mapped.usageTelemetry) this.onUsageTelemetry?.(mapped.usageTelemetry)
+      if (isObject(record) && record.type === 'run_end') tail.ended = true
+    }
+
+    if (!includeTerminalFallback || sawRunEnd || tail.ended) return
+    const record = readTerminalRunEndRecord(runDir, this.acceptedRunDir ?? runDir, maxSequence + 1)
+    if (!record) return
+    const sequence = nonNegativeInt(record.sequence)
+    if (sinceSequence !== undefined && sequence !== undefined && sequence <= sinceSequence) return
+    this.ingestion.recordsObserved += 1
+    this.onRecord?.(record, this.ingestion.recordsObserved - 1)
+    const mapped = this.mapper.mapRecord(record)
+    for (const update of mapped.updates) this.emit(update)
+    if (mapped.usageTelemetry) this.onUsageTelemetry?.(mapped.usageTelemetry)
+    tail.ended = true
   }
 
   private acceptLinkedSubWorkflowRun(record: Record<string, unknown>): void {
@@ -841,7 +946,7 @@ export class WorkflowEventMonitor {
       return
     }
 
-    const runDir = join(this.workflowRunsDir, this.acceptedRunDir)
+    const runDir = this.acceptedRunDirPath ?? join(this.workflowRunsDir, this.acceptedRunDir)
     const record = readTerminalRunEndRecord(runDir, this.acceptedRunDir)
     if (!record) {
       this.terminalRunJsonFallback = null
@@ -878,7 +983,7 @@ export class WorkflowEventMonitor {
 
   private emitRunEndTimeoutFallback(): void {
     if (!this.acceptedRunDir) return
-    const runDir = join(this.workflowRunsDir, this.acceptedRunDir)
+    const runDir = this.acceptedRunDirPath ?? join(this.workflowRunsDir, this.acceptedRunDir)
     const metadata = readWorkflowRunMetadata(runDir) ?? {}
     const runId = metadata.runId ?? this.acceptedRunDir
     const workflowId = metadata.rootWorkflowId ?? metadata.workflowId ?? this.target?.workflowId ?? 'workflow'
@@ -901,6 +1006,11 @@ export class WorkflowEventMonitor {
     for (const update of mapped.updates) this.emit(update)
     if (mapped.usageTelemetry) this.onUsageTelemetry?.(mapped.usageTelemetry)
     for (const tail of this.tails.values()) tail.ended = true
+  }
+
+  private maybeFinishAttachedRun(): void {
+    if (!this.attach || this.tails.size === 0) return
+    if (Array.from(this.tails.values()).every(tail => tail.ended)) this.dispose()
   }
 
   private maybeFinish(): void {
@@ -1037,13 +1147,23 @@ function listRunDirs(workflowRunsDir: string): string[] {
   }
 }
 
+function resolveAttachRunDir(workflowRunsDir: string, attach: WorkflowEventMonitorAttachTarget): string | null {
+  if (attach.runDir) return resolve(attach.runDir)
+  if (!attach.runId) return null
+  return join(workflowRunsDir, attach.runId)
+}
+
 function readWorkflowRunMetadata(runDir: string): WorkflowRunMetadata | null {
   const runJson = readJsonObject(join(runDir, 'run.json'))
   if (runJson) return metadataFromRunJson(runJson, runDir)
   return readMetadataFromEvents(join(runDir, 'events.jsonl'))
 }
 
-function readTerminalRunEndRecord(runDir: string, fallbackRunId: string): Record<string, unknown> | null {
+function readTerminalRunEndRecord(
+  runDir: string,
+  fallbackRunId: string,
+  sequence?: number
+): Record<string, unknown> | null {
   const runJson = readJsonObject(join(runDir, 'run.json'))
   if (!runJson) return null
 
@@ -1064,7 +1184,8 @@ function readTerminalRunEndRecord(runDir: string, fallbackRunId: string): Record
     runDir: metadata.runDir ?? runDir,
     auditPath: metadata.auditPath,
     status: !status || status === 'running' ? 'completed' : status,
-    error: stringField(runJson.error)
+    error: stringField(runJson.error),
+    ...(sequence !== undefined ? { sequence, eventId: `${metadata.runId ?? fallbackRunId}:run_end:run-json` } : {})
   }
 }
 

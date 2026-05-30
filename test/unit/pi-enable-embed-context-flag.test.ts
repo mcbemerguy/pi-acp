@@ -45,6 +45,16 @@ test('PiAcpAgent: advertises Pi ACP extension UI custom notifications in capabil
     usageTelemetryMethod: '_pi/session_usage_update',
     steering: true,
     steeringMethod: '_pi/steer',
-    steeringModes: ['steer', 'follow_up']
+    steeringModes: ['steer', 'follow_up'],
+    workflows: true,
+    workflowMethods: [
+      '_pi/workflows/list',
+      '_pi/workflows/get',
+      '_pi/workflows/events',
+      '_pi/workflows/resume',
+      '_pi/workflows/pause',
+      '_pi/workflows/abort'
+    ],
+    workflowEventsMethod: '_pi/workflows/events'
   })
 })
