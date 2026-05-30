@@ -811,14 +811,22 @@ export class WorkflowEventMonitor {
     tail.dev = stat.dev
     tail.ino = stat.ino
     tail.offset = stat.size
+    tail.buffer = ''
+    tail.bufferStartOffset = stat.size
     let cursor = 0
     let sawRunEnd = false
     let maxSequence = 0
     while (cursor < buffer.length) {
       const lineStart = cursor
       const newlineIndex = buffer.indexOf(0x0a, cursor)
-      const lineEnd = newlineIndex === -1 ? buffer.length : newlineIndex
-      const lineNextOffset = newlineIndex === -1 ? buffer.length : newlineIndex + 1
+      if (newlineIndex === -1) {
+        tail.bufferStartOffset = lineStart
+        tail.buffer = tail.decoder.write(buffer.subarray(lineStart))
+        this.ingestion.maxTailBufferBytes = Math.max(this.ingestion.maxTailBufferBytes, Buffer.byteLength(tail.buffer))
+        break
+      }
+      const lineEnd = newlineIndex
+      const lineNextOffset = newlineIndex + 1
       cursor = lineNextOffset
       let contentEnd = lineEnd
       if (contentEnd > lineStart && buffer[contentEnd - 1] === 0x0d) contentEnd -= 1

@@ -864,6 +864,49 @@ test('WorkflowEventMonitor replays only records after the known workflow sequenc
   }
 })
 
+test('WorkflowEventMonitor attached replay buffers an unterminated final record until newline arrives', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-attach-partial-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  const runDir = join(workflowRunsDir, 'partial')
+  mkdirSync(runDir, { recursive: true })
+  const eventsPath = join(runDir, 'events.jsonl')
+  writeFileSync(
+    eventsPath,
+    `${JSON.stringify({ type: 'run_start', sequence: 1, timestamp: 't1', runId: 'partial', workflowId: 'wf', cwd: '/repo', status: 'running' })}\n` +
+      '{"type":"step_start","sequence":2,"timestamp":"t2","runId":"partial","workflowId":"wf","stepId":"code","title":"Code"',
+    'utf8'
+  )
+  const updates: any[] = []
+  const monitor = new WorkflowEventMonitor('/repo', update => updates.push(update), {
+    workflowRunsDir,
+    pollIntervalMs: 5,
+    graceMs: 20,
+    attach: { runId: 'partial', runDir, sinceSequence: 0 }
+  })
+
+  try {
+    monitor.start()
+    await waitUntil(() => updates.some(update => update.sessionUpdate === 'tool_call'))
+    appendFileSync(eventsPath, ',"status":"running"}\n', 'utf8')
+    await waitUntil(() => updates.some(update => update.sessionUpdate === 'plan'))
+    appendFileSync(
+      eventsPath,
+      `${JSON.stringify({ type: 'run_end', sequence: 3, timestamp: 't3', runId: 'partial', workflowId: 'wf', status: 'completed' })}\n`,
+      'utf8'
+    )
+    await monitor.waitForRunEndAfterPromptResolution()
+
+    assert.equal(monitor.getIngestionSnapshot().malformedLines, 0)
+    assert.ok(updates.some(update => update.sessionUpdate === 'plan'))
+    assert.ok(
+      updates.some(update => update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'workflow:partial')
+    )
+  } finally {
+    monitor.dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('WorkflowEventMonitor attached replay emits terminal run.json fallback when run_end is missing', async () => {
   const root = join(tmpdir(), `pi-acp-workflow-attach-terminal-${process.pid}-${Date.now()}`)
   const workflowRunsDir = join(root, 'workflow-runs')

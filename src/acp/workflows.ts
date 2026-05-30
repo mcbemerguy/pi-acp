@@ -142,11 +142,11 @@ export function readWorkflowRunEvents(
   }
 
   const start = Math.min(Math.max(0, options.offset ?? 0), buffer.length)
+  const completeFileStats = scanCompleteEventFileStats(buffer)
   const events: Record<string, unknown>[] = []
   let malformedLineCount = 0
   let lastSequence: number | undefined
   let nextOffset = start
-  let sawRunEnd = false
   const sinceSequence = options.sinceSequence
   const limit = options.limit
   let cursor = start
@@ -154,8 +154,9 @@ export function readWorkflowRunEvents(
   while (cursor < buffer.length && (limit === undefined || events.length < limit)) {
     const lineStart = cursor
     const newlineIndex = buffer.indexOf(0x0a, cursor)
-    const lineEnd = newlineIndex === -1 ? buffer.length : newlineIndex
-    const lineNextOffset = newlineIndex === -1 ? buffer.length : newlineIndex + 1
+    if (newlineIndex === -1) break
+    const lineEnd = newlineIndex
+    const lineNextOffset = newlineIndex + 1
     cursor = lineNextOffset
     nextOffset = lineNextOffset
     let contentEnd = lineEnd
@@ -173,7 +174,6 @@ export function readWorkflowRunEvents(
       malformedLineCount += 1
       continue
     }
-    if (parsed.type === 'run_end') sawRunEnd = true
     const sequence = numberField(parsed.sequence)
     if (sequence !== undefined) lastSequence = Math.max(lastSequence ?? 0, sequence)
     if (sinceSequence !== undefined && (sequence === undefined || sequence <= sinceSequence)) continue
@@ -188,8 +188,12 @@ export function readWorkflowRunEvents(
     ...(lastSequence !== undefined ? { lastSequence } : {})
   }
 
-  if (options.includeTerminalFallback && !sawRunEnd && (limit === undefined || events.length < limit)) {
-    const fallback = terminalRunEndRecord(run, (lastSequence ?? maxSequence(events) ?? 0) + 1)
+  if (
+    options.includeTerminalFallback &&
+    !completeFileStats.sawRunEnd &&
+    (limit === undefined || events.length < limit)
+  ) {
+    const fallback = terminalRunEndRecord(run, completeFileStats.maxSequence + 1)
     if (fallback && (sinceSequence === undefined || numberField(fallback.sequence)! > sinceSequence)) {
       result.events.push(fallback)
       result.terminalFallback = fallback
@@ -399,13 +403,31 @@ function numberField(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
-function maxSequence(events: Record<string, unknown>[]): number | undefined {
-  let max: number | undefined
-  for (const event of events) {
-    const sequence = numberField(event.sequence)
-    if (sequence !== undefined) max = Math.max(max ?? 0, sequence)
+function scanCompleteEventFileStats(buffer: Buffer): { maxSequence: number; sawRunEnd: boolean } {
+  let cursor = 0
+  let maxSequence = 0
+  let sawRunEnd = false
+  while (cursor < buffer.length) {
+    const newlineIndex = buffer.indexOf(0x0a, cursor)
+    if (newlineIndex === -1) break
+    const lineStart = cursor
+    let contentEnd = newlineIndex
+    cursor = newlineIndex + 1
+    if (contentEnd > lineStart && buffer[contentEnd - 1] === 0x0d) contentEnd -= 1
+    const trimmed = buffer.subarray(lineStart, contentEnd).toString('utf8').trim()
+    if (!trimmed) continue
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(trimmed)
+    } catch {
+      continue
+    }
+    if (!isRecord(parsed)) continue
+    if (parsed.type === 'run_end') sawRunEnd = true
+    const sequence = numberField(parsed.sequence)
+    if (sequence !== undefined && sequence > maxSequence) maxSequence = sequence
   }
-  return max
+  return { maxSequence, sawRunEnd }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
