@@ -22,7 +22,12 @@ import {
 import { toToolCallLocations, toToolKind } from './translate/tool-metadata.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import { isWorkflowCommandPrompt, parseWorkflowCommandPrompt, WorkflowEventMonitor } from './workflow-events.js'
-import { PI_WORKFLOWS_EVENTS_METHOD, type WorkflowRunControlOptions, type WorkflowRunRecord } from './workflows.js'
+import {
+  PI_WORKFLOWS_EVENTS_METHOD,
+  readWorkflowRun,
+  type WorkflowRunControlOptions,
+  type WorkflowRunRecord
+} from './workflows.js'
 import {
   handleExtensionUiRequest,
   isDialogExtensionUiMethod,
@@ -670,7 +675,7 @@ export class PiAcpSession {
     opts: WorkflowRunControlOptions = {}
   ): Promise<unknown> {
     const result = await this.proc.workflowControl(action, target, opts)
-    const run = workflowRunFromControlResult(result)
+    const run = workflowRunFromControlResult(result) ?? readWorkflowRunIfAvailable(target)
     if (run && action !== 'abort') await this.attachWorkflowRun(run, 0)
     return result
   }
@@ -1374,6 +1379,15 @@ function workflowRunFromControlResult(value: unknown): Pick<WorkflowRunRecord, '
   const runDir = typeof run?.runDir === 'string' ? run.runDir : null
   if (!id || !runDir) return null
   return { id, runDir }
+}
+
+function readWorkflowRunIfAvailable(target: string): Pick<WorkflowRunRecord, 'id' | 'runDir'> | null {
+  try {
+    const run = readWorkflowRun(target)
+    return { id: run.id, runDir: run.runDir }
+  } catch {
+    return null
+  }
 }
 
 function mergeTextChunkUpdate(previous: SessionUpdate, next: SessionUpdate): boolean {

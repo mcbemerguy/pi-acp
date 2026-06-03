@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
@@ -72,6 +72,58 @@ rl.on('line', line => {
   } finally {
     proc.dispose()
     rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 })
+  }
+})
+
+test('PiRpcProcess: workflowControl falls back to the workflow extension command when RPC command is unavailable', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-workflow-control-fallback-'))
+  const messagePath = join(root, 'prompt-message.txt').replace(/\\/g, '\\\\')
+  const piCommand = writeFakePiCommand(
+    root,
+    `import readline from 'node:readline'
+import { writeFileSync } from 'node:fs'
+const rl = readline.createInterface({ input: process.stdin })
+const write = value => process.stdout.write(JSON.stringify(value) + '\\n')
+rl.on('line', line => {
+  const msg = JSON.parse(line)
+  if (msg.type === 'get_state') {
+    write({ type: 'response', id: msg.id, command: 'get_state', success: true, data: {} })
+    return
+  }
+  if (msg.type === 'workflow_control') {
+    write({ type: 'response', id: msg.id, command: 'workflow_control', success: false, error: 'Unknown command: workflow_control' })
+    return
+  }
+  if (msg.type === 'prompt') {
+    writeFileSync('${messagePath}', msg.message, 'utf8')
+    write({ type: 'response', id: msg.id, command: 'prompt', success: true, data: { accepted: true } })
+  }
+})
+`
+  )
+
+  const proc = await PiRpcProcess.spawn({ cwd: root, piCommand })
+
+  try {
+    await proc.workflowControl('resume', 'run-123', {
+      reason: 'continue from ACP',
+      policy: 'redo-step',
+      continuationMessage: 'please continue'
+    })
+    const message = readFileSync(join(root, 'prompt-message.txt'), 'utf8')
+    assert.match(message, /^\/workflow:control /)
+    const payload = JSON.parse(Buffer.from(message.slice('/workflow:control '.length), 'base64url').toString('utf8'))
+    assert.deepEqual(payload, {
+      action: 'resume',
+      target: 'run-123',
+      reason: 'continue from ACP',
+      policy: 'redo-step',
+      continuationMessage: 'please continue'
+    })
+  } finally {
+    proc.dispose('SIGKILL')
+    await wait(100)
+    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
   }
 })
 

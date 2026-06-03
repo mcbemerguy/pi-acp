@@ -130,6 +130,10 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+function isUnknownWorkflowControlCommand(error: unknown): boolean {
+  return typeof error === 'string' && /unknown command:\s*workflow_control/i.test(error)
+}
+
 export function buildPiRpcSpawnEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   return {
     ...env,
@@ -470,8 +474,28 @@ export class PiRpcProcess {
       { type: 'workflow_control', action, target, ...opts },
       WORKFLOW_CONTROL_REQUEST_TIMEOUT_MS
     )
-    if (!res.success) throw new Error(`pi workflow_control ${action} failed: ${res.error ?? JSON.stringify(res.data)}`)
-    return res.data
+    if (res.success) return res.data
+    if (isUnknownWorkflowControlCommand(res.error)) return this.workflowControlViaPrompt(action, target, opts)
+    throw new Error(`pi workflow_control ${action} failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  private async workflowControlViaPrompt(
+    action: 'interrupt' | 'pause' | 'resume' | 'abort',
+    target: string,
+    opts: {
+      reason?: string
+      policy?: 'continue-existing-session' | 'redo-step' | 'manual'
+      continuationMessage?: string
+    } = {}
+  ): Promise<unknown> {
+    const payload = Buffer.from(JSON.stringify({ action, target, ...opts }), 'utf8').toString('base64url')
+    const res = await this.request(
+      { type: 'prompt', message: `/workflow:control ${payload}` },
+      PROMPT_REQUEST_TIMEOUT_MS
+    )
+    if (!res.success)
+      throw new Error(`pi workflow control command ${action} failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return res.data ?? null
   }
 
   private request(cmd: PiRpcCommand, timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS): Promise<PiRpcResponse> {
