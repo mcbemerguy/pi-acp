@@ -271,6 +271,8 @@ export class PiAcpSession {
   private promptLifecycleActive = false
   private currentWorkflowMonitor: WorkflowEventMonitor | null = null
   private completingWorkflowMonitor: WorkflowEventMonitor | null = null
+  private workflowContinuationActive = false
+  private workflowContinuationCancel: (() => void) | null = null
   private readonly attachedWorkflowMonitors = new Map<string, WorkflowEventMonitor>()
   private completionReasonOverride: StopReason | null = null
   private drainingCancelledTurn = false
@@ -357,7 +359,7 @@ export class PiAcpSession {
       const queued: QueuedTurn = { message: expandedMessage, images, resolve, reject, lifecycle }
 
       // If a turn is already running, enqueue.
-      if (this.pendingTurn || this.drainingCancelledTurn) {
+      if (this.pendingTurn || this.workflowContinuationActive || this.drainingCancelledTurn) {
         this.turnQueue.push(queued)
 
         // Best-effort: notify client that a prompt was queued.
@@ -389,7 +391,7 @@ export class PiAcpSession {
 
   async cancel(): Promise<void> {
     console.error(
-      `[pi-acp] session/cancel received sessionId=${this.sessionId} pendingTurn=${Boolean(this.pendingTurn)} queuedTurns=${this.turnQueue.length}`
+      `[pi-acp] session/cancel received sessionId=${this.sessionId} pendingTurn=${Boolean(this.pendingTurn)} workflowContinuation=${this.workflowContinuationActive} queuedTurns=${this.turnQueue.length}`
     )
     this.cancelRequested = true
 
@@ -403,18 +405,36 @@ export class PiAcpSession {
       })
       this.emit({
         sessionUpdate: 'session_info_update',
-        _meta: { piAcp: { queueDepth: 0, running: Boolean(this.pendingTurn) } }
+        _meta: { piAcp: { queueDepth: 0, running: Boolean(this.pendingTurn || this.workflowContinuationActive) } }
       })
     }
 
     if (!this.pendingTurn) {
-      await this.proc.abort().catch(error => {
+      try {
+        await this.withTimeout(this.proc.abort(), this.cancelAbortTimeoutMs, 'pi abort')
+        if (this.workflowContinuationActive) {
+          this.startCancelledTurnDrain()
+          this.workflowContinuationCancel?.()
+        } else {
+          this.completingWorkflowMonitor?.dispose()
+          this.completingWorkflowMonitor = null
+        }
+      } catch (error) {
         console.error(
           `[pi-acp] pi RPC abort ignored with no pending turn: ${error instanceof Error ? error.message : String(error)}`
         )
-      })
-      this.completingWorkflowMonitor?.dispose()
-      this.completingWorkflowMonitor = null
+        if (this.workflowContinuationActive) {
+          this.emit({
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'Pi did not acknowledge cancellation; restarting the ACP subprocess.' }
+          })
+          this.workflowContinuationCancel?.()
+          this.proc.dispose('SIGKILL')
+        } else {
+          this.completingWorkflowMonitor?.dispose()
+          this.completingWorkflowMonitor = null
+        }
+      }
       await this.waitForTurnSettlement()
       return
     }
@@ -632,7 +652,12 @@ export class PiAcpSession {
     continuationMessage: string,
     opts: WorkflowRunControlOptions = {}
   ): Promise<StopReason> {
+    if (this.pendingTurn || this.workflowContinuationActive) {
+      throw RequestError.internalError({}, 'Cannot continue a workflow while another Pi turn is running.')
+    }
+
     this.cancelRequested = false
+    this.workflowContinuationActive = true
     this.emit({
       sessionUpdate: 'session_info_update',
       _meta: { piAcp: { queueDepth: this.turnQueue.length, running: true, workflowRunId: run.id } }
@@ -649,23 +674,47 @@ export class PiAcpSession {
           usage: event.usage
         })
     })
+    let cancelContinuation!: () => void
+    const cancelPromise = new Promise<StopReason>(resolve => {
+      cancelContinuation = () => resolve('cancelled')
+    })
+    this.workflowContinuationCancel = cancelContinuation
     this.completingWorkflowMonitor = monitor
     monitor.start()
-    try {
+
+    const workflowPromise = (async (): Promise<StopReason> => {
       await this.proc.workflowControl('resume', run.runDir || run.id, { ...opts, continuationMessage })
       await monitor.waitForRunEndAfterPromptResolution()
       await this.flushEmits()
       return this.cancelRequested ? 'cancelled' : 'end_turn'
+    })()
+
+    try {
+      return await Promise.race([workflowPromise, cancelPromise])
     } catch (error) {
       if (this.cancelRequested) return 'cancelled'
       throw error
     } finally {
+      this.workflowContinuationActive = false
+      this.workflowContinuationCancel = null
       monitor.dispose()
-      this.completingWorkflowMonitor = null
+      if (this.completingWorkflowMonitor === monitor) this.completingWorkflowMonitor = null
       this.emit({
         sessionUpdate: 'session_info_update',
         _meta: { piAcp: { queueDepth: this.turnQueue.length, running: Boolean(this.pendingTurn) } }
       })
+      this.resolveTurnSettledWaiters()
+
+      if (!this.pendingTurn && !this.drainingCancelledTurn) {
+        const next = this.turnQueue.shift()
+        if (next) {
+          this.emit({
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
+          })
+          this.startTurn(next)
+        }
+      }
     }
   }
 
@@ -746,12 +795,13 @@ export class PiAcpSession {
   }
 
   private waitForTurnSettlement(): Promise<void> {
-    if (!this.pendingTurn && !this.completingTurn && !this.drainingCancelledTurn) return Promise.resolve()
+    if (!this.pendingTurn && !this.workflowContinuationActive && !this.completingTurn && !this.drainingCancelledTurn)
+      return Promise.resolve()
     return new Promise(resolve => this.turnSettledWaiters.push(resolve))
   }
 
   private resolveTurnSettledWaiters(): void {
-    if (this.pendingTurn || this.completingTurn || this.drainingCancelledTurn) return
+    if (this.pendingTurn || this.workflowContinuationActive || this.completingTurn || this.drainingCancelledTurn) return
     const waiters = this.turnSettledWaiters.splice(0, this.turnSettledWaiters.length)
     for (const resolve of waiters) resolve()
   }
@@ -929,7 +979,7 @@ export class PiAcpSession {
 
     this.resolveTurnSettledWaiters()
 
-    if (!this.pendingTurn && this.turnQueue.length) {
+    if (!this.pendingTurn && !this.workflowContinuationActive && this.turnQueue.length) {
       const next = this.turnQueue.shift()
       if (next) {
         this.emit({
