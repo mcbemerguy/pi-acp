@@ -13,7 +13,7 @@ Pi RPC mode is effectively single-session, so the adapter maps:
 
 - `session/new` → spawn a dedicated `pi --mode rpc` process
 - `session/prompt` → send `{type:"prompt"}` to that process and stream events back as `session/update`
-- `session/cancel` → send `{type:"abort"}`
+- `session/cancel` → interrupt the active Pi turn without implying terminal workflow abort
 
 ### ACP server wiring (modeled after opencode)
 
