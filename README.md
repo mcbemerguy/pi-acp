@@ -185,10 +185,11 @@ The adapter advertises Pi workflow support under `_meta.piAcp` and supports thes
 - `_pi/workflows/get`
 - `_pi/workflows/events`
 - `_pi/workflows/resume`
+- `_pi/workflows/interrupt`
 - `_pi/workflows/pause`
 - `_pi/workflows/abort`
 
-Generic ACP clients can ignore those methods and still receive replayed standard updates plus audit/run links. They may not have UI affordances to pause, resume, or abort a workflow; the run remains recoverable from Pi artifacts or from a Pi-aware client. `_pi/workflows/pause` and `_pi/workflows/abort` update `run.json` and append control events. `_pi/workflows/resume` records a resume request/policy and transitions the run to `recovering`, but the adapter does not act as a background workflow executor; actual step continuation requires the Pi workflow engine resume/recovery path to be invoked for the run. Ambiguous side-effecting child steps pause/interrupt instead of being automatically rerun. Use the end-to-end checklist at `/home/marcosb/.pi/agent/extensions/workflows/scripts/recovery-smoke.md` to validate T3Code UI reload, T3Code server restart, adapter restart, parent `pi --mode rpc` restart with `session/load`, child crashes before/after handoff, and interrupt/resume/abort behavior.
+Generic ACP clients can ignore those methods and still receive replayed standard updates plus audit/run links. Pi-aware clients should include `sessionId` when controlling a live run; the adapter routes live `interrupt`, `pause`, `resume`, and explicit `abort` through Pi RPC workflow control so execution stops or continues in Pi rather than only editing artifacts. `session/cancel` remains the standard Stop path and interrupts the active Pi turn without implying terminal abort. If no live ACP session is available, the custom control methods are limited to offline recovery metadata in `run.json`; that offline path does not append `events.jsonl` control records because Pi owns workflow event sequencing. A normal next user prompt continues the single recoverable run for the session; if multiple runs are recoverable, the adapter asks the client to choose one explicitly with `_pi/workflows/resume`. Use the end-to-end checklist at `/home/marcosb/.pi/agent/extensions/workflows/scripts/recovery-smoke.md` to validate T3Code UI reload, T3Code server restart, adapter restart, parent `pi --mode rpc` restart with `session/load`, child crashes before/after handoff, and interrupt/resume/abort behavior.
 
 ### Slash commands
 

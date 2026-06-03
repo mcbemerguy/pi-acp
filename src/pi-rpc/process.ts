@@ -53,6 +53,15 @@ type PiRpcCommand =
   | { type: 'get_messages'; id?: string }
   // Commands
   | { type: 'get_commands'; id?: string }
+  | {
+      type: 'workflow_control'
+      id?: string
+      action: 'interrupt' | 'pause' | 'resume' | 'abort'
+      target: string
+      reason?: string
+      policy?: 'continue-existing-session' | 'redo-step' | 'manual'
+      continuationMessage?: string
+    }
 
 type PiRpcResponse = {
   type: 'response'
@@ -84,6 +93,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 const PROMPT_REQUEST_TIMEOUT_MS = 0
 export const COMPACT_REQUEST_TIMEOUT_MS = 0
 const ABORT_REQUEST_TIMEOUT_MS = 3_000
+const WORKFLOW_CONTROL_REQUEST_TIMEOUT_MS = 5_000
 const DIAGNOSTIC_TAIL_MAX_CHARS = 4_000
 const DIAGNOSTIC_TAIL_MAX_LINES = 40
 
@@ -170,6 +180,14 @@ export class PiRpcProcess {
           const pending = this.pending.get(id)
           if (pending) {
             this.pending.delete(id)
+            pending.resolve(msg as PiRpcResponse)
+            return
+          }
+        } else if (typeof msg.command === 'string') {
+          const matches = Array.from(this.pending.entries()).filter(([, pending]) => pending.command === msg.command)
+          if (matches.length === 1) {
+            const [pendingId, pending] = matches[0]!
+            this.pending.delete(pendingId)
             pending.resolve(msg as PiRpcResponse)
             return
           }
@@ -436,6 +454,23 @@ export class PiRpcProcess {
   async getCommands(): Promise<unknown> {
     const res = await this.request({ type: 'get_commands' })
     if (!res.success) throw new Error(`pi get_commands failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return res.data
+  }
+
+  async workflowControl(
+    action: 'interrupt' | 'pause' | 'resume' | 'abort',
+    target: string,
+    opts: {
+      reason?: string
+      policy?: 'continue-existing-session' | 'redo-step' | 'manual'
+      continuationMessage?: string
+    } = {}
+  ): Promise<unknown> {
+    const res = await this.request(
+      { type: 'workflow_control', action, target, ...opts },
+      WORKFLOW_CONTROL_REQUEST_TIMEOUT_MS
+    )
+    if (!res.success) throw new Error(`pi workflow_control ${action} failed: ${res.error ?? JSON.stringify(res.data)}`)
     return res.data
   }
 

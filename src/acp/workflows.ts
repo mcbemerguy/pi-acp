@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { basename, join, resolve, sep } from 'node:path'
 import { getAgentDir } from './pi-settings.js'
 
@@ -6,6 +6,7 @@ export const PI_WORKFLOWS_LIST_METHOD = '_pi/workflows/list'
 export const PI_WORKFLOWS_GET_METHOD = '_pi/workflows/get'
 export const PI_WORKFLOWS_EVENTS_METHOD = '_pi/workflows/events'
 export const PI_WORKFLOWS_RESUME_METHOD = '_pi/workflows/resume'
+export const PI_WORKFLOWS_INTERRUPT_METHOD = '_pi/workflows/interrupt'
 export const PI_WORKFLOWS_PAUSE_METHOD = '_pi/workflows/pause'
 export const PI_WORKFLOWS_ABORT_METHOD = '_pi/workflows/abort'
 
@@ -14,6 +15,7 @@ export const PI_WORKFLOW_METHODS = [
   PI_WORKFLOWS_GET_METHOD,
   PI_WORKFLOWS_EVENTS_METHOD,
   PI_WORKFLOWS_RESUME_METHOD,
+  PI_WORKFLOWS_INTERRUPT_METHOD,
   PI_WORKFLOWS_PAUSE_METHOD,
   PI_WORKFLOWS_ABORT_METHOD
 ] as const
@@ -52,6 +54,7 @@ export type WorkflowRunControlOptions = {
   reason?: string
   policy?: 'continue-existing-session' | 'redo-step' | 'manual'
   workflowRunsDir?: string
+  continuationMessage?: string
 }
 
 const TERMINAL_STATUSES = new Set<WorkflowRunStatus>(['completed', 'failed', 'aborted'])
@@ -209,10 +212,30 @@ export function pauseWorkflowRun(target: string, options: WorkflowRunControlOpti
   if (isTerminalWorkflowStatus(run.status)) throw new Error(`Cannot pause terminal workflow run ${run.id}.`)
   const now = new Date().toISOString()
   run.status = 'paused'
-  run.control = { ...(isRecord(run.control) ? run.control : {}), pauseRequestedAt: now, reason: options.reason }
+  run.control = {
+    ...(isRecord(run.control) ? run.control : {}),
+    pauseRequestedAt: now,
+    reason: options.reason,
+    controlSource: 'pi-acp-offline'
+  }
   updateActiveSteps(run, 'paused', now, options.reason)
   writeWorkflowRun(run)
-  appendControlEvent(run, { type: 'run_paused', status: run.status, reason: options.reason })
+  return run
+}
+
+export function interruptWorkflowRun(target: string, options: WorkflowRunControlOptions = {}): WorkflowRunRecord {
+  const run = readWorkflowRun(target, options.workflowRunsDir)
+  if (isTerminalWorkflowStatus(run.status)) throw new Error(`Cannot interrupt terminal workflow run ${run.id}.`)
+  const now = new Date().toISOString()
+  run.status = 'interrupted'
+  run.control = {
+    ...(isRecord(run.control) ? run.control : {}),
+    interruptRequestedAt: now,
+    reason: options.reason,
+    controlSource: 'pi-acp-offline'
+  }
+  updateActiveSteps(run, 'interrupted', now, options.reason)
+  writeWorkflowRun(run)
   return run
 }
 
@@ -225,16 +248,12 @@ export function resumeWorkflowRun(target: string, options: WorkflowRunControlOpt
     ...(isRecord(run.control) ? run.control : {}),
     resumeRequestedAt: now,
     reason: options.reason,
-    policy: options.policy ?? 'continue-existing-session'
+    policy: options.policy ?? 'continue-existing-session',
+    continuationMessage: options.continuationMessage,
+    controlSource: 'pi-acp-offline'
   }
   updateActiveSteps(run, 'recovering', now, options.reason)
   writeWorkflowRun(run)
-  appendControlEvent(run, {
-    type: 'run_resume_requested',
-    status: run.status,
-    policy: options.policy ?? 'continue-existing-session',
-    reason: options.reason
-  })
   return run
 }
 
@@ -246,11 +265,14 @@ export function abortWorkflowRun(target: string, options: WorkflowRunControlOpti
   run.status = 'aborted'
   run.endedAt = now
   run.error = reason
-  run.control = { ...(isRecord(run.control) ? run.control : {}), abortRequestedAt: now, reason }
+  run.control = {
+    ...(isRecord(run.control) ? run.control : {}),
+    abortRequestedAt: now,
+    reason,
+    controlSource: 'pi-acp-offline'
+  }
   updateActiveSteps(run, 'aborted', now, reason)
   writeWorkflowRun(run)
-  appendControlEvent(run, { type: 'run_end', status: run.status, error: reason })
-  appendControlEvent(run, { type: 'run_aborted', status: run.status, reason })
   return run
 }
 
@@ -300,46 +322,6 @@ function resolveWorkflowRunDir(target: string, root: string): string {
 
 function writeWorkflowRun(run: WorkflowRunRecord): void {
   writeFileSync(join(run.runDir, 'run.json'), `${JSON.stringify(run, null, 2)}\n`, 'utf8')
-}
-
-function appendControlEvent(run: WorkflowRunRecord, event: Record<string, unknown>): void {
-  const sequence = readMaxSequence(run.runDir) + 1
-  const record = withoutUndefined({
-    timestamp: new Date().toISOString(),
-    runId: run.id,
-    rootWorkflowId: stringField(run.rootWorkflowId) ?? stringField(run.workflowId),
-    workflowId: stringField(run.workflowId) ?? stringField(run.rootWorkflowId),
-    commandName: stringField(run.commandName),
-    cwd: run.cwd,
-    parentSessionId: stringField(run.parentSessionId),
-    parentSessionFile: stringField(run.parentSessionFile),
-    runDir: run.runDir,
-    auditPath: stringField(run.auditPath),
-    ...event,
-    workflowEventVersion: WORKFLOW_EVENT_ENVELOPE_VERSION,
-    sequence,
-    eventId: `${run.id}:${sequence}`
-  })
-  appendFileSync(join(run.runDir, 'events.jsonl'), `${JSON.stringify(record)}\n`, 'utf8')
-}
-
-function readMaxSequence(runDir: string): number {
-  try {
-    return readFileSync(join(runDir, 'events.jsonl'), 'utf8')
-      .split(/\r?\n/)
-      .reduce((max, line) => {
-        if (!line.trim()) return max
-        try {
-          const parsed: unknown = JSON.parse(line)
-          const sequence = isRecord(parsed) ? numberField(parsed.sequence) : undefined
-          return sequence !== undefined && sequence > max ? sequence : max
-        } catch {
-          return max
-        }
-      }, 0)
-  } catch {
-    return 0
-  }
 }
 
 function updateActiveSteps(run: WorkflowRunRecord, status: string, now: string, reason?: string): void {

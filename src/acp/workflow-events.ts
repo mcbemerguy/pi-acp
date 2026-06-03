@@ -180,6 +180,10 @@ export class WorkflowEventMapper {
         return { updates: this.mapRunStart(record, runId) }
       case 'run_end':
         return { updates: this.mapRunEnd(record, runId) }
+      case 'run_interrupted':
+      case 'run_paused':
+      case 'run_resume_requested':
+        return { updates: this.mapRunControl(record, runId, type) }
       case 'step_start':
       case 'step_update':
       case 'step_end':
@@ -290,6 +294,48 @@ export class WorkflowEventMapper {
         _meta: { piWorkflow: meta }
       })
     }
+    return updates
+  }
+
+  private mapRunControl(record: Record<string, unknown>, runId: string, type: string): SessionUpdate[] {
+    const workflowId = stringField(record.workflowId) ?? 'workflow'
+    const meta = metaFromRecord(record)
+    const updates: SessionUpdate[] = []
+    if (!this.runs.has(runId)) {
+      this.runs.add(runId)
+      updates.push({
+        sessionUpdate: 'tool_call',
+        toolCallId: workflowToolId(runId),
+        title: `Workflow: ${workflowId}`,
+        kind: 'other',
+        status: 'in_progress',
+        rawInput: withWorkflowMeta({ runId, workflowId }, meta),
+        _meta: { piWorkflow: meta }
+      })
+    }
+    const statusText =
+      type === 'run_resume_requested' ? 'resume requested' : type === 'run_paused' ? 'paused' : 'interrupted'
+    updates.push(
+      {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: workflowToolId(runId),
+        status: 'in_progress',
+        rawOutput: withWorkflowMeta(
+          { status: stringField(record.status), reason: stringField(record.reason), event: type },
+          meta
+        ),
+        _meta: { piWorkflow: meta }
+      },
+      {
+        sessionUpdate: 'session_info_update',
+        _meta: { piWorkflow: meta, piAcp: { workflowRunId: runId, workflowStatus: stringField(record.status) } }
+      },
+      {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: `Workflow ${workflowId} ${statusText}.` } satisfies ContentBlock,
+        _meta: { piWorkflow: meta }
+      }
+    )
     return updates
   }
 

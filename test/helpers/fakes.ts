@@ -53,6 +53,12 @@ export class FakePiRpcProcess {
     payload?: Record<string, unknown>
     response?: { cancelled?: boolean; value?: unknown; confirmed?: boolean }
   }> = []
+  readonly workflowControls: Array<{
+    action: 'interrupt' | 'pause' | 'resume' | 'abort'
+    target: string
+    opts: Record<string, unknown>
+  }> = []
+  workflowControlResult: unknown = null
   abortCount = 0
   disposeCount = 0
   getSessionStatsCount = 0
@@ -123,6 +129,19 @@ export class FakePiRpcProcess {
 
   async getMessages(): Promise<any> {
     return { messages: [] }
+  }
+
+  async workflowControl(
+    action: 'interrupt' | 'pause' | 'resume' | 'abort',
+    target: string,
+    opts: Record<string, unknown> = {}
+  ): Promise<unknown> {
+    this.workflowControls.push({ action, target, opts })
+    return (
+      this.workflowControlResult ?? {
+        run: { id: 'run', cwd: process.cwd(), runDir: target, status: action === 'abort' ? 'aborted' : 'running' }
+      }
+    )
   }
 }
 

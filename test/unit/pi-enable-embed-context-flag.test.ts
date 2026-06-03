@@ -52,6 +52,7 @@ test('PiAcpAgent: advertises Pi ACP extension UI custom notifications in capabil
       '_pi/workflows/get',
       '_pi/workflows/events',
       '_pi/workflows/resume',
+      '_pi/workflows/interrupt',
       '_pi/workflows/pause',
       '_pi/workflows/abort'
     ],

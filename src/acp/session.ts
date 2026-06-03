@@ -22,7 +22,7 @@ import {
 import { toToolCallLocations, toToolKind } from './translate/tool-metadata.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import { isWorkflowCommandPrompt, parseWorkflowCommandPrompt, WorkflowEventMonitor } from './workflow-events.js'
-import { PI_WORKFLOWS_EVENTS_METHOD, type WorkflowRunRecord } from './workflows.js'
+import { PI_WORKFLOWS_EVENTS_METHOD, type WorkflowRunControlOptions, type WorkflowRunRecord } from './workflows.js'
 import {
   handleExtensionUiRequest,
   isDialogExtensionUiMethod,
@@ -408,6 +408,8 @@ export class PiAcpSession {
           `[pi-acp] pi RPC abort ignored with no pending turn: ${error instanceof Error ? error.message : String(error)}`
         )
       })
+      this.completingWorkflowMonitor?.dispose()
+      this.completingWorkflowMonitor = null
       await this.waitForTurnSettlement()
       return
     }
@@ -618,6 +620,59 @@ export class PiAcpSession {
       sequence: typeof record.sequence === 'number' ? record.sequence : observedSequence,
       event: record
     })
+  }
+
+  async continueWorkflowRun(
+    run: Pick<WorkflowRunRecord, 'id' | 'runDir'>,
+    continuationMessage: string,
+    opts: WorkflowRunControlOptions = {}
+  ): Promise<StopReason> {
+    this.cancelRequested = false
+    this.emit({
+      sessionUpdate: 'session_info_update',
+      _meta: { piAcp: { queueDepth: this.turnQueue.length, running: true, workflowRunId: run.id } }
+    })
+
+    const monitor = new WorkflowEventMonitor(this.cwd, update => this.emit(update), {
+      attach: { runId: run.id, runDir: run.runDir, sinceSequence: 0, replay: false },
+      onRecord: (record, sequence) => this.emitWorkflowEventNotification(record, sequence),
+      onUsageTelemetry: event =>
+        this.emitCustomNotification(PI_USAGE_UPDATE_METHOD, {
+          sessionId: this.sessionId,
+          ...(event.contextSessionId ? { contextSessionId: event.contextSessionId } : {}),
+          ...(event.workflow ? { workflow: event.workflow } : {}),
+          usage: event.usage
+        })
+    })
+    this.completingWorkflowMonitor = monitor
+    monitor.start()
+    try {
+      await this.proc.workflowControl('resume', run.runDir || run.id, { ...opts, continuationMessage })
+      await monitor.waitForRunEndAfterPromptResolution()
+      await this.flushEmits()
+      return this.cancelRequested ? 'cancelled' : 'end_turn'
+    } catch (error) {
+      if (this.cancelRequested) return 'cancelled'
+      throw error
+    } finally {
+      monitor.dispose()
+      this.completingWorkflowMonitor = null
+      this.emit({
+        sessionUpdate: 'session_info_update',
+        _meta: { piAcp: { queueDepth: this.turnQueue.length, running: Boolean(this.pendingTurn) } }
+      })
+    }
+  }
+
+  async controlWorkflowRun(
+    action: 'interrupt' | 'pause' | 'resume' | 'abort',
+    target: string,
+    opts: WorkflowRunControlOptions = {}
+  ): Promise<unknown> {
+    const result = await this.proc.workflowControl(action, target, opts)
+    const run = workflowRunFromControlResult(result)
+    if (run && action !== 'abort') await this.attachWorkflowRun(run, 0)
+    return result
   }
 
   async attachWorkflowRun(run: Pick<WorkflowRunRecord, 'id' | 'runDir'>, sinceSequence = 0): Promise<void> {
@@ -1310,6 +1365,15 @@ export class PiAcpSession {
       })
     }
   }
+}
+
+function workflowRunFromControlResult(value: unknown): Pick<WorkflowRunRecord, 'id' | 'runDir'> | null {
+  const data = value && typeof value === 'object' ? (value as Record<string, unknown>) : null
+  const run = data?.run && typeof data.run === 'object' ? (data.run as Record<string, unknown>) : data
+  const id = typeof run?.id === 'string' ? run.id : typeof run?.runId === 'string' ? run.runId : null
+  const runDir = typeof run?.runDir === 'string' ? run.runDir : null
+  if (!id || !runDir) return null
+  return { id, runDir }
 }
 
 function mergeTextChunkUpdate(previous: SessionUpdate, next: SessionUpdate): boolean {

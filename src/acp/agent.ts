@@ -42,16 +42,20 @@ import {
   PI_WORKFLOWS_ABORT_METHOD,
   PI_WORKFLOWS_EVENTS_METHOD,
   PI_WORKFLOWS_GET_METHOD,
+  PI_WORKFLOWS_INTERRUPT_METHOD,
   PI_WORKFLOWS_LIST_METHOD,
   PI_WORKFLOWS_PAUSE_METHOD,
   PI_WORKFLOWS_RESUME_METHOD,
   abortWorkflowRun,
+  interruptWorkflowRun,
+  isRecoverableWorkflowStatus,
   listRecoverableWorkflowRunsForSession,
   listWorkflowRuns,
   pauseWorkflowRun,
   readWorkflowRun,
   readWorkflowRunEvents,
   resumeWorkflowRun,
+  type WorkflowRunRecord,
   type WorkflowRunStatus
 } from './workflows.js'
 import {
@@ -880,11 +884,26 @@ export class PiAcpAgent implements ACPAgent {
       }
     }
 
-    const result = await session.prompt(message, images, {
-      onAccepted: state => {
-        this.refreshSessionMapFromPiState(session.sessionId, session.cwd, state, session)
-      }
-    })
+    const continuation = this.resolveWorkflowContinuation(session.sessionId, session.cwd, message, images)
+    if (continuation.kind === 'ambiguous') {
+      await this.conn.sessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: continuation.message }
+        }
+      })
+      return { stopReason: 'end_turn' }
+    }
+
+    const result =
+      continuation.kind === 'resume'
+        ? await session.continueWorkflowRun(continuation.run, message, { reason: 'ACP prompt continuation' })
+        : await session.prompt(message, images, {
+            onAccepted: state => {
+              this.refreshSessionMapFromPiState(session.sessionId, session.cwd, state, session)
+            }
+          })
 
     if (result === 'cancelled' || (result === 'error' && session.wasCancelRequested())) {
       return { stopReason: 'cancelled' }
@@ -927,7 +946,10 @@ export class PiAcpAgent implements ACPAgent {
     throw RequestError.methodNotFound(method)
   }
 
-  private handleWorkflowMethod(method: string, params: Record<string, unknown>): Record<string, unknown> {
+  private async handleWorkflowMethod(
+    method: string,
+    params: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
     try {
       switch (method) {
         case PI_WORKFLOWS_LIST_METHOD: {
@@ -952,23 +974,66 @@ export class PiAcpAgent implements ACPAgent {
               includeTerminalFallback: params.includeTerminalFallback !== false
             })
           }
+        case PI_WORKFLOWS_INTERRUPT_METHOD:
+          return this.handleWorkflowControl('interrupt', params)
         case PI_WORKFLOWS_PAUSE_METHOD:
-          return { run: pauseWorkflowRun(workflowTargetParam(params), { reason: stringParam(params.reason) }) }
+          return this.handleWorkflowControl('pause', params)
         case PI_WORKFLOWS_RESUME_METHOD:
-          return {
-            run: resumeWorkflowRun(workflowTargetParam(params), {
-              reason: stringParam(params.reason),
-              policy: parseWorkflowResumePolicy(params.policy)
-            })
-          }
+          return this.handleWorkflowControl('resume', params)
         case PI_WORKFLOWS_ABORT_METHOD:
-          return { run: abortWorkflowRun(workflowTargetParam(params), { reason: stringParam(params.reason) }) }
+          return this.handleWorkflowControl('abort', params)
         default:
           throw RequestError.methodNotFound(method)
       }
     } catch (error) {
       if (error instanceof RequestError) throw error
       throw compactError(error)
+    }
+  }
+
+  private async handleWorkflowControl(
+    action: 'interrupt' | 'pause' | 'resume' | 'abort',
+    params: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
+    const target = workflowTargetParam(params)
+    const opts = {
+      reason: stringParam(params.reason),
+      policy: action === 'resume' ? parseWorkflowResumePolicy(params.policy) : undefined,
+      continuationMessage: stringParam(params.continuationMessage)
+    }
+    const sessionId = stringParam(params.sessionId)
+    const session = sessionId ? this.sessions.maybeGet(sessionId) : undefined
+
+    if (session) {
+      const result = await session.controlWorkflowRun(action, target, opts)
+      const run = workflowControlResultRun(result) ?? readWorkflowRun(target)
+      return { run, control: { mode: 'live', action, result } }
+    }
+
+    const run = offlineWorkflowControl(action, target, opts)
+    return { run, control: { mode: 'offline_artifact', action } }
+  }
+
+  private resolveWorkflowContinuation(
+    sessionId: string,
+    cwd: string,
+    message: string,
+    images: unknown[]
+  ): { kind: 'none' } | { kind: 'resume'; run: WorkflowRunRecord } | { kind: 'ambiguous'; message: string } {
+    if (images.length > 0 || message.trimStart().startsWith('/')) return { kind: 'none' }
+    const runs = listRecoverableWorkflowRunsForSession({ cwd, parentSessionId: sessionId }).filter(run =>
+      isRecoverableWorkflowStatus(run.status)
+    )
+    if (runs.length === 0) return { kind: 'none' }
+    if (runs.length === 1) return { kind: 'resume', run: runs[0]! }
+
+    const lines = runs
+      .slice(0, 8)
+      .map(run => `- ${run.id} (${run.status}${run.workflowId ? `, ${run.workflowId}` : ''})`)
+    const more = runs.length > lines.length ? `\n- ... ${runs.length - lines.length} more` : ''
+    return {
+      kind: 'ambiguous',
+      message: `Multiple recoverable workflow runs are associated with this session. Choose one explicitly with _pi/workflows/resume before sending a continuation.\n${lines.join('\n')}${more}`
     }
   }
 
@@ -1255,6 +1320,30 @@ export class PiAcpAgent implements ACPAgent {
 
     return {}
   }
+}
+
+function offlineWorkflowControl(
+  action: 'interrupt' | 'pause' | 'resume' | 'abort',
+  target: string,
+  opts: { reason?: string; policy?: 'continue-existing-session' | 'redo-step' | 'manual'; continuationMessage?: string }
+): WorkflowRunRecord {
+  switch (action) {
+    case 'interrupt':
+      return interruptWorkflowRun(target, opts)
+    case 'pause':
+      return pauseWorkflowRun(target, opts)
+    case 'resume':
+      return resumeWorkflowRun(target, opts)
+    case 'abort':
+      return abortWorkflowRun(target, opts)
+  }
+}
+
+function workflowControlResultRun(value: unknown): WorkflowRunRecord | null {
+  const data = value && typeof value === 'object' ? (value as Record<string, unknown>) : null
+  const run = data?.run && typeof data.run === 'object' ? (data.run as Record<string, unknown>) : data
+  if (!run || typeof run.id !== 'string' || typeof run.cwd !== 'string' || typeof run.runDir !== 'string') return null
+  return run as WorkflowRunRecord
 }
 
 function workflowTargetParam(params: Record<string, unknown>): string {

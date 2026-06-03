@@ -1,9 +1,15 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { readWorkflowRunEvents } from '../../src/acp/workflows.js'
+import {
+  abortWorkflowRun,
+  interruptWorkflowRun,
+  pauseWorkflowRun,
+  readWorkflowRunEvents,
+  resumeWorkflowRun
+} from '../../src/acp/workflows.js'
 
 function writeRunJson(runDir: string, run: Record<string, unknown>): void {
   writeFileSync(
@@ -40,6 +46,34 @@ test('readWorkflowRunEvents does not consume an unterminated final JSONL record'
       ['step_start']
     )
     assert.equal(second.events[0]?.sequence, 2)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('offline workflow controls update run.json without appending events.jsonl records', () => {
+  const root = join(tmpdir(), `pi-acp-workflows-control-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  const runDir = join(workflowRunsDir, 'run')
+  const eventsPath = join(runDir, 'events.jsonl')
+  mkdirSync(runDir, { recursive: true })
+  writeRunJson(runDir, {
+    workflowId: 'wf',
+    steps: [{ id: 'code', status: 'running' }]
+  })
+  const initialEvents = `${JSON.stringify({ type: 'run_start', sequence: 1, runId: 'run', workflowId: 'wf' })}\n`
+  writeFileSync(eventsPath, initialEvents, 'utf8')
+
+  try {
+    assert.equal(pauseWorkflowRun('run', { workflowRunsDir, reason: 'manual pause' }).status, 'paused')
+    assert.equal(resumeWorkflowRun('run', { workflowRunsDir, policy: 'redo-step' }).status, 'recovering')
+    assert.equal(interruptWorkflowRun('run', { workflowRunsDir, reason: 'stop' }).status, 'interrupted')
+    assert.equal(abortWorkflowRun('run', { workflowRunsDir, reason: 'explicit abort' }).status, 'aborted')
+
+    assert.equal(readFileSync(eventsPath, 'utf8'), initialEvents)
+    const run = JSON.parse(readFileSync(join(runDir, 'run.json'), 'utf8'))
+    assert.equal(run.control.controlSource, 'pi-acp-offline')
+    assert.equal(run.status, 'aborted')
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

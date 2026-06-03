@@ -1,5 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
@@ -133,6 +136,88 @@ test('PiAcpSession: cancel forwards late events and waits for drain before retur
 
   proc.emit({ type: 'agent_end' })
   assert.equal(await second, 'end_turn')
+})
+
+test('PiAcpSession: continues a recoverable workflow run through Pi RPC control', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const root = join(tmpdir(), `pi-acp-session-workflow-resume-${process.pid}-${Date.now()}`)
+  const runDir = join(root, 'workflow-runs', 'run')
+  mkdirSync(runDir, { recursive: true })
+  writeFileSync(
+    join(runDir, 'run.json'),
+    JSON.stringify({ id: 'run', cwd: process.cwd(), runDir, status: 'recovering', workflowId: 'wf' }),
+    'utf8'
+  )
+  writeFileSync(join(runDir, 'events.jsonl'), '', 'utf8')
+  proc.workflowControlResult = { run: { id: 'run', cwd: process.cwd(), runDir, status: 'completed' } }
+  proc.workflowControl = async (action, target, opts = {}) => {
+    proc.workflowControls.push({ action, target, opts })
+    appendFileSync(
+      join(runDir, 'events.jsonl'),
+      `${JSON.stringify({ type: 'run_end', sequence: 1, runId: 'run', workflowId: 'wf', status: 'completed' })}\n`,
+      'utf8'
+    )
+    return proc.workflowControlResult
+  }
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  try {
+    assert.equal(await session.continueWorkflowRun({ id: 'run', runDir }, 'continue now'), 'end_turn')
+    assert.deepEqual(proc.workflowControls, [
+      { action: 'resume', target: runDir, opts: { continuationMessage: 'continue now' } }
+    ])
+    assert.equal(
+      conn.updates.some(update => JSON.stringify(update).includes('Workflow wf completed')),
+      true
+    )
+  } finally {
+    session.dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('PiAcpSession: cancel interrupts workflow continuation and settles the ACP turn', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const root = join(tmpdir(), `pi-acp-session-workflow-cancel-${process.pid}-${Date.now()}`)
+  const runDir = join(root, 'workflow-runs', 'run')
+  mkdirSync(runDir, { recursive: true })
+  writeFileSync(
+    join(runDir, 'run.json'),
+    JSON.stringify({ id: 'run', cwd: process.cwd(), runDir, status: 'recovering', workflowId: 'wf' }),
+    'utf8'
+  )
+  writeFileSync(join(runDir, 'events.jsonl'), '', 'utf8')
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  try {
+    const continuation = session.continueWorkflowRun({ id: 'run', runDir }, 'continue now')
+    await waitForMicrotasks()
+    await session.cancel()
+
+    assert.equal(proc.abortCount, 1)
+    assert.equal(await continuation, 'cancelled')
+  } finally {
+    session.dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('PiAcpSession: cancel resolves current prompt when abort hangs', async () => {
