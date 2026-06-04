@@ -19,7 +19,7 @@ export function makePiTextDeltaEvents(count: number, payloadSize = 24): StressFi
   return fixtureFromRecords(records)
 }
 
-export function makeWorkflowTextDeltaRecords(count: number, payloadSize = 24): StressFixture<Record<string, unknown>> {
+export function makeWorkflowFinalTextRecords(count: number, payloadSize = 24): StressFixture<Record<string, unknown>> {
   const payload = 'w'.repeat(payloadSize)
   const records: Record<string, unknown>[] = [
     {
@@ -42,14 +42,14 @@ export function makeWorkflowTextDeltaRecords(count: number, payloadSize = 24): S
       cwd: '/repo',
       stepId: 'code',
       childSessionId: 'child-1',
-      childEventType: 'message_update',
+      childEventType: 'message_end',
       event: {
-        type: 'message_update',
+        type: 'message_end',
         messageId: `m-${index}`,
-        assistantMessageEvent: {
-          type: 'text_delta',
-          delta: `workflow-chunk-${index}-${payload}`,
-          partial: { id: `m-${index}` }
+        message: {
+          id: `m-${index}`,
+          role: 'assistant',
+          content: [{ type: 'text', text: `workflow-chunk-${index}-${payload}` }]
         }
       }
     })),

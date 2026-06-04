@@ -8,7 +8,7 @@ import { PiAcpSession } from '../../src/acp/session.js'
 import { WorkflowEventMonitor } from '../../src/acp/workflow-events.js'
 import { PiRpcProcess, type PiRpcEvent } from '../../src/pi-rpc/process.js'
 import { asAgentConn, FakeAgentSideConnection, FakePiRpcProcess } from '../helpers/fakes.js'
-import { makePiTextDeltaEvents, makeWorkflowTextDeltaRecords } from '../helpers/stress-fixtures.js'
+import { makePiTextDeltaEvents, makeWorkflowFinalTextRecords } from '../helpers/stress-fixtures.js'
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -239,7 +239,7 @@ test('phase 4: outbound diagnostics are included in enqueue accounting', async (
 })
 
 test('baseline: workflow monitor observes every JSONL event in order before mapping to ACP updates', async () => {
-  const fixture = makeWorkflowTextDeltaRecords(1_200, 40)
+  const fixture = makeWorkflowFinalTextRecords(1_200, 40)
   const root = join(tmpdir(), `pi-acp-workflow-stress-${process.pid}-${Date.now()}`)
   const workflowRunsDir = join(root, 'workflow-runs')
   const runDir = join(workflowRunsDir, 'stress-run')
@@ -278,8 +278,8 @@ test('baseline: workflow monitor observes every JSONL event in order before mapp
       fixture.records
         .filter(record => record.type === 'child_pi_event')
         .map(record => {
-          const event = record.event as { assistantMessageEvent: { delta: string } }
-          return event.assistantMessageEvent.delta
+          const event = record.event as { message: { content: Array<{ text: string }> } }
+          return event.message.content[0]!.text
         })
     )
 

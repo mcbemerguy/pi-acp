@@ -525,7 +525,7 @@ test('WorkflowEventMapper fallback hashes are stable across object key order', (
   assert.equal(reordered.length, 0)
 })
 
-test('WorkflowEventMapper projects child assistant text deltas and avoids duplicate message_end fallback', () => {
+test('WorkflowEventMapper ignores child assistant text deltas and emits finalized message text', () => {
   const mapper = new WorkflowEventMapper('/repo')
   const delta = mapper.map({
     type: 'child_pi_event',
@@ -537,7 +537,7 @@ test('WorkflowEventMapper projects child assistant text deltas and avoids duplic
     childEventType: 'message_update',
     event: {
       type: 'message_update',
-      assistantMessageEvent: { type: 'text_delta', delta: 'hello ' }
+      assistantMessageEvent: { type: 'text_delta', delta: 'bad partial' }
     }
   })
   const end = mapper.map({
@@ -554,12 +554,12 @@ test('WorkflowEventMapper projects child assistant text deltas and avoids duplic
     }
   })
 
-  assert.equal(delta.length, 1)
-  assert.equal(delta[0]!.sessionUpdate, 'agent_message_chunk')
-  assert.match((delta[0] as any).messageId, /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
-  assert.equal((delta[0] as any).content.text, 'hello ')
-  assert.deepEqual((delta[0] as any)._meta.piWorkflow.stepId, 'code')
-  assert.equal(end.length, 0)
+  assert.equal(delta.length, 0)
+  assert.equal(end.length, 1)
+  assert.equal(end[0]!.sessionUpdate, 'agent_message_chunk')
+  assert.match((end[0] as any).messageId, /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  assert.equal((end[0] as any).content.text, 'hello world')
+  assert.deepEqual((end[0] as any)._meta.piWorkflow.stepId, 'code')
 })
 
 test('WorkflowEventMapper emits child message_end text when no delta was seen', () => {
@@ -587,9 +587,9 @@ test('WorkflowEventMapper emits child message_end text when no delta was seen', 
   assert.equal((updates[0] as any).content.text, 'final text')
 })
 
-test('WorkflowEventMapper only suppresses the next message_end after no-id text deltas', () => {
+test('WorkflowEventMapper suppresses message_end after finalized text_end for no-id child messages', () => {
   const mapper = new WorkflowEventMapper('/repo')
-  const delta = mapper.map({
+  const textEnd = mapper.map({
     type: 'child_pi_event',
     timestamp: 't1',
     runId: 'r1',
@@ -599,7 +599,7 @@ test('WorkflowEventMapper only suppresses the next message_end after no-id text 
     childEventType: 'message_update',
     event: {
       type: 'message_update',
-      assistantMessageEvent: { type: 'text_delta', delta: 'streamed' }
+      assistantMessageEvent: { type: 'text_end', content: 'streamed final' }
     }
   })
   const streamedEnd = mapper.map({
@@ -612,7 +612,7 @@ test('WorkflowEventMapper only suppresses the next message_end after no-id text 
     childEventType: 'message_end',
     event: {
       type: 'message_end',
-      message: { id: 'msg-1', role: 'assistant', content: [{ type: 'text', text: 'streamed final' }] }
+      message: { role: 'assistant', content: [{ type: 'text', text: 'streamed final' }] }
     }
   })
   const fallbackEnd = mapper.map({
@@ -625,11 +625,12 @@ test('WorkflowEventMapper only suppresses the next message_end after no-id text 
     childEventType: 'message_end',
     event: {
       type: 'message_end',
-      message: { id: 'msg-2', role: 'assistant', content: [{ type: 'text', text: 'fallback final' }] }
+      message: { role: 'assistant', content: [{ type: 'text', text: 'fallback final' }] }
     }
   })
 
-  assert.equal(delta.length, 1)
+  assert.equal(textEnd.length, 1)
+  assert.equal((textEnd[0] as any).content.text, 'streamed final')
   assert.equal(streamedEnd.length, 0)
   assert.equal(fallbackEnd.length, 1)
   assert.equal((fallbackEnd[0] as any).content.text, 'fallback final')
@@ -822,11 +823,11 @@ test('WorkflowEventMonitor replays only records after the known workflow sequenc
         workflowId: 'wf',
         stepId: 'code',
         childSessionId: 'child',
-        childEventType: 'message_update',
+        childEventType: 'message_end',
         event: {
-          type: 'message_update',
+          type: 'message_end',
           messageId: 'new',
-          assistantMessageEvent: { type: 'text_delta', delta: 'new', partial: { id: 'new' } }
+          message: { id: 'new', role: 'assistant', content: [{ type: 'text', text: 'new' }] }
         }
       }
     ]
@@ -1051,7 +1052,7 @@ test('WorkflowEventMonitor suppresses source-position duplicates when a tail is 
     mkdirSync(runDir)
     writeFileSync(
       eventsPath,
-      `${JSON.stringify({ type: 'run_start', timestamp: 't1', runId: 'reread', workflowId: 'wf', status: 'running' })}\n${JSON.stringify({ type: 'child_pi_event', timestamp: 't2', runId: 'reread', workflowId: 'wf', stepId: 'code', childSessionId: 'child', childEventType: 'message_update', event: { type: 'message_update', messageId: 'm1', assistantMessageEvent: { type: 'text_delta', delta: 'hello', partial: { id: 'm1' } } } })}\n`,
+      `${JSON.stringify({ type: 'run_start', timestamp: 't1', runId: 'reread', workflowId: 'wf', status: 'running' })}\n${JSON.stringify({ type: 'child_pi_event', timestamp: 't2', runId: 'reread', workflowId: 'wf', stepId: 'code', childSessionId: 'child', childEventType: 'message_end', event: { type: 'message_end', messageId: 'm1', message: { id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'hello' }] } } })}\n`,
       'utf8'
     )
     await waitUntil(() => updates.some(update => update.sessionUpdate === 'agent_message_chunk'))

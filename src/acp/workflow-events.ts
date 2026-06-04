@@ -151,8 +151,8 @@ export class WorkflowEventMapper {
   private readonly childTools = new Set<string>()
   private readonly childToolMetadata = new Map<string, ChildToolMetadata>()
   private readonly editSnapshots = new Map<string, EditSnapshot>()
-  private readonly childTextDeltas = new Set<string>()
-  private readonly pendingNoIdTextDeltas = new Set<string>()
+  private readonly emittedChildTextMessages = new Set<string>()
+  private readonly pendingNoIdMessageEndSuppressions = new Set<string>()
   private readonly noIdMessageSequences = new Map<string, number>()
 
   constructor(cwd: string) {
@@ -560,33 +560,38 @@ export class WorkflowEventMapper {
     event: Record<string, unknown>
   ): SessionUpdate[] {
     const assistantMessageEvent = isObject(event.assistantMessageEvent) ? event.assistantMessageEvent : undefined
-    const delta = stringField(assistantMessageEvent?.delta)
-    if (!assistantMessageEvent || !delta) return []
+    if (!assistantMessageEvent) return []
 
     const meta = metaFromRecord(record)
-    const identity = this.childMessageIdentity(runId, stepId, meta.childSessionId, event, assistantMessageEvent)
 
-    if (assistantMessageEvent.type === 'text_delta') {
-      this.childTextDeltas.add(identity.sourceKey)
-      if (!identity.hasExplicitId) this.pendingNoIdTextDeltas.add(identity.sourceKey)
-      return [
-        {
-          sessionUpdate: 'agent_message_chunk',
-          messageId: stableUuid(identity.sourceKey),
-          content: { type: 'text', text: delta } satisfies ContentBlock,
-          _meta: { piWorkflow: meta }
-        }
-      ]
+    if (assistantMessageEvent.type === 'text_start') {
+      this.advancePendingNoIdMessageEndSuppression(runId, stepId, meta.childSessionId)
+      return []
+    }
+
+    if (assistantMessageEvent.type === 'text_delta') return []
+
+    if (assistantMessageEvent.type === 'text_end') {
+      const text = stringField(assistantMessageEvent.content)
+      return text
+        ? this.mapChildFinalAssistantText(record, runId, stepId, event, text, {
+            assistantMessageEvent,
+            suppressFollowingNoIdMessageEnd: true
+          })
+        : []
     }
 
     if (assistantMessageEvent.type === 'thinking_delta') {
-      return [
-        {
-          sessionUpdate: 'agent_thought_chunk',
-          content: { type: 'text', text: delta } satisfies ContentBlock,
-          _meta: { piWorkflow: meta }
-        }
-      ]
+      const delta = stringField(assistantMessageEvent.delta)
+      return delta
+        ? [
+            {
+              sessionUpdate: 'agent_thought_chunk',
+              content: { type: 'text', text: delta } satisfies ContentBlock,
+              _meta: { piWorkflow: meta }
+            }
+          ]
+        : []
     }
 
     return []
@@ -602,19 +607,37 @@ export class WorkflowEventMapper {
     const text = assistantText(message)
     if (!text) return []
 
+    return this.mapChildFinalAssistantText(record, runId, stepId, event, text)
+  }
+
+  private mapChildFinalAssistantText(
+    record: Record<string, unknown>,
+    runId: string,
+    stepId: string,
+    event: Record<string, unknown>,
+    text: string,
+    opts: { assistantMessageEvent?: Record<string, unknown>; suppressFollowingNoIdMessageEnd?: boolean } = {}
+  ): SessionUpdate[] {
     const meta = metaFromRecord(record)
-    const identity = this.childMessageIdentity(runId, stepId, meta.childSessionId, event)
-    if (this.childTextDeltas.has(identity.sourceKey)) return []
+    const identity = this.childMessageIdentity(runId, stepId, meta.childSessionId, event, opts.assistantMessageEvent)
+
+    if (this.emittedChildTextMessages.has(identity.sourceKey)) {
+      this.resolvePendingNoIdMessageEndSuppression(identity, runId, stepId, meta.childSessionId)
+      return []
+    }
 
     const pendingNoIdIdentity = this.currentNoIdChildMessageIdentity(runId, stepId, meta.childSessionId)
-    if (this.pendingNoIdTextDeltas.has(pendingNoIdIdentity.sourceKey)) {
-      this.pendingNoIdTextDeltas.delete(pendingNoIdIdentity.sourceKey)
+    if (this.pendingNoIdMessageEndSuppressions.has(pendingNoIdIdentity.sourceKey)) {
+      this.pendingNoIdMessageEndSuppressions.delete(pendingNoIdIdentity.sourceKey)
       this.advanceNoIdChildMessageSequence(runId, stepId, meta.childSessionId)
       return []
     }
 
-    this.childTextDeltas.add(identity.sourceKey)
-    if (!identity.hasExplicitId) this.advanceNoIdChildMessageSequence(runId, stepId, meta.childSessionId)
+    this.emittedChildTextMessages.add(identity.sourceKey)
+    if (!identity.hasExplicitId) {
+      if (opts.suppressFollowingNoIdMessageEnd) this.pendingNoIdMessageEndSuppressions.add(identity.sourceKey)
+      else this.advanceNoIdChildMessageSequence(runId, stepId, meta.childSessionId)
+    }
 
     return [
       {
@@ -624,6 +647,26 @@ export class WorkflowEventMapper {
         _meta: { piWorkflow: meta }
       }
     ]
+  }
+
+  private resolvePendingNoIdMessageEndSuppression(
+    identity: ChildMessageIdentity,
+    runId: string,
+    stepId: string,
+    childSessionId: string | undefined
+  ): void {
+    if (identity.hasExplicitId || !this.pendingNoIdMessageEndSuppressions.delete(identity.sourceKey)) return
+    this.advanceNoIdChildMessageSequence(runId, stepId, childSessionId)
+  }
+
+  private advancePendingNoIdMessageEndSuppression(
+    runId: string,
+    stepId: string,
+    childSessionId: string | undefined
+  ): void {
+    const identity = this.currentNoIdChildMessageIdentity(runId, stepId, childSessionId)
+    if (!this.pendingNoIdMessageEndSuppressions.delete(identity.sourceKey)) return
+    this.advanceNoIdChildMessageSequence(runId, stepId, childSessionId)
   }
 
   private childMessageIdentity(
