@@ -146,6 +146,16 @@ export class SessionManager {
     this.sessions.delete(sessionId)
   }
 
+  async closeSession(sessionId: string): Promise<void> {
+    const s = this.sessions.get(sessionId)
+    if (!s) return
+    try {
+      await s.close()
+    } finally {
+      this.sessions.delete(sessionId)
+    }
+  }
+
   /** Close all sessions except the one with `keepSessionId`. */
   closeAllExcept(keepSessionId: string): void {
     for (const [id] of this.sessions) {
@@ -331,24 +341,41 @@ export class PiAcpSession {
     this.proc.onEvent(ev => this.handlePiEvent(ev))
   }
 
-  dispose(): void {
-    this.currentWorkflowMonitor?.dispose()
-    this.currentWorkflowMonitor = null
-    this.completingWorkflowMonitor?.dispose()
-    this.completingWorkflowMonitor = null
-    for (const monitor of this.attachedWorkflowMonitors.values()) monitor.dispose()
-    this.attachedWorkflowMonitors.clear()
-    if (this.cancelDrainTimer) {
-      clearTimeout(this.cancelDrainTimer)
-      this.cancelDrainTimer = null
+  dispose(opts: { disposeProcess?: boolean; signal?: NodeJS.Signals | number; settle?: boolean } = {}): void {
+    if (opts.settle !== false) this.settleCancelledWorkForShutdown()
+    this.disposeRuntimeResources()
+    if (opts.disposeProcess !== false) this.proc.dispose?.(opts.signal ?? 'SIGTERM')
+  }
+
+  async close(): Promise<void> {
+    console.error(
+      `[pi-acp] session/close received sessionId=${this.sessionId} pendingTurn=${Boolean(this.pendingTurn)} workflowContinuation=${this.workflowContinuationActive} queuedTurns=${this.turnQueue.length}`
+    )
+
+    if (this.hasActiveWork()) {
+      try {
+        await this.cancel()
+      } catch (error) {
+        console.error(
+          `[pi-acp] session close cancellation failed sessionId=${this.sessionId}: ${error instanceof Error ? error.message : String(error)}`
+        )
+      }
     }
-    if (this.usageRefreshTimer) {
-      clearTimeout(this.usageRefreshTimer)
-      this.usageRefreshTimer = null
+
+    this.settleCancelledWorkForShutdown()
+    await this.waitForTurnSettlement()
+
+    const proc = this.proc as PiRpcProcess & {
+      terminate?: (opts?: { gracefulTimeoutMs?: number; killTimeoutMs?: number }) => Promise<void>
     }
-    this.clearAgentEndFallbackTimer()
-    this.drainingCancelledTurn = false
-    this.proc.dispose?.()
+    if (typeof proc.terminate === 'function') await proc.terminate({ gracefulTimeoutMs: 1_500, killTimeoutMs: 1_500 })
+    else proc.dispose?.('SIGTERM')
+
+    this.dispose({ disposeProcess: false, settle: false })
+  }
+
+  getSessionFile(): string | null {
+    return this.sessionFile
   }
 
   async prompt(message: string, images: unknown[] = [], lifecycle?: PromptLifecycleOptions): Promise<StopReason> {
@@ -782,6 +809,58 @@ export class PiAcpSession {
       this.usageRefreshQueued = false
       this.scheduleUsageRefresh()
     }
+  }
+
+  private hasActiveWork(): boolean {
+    return Boolean(
+      this.pendingTurn ||
+      this.workflowContinuationActive ||
+      this.completingTurn ||
+      this.drainingCancelledTurn ||
+      this.turnQueue.length
+    )
+  }
+
+  private settleCancelledWorkForShutdown(): void {
+    this.cancelRequested = true
+
+    if (this.turnQueue.length) {
+      const queued = this.turnQueue.splice(0, this.turnQueue.length)
+      for (const t of queued) t.resolve('cancelled')
+    }
+
+    if (this.workflowContinuationActive) this.workflowContinuationCancel?.()
+
+    if (this.pendingTurn) {
+      if (!this.interruptCompletingTurn('cancelled')) this.completeTurn('cancelled', { proceedQueue: false })
+    } else {
+      this.currentWorkflowMonitor?.dispose()
+      this.currentWorkflowMonitor = null
+      this.completingWorkflowMonitor?.dispose()
+      this.completingWorkflowMonitor = null
+    }
+
+    if (this.drainingCancelledTurn) this.stopCancelledTurnDrain()
+    this.resolveTurnSettledWaiters()
+  }
+
+  private disposeRuntimeResources(): void {
+    this.currentWorkflowMonitor?.dispose()
+    this.currentWorkflowMonitor = null
+    this.completingWorkflowMonitor?.dispose()
+    this.completingWorkflowMonitor = null
+    for (const monitor of this.attachedWorkflowMonitors.values()) monitor.dispose()
+    this.attachedWorkflowMonitors.clear()
+    if (this.cancelDrainTimer) {
+      clearTimeout(this.cancelDrainTimer)
+      this.cancelDrainTimer = null
+    }
+    if (this.usageRefreshTimer) {
+      clearTimeout(this.usageRefreshTimer)
+      this.usageRefreshTimer = null
+    }
+    this.clearAgentEndFallbackTimer()
+    this.drainingCancelledTurn = false
   }
 
   private withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {

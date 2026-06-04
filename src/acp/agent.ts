@@ -4,7 +4,11 @@ import {
   type AgentSideConnection,
   type AuthenticateRequest,
   type CancelNotification,
+  type CloseSessionRequest,
+  type CloseSessionResponse,
   type ContentBlock,
+  type DeleteSessionRequest,
+  type DeleteSessionResponse,
   type InitializeRequest,
   type InitializeResponse,
   type ListSessionsRequest,
@@ -286,7 +290,9 @@ export class PiAcpAgent implements ACPAgent {
         },
         sessionCapabilities: {
           // Enables a native session picker in clients that support session/list.
-          list: {}
+          list: {},
+          close: {},
+          delete: {}
         },
         _meta: {
           piAcp: {
@@ -925,6 +931,100 @@ export class PiAcpAgent implements ACPAgent {
   async cancel(params: CancelNotification): Promise<void> {
     const session = this.sessions.get(params.sessionId)
     await session.cancel()
+  }
+
+  async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+    await this.closeManagedSession(params.sessionId)
+    return {}
+  }
+
+  async unstable_deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+    const sessionId = params.sessionId
+    const active = this.sessions.maybeGet(sessionId)
+    const stored = this.store.get(sessionId)
+    const activeCwd = active?.cwd ?? null
+    const activeSessionFile = active?.getSessionFile() ?? null
+    const expectedCwd = activeCwd ?? stored?.cwd ?? this.lastSessionCwd
+
+    await this.closeManagedSession(sessionId)
+    this.store.delete(sessionId)
+
+    const deleted = this.deleteValidatedPiSessionFile({
+      sessionId,
+      expectedCwd,
+      activeSessionFile,
+      storedSessionFile: stored?.sessionFile ?? null
+    })
+
+    const workflowCwd = activeCwd ?? stored?.cwd ?? deleted?.cwd ?? expectedCwd
+    if (workflowCwd) this.abortRecoverableWorkflowRunsForDeletedSession(sessionId, workflowCwd)
+
+    return {}
+  }
+
+  private async closeManagedSession(sessionId: string): Promise<void> {
+    if (typeof (this.sessions as any).closeSession === 'function') {
+      await (this.sessions as any).closeSession(sessionId)
+      return
+    }
+
+    this.sessions.close(sessionId)
+  }
+
+  private deleteValidatedPiSessionFile(opts: {
+    sessionId: string
+    expectedCwd?: string | null
+    activeSessionFile?: string | null
+    storedSessionFile?: string | null
+  }): { sessionFile: string; cwd: string } | null {
+    const candidates: Array<{ file: string; cwd?: string | null }> = []
+    const addCandidate = (file: string | null | undefined, cwd?: string | null) => {
+      if (!file || !file.trim()) return
+      if (candidates.some(candidate => candidate.file === file)) return
+      candidates.push({ file, cwd })
+    }
+
+    addCandidate(opts.activeSessionFile, opts.expectedCwd)
+    addCandidate(opts.storedSessionFile, opts.expectedCwd)
+    addCandidate(findPiSessionFile(opts.sessionId, opts.expectedCwd), opts.expectedCwd)
+    if (!opts.expectedCwd) addCandidate(findPiSessionFile(opts.sessionId), null)
+
+    for (const candidate of candidates) {
+      const validation = validatePiSessionFile(candidate.file, { sessionId: opts.sessionId, cwd: candidate.cwd })
+      if (!validation.ok) {
+        console.error(
+          `[pi-acp] session/delete refused to unlink invalid session file sessionId=${opts.sessionId} file=${candidate.file} reason=${validation.reason}`
+        )
+        continue
+      }
+
+      try {
+        unlinkSync(validation.sessionFile)
+        console.error(
+          `[pi-acp] session/delete unlinked pi session file sessionId=${opts.sessionId} file=${validation.sessionFile}`
+        )
+      } catch (error) {
+        console.error(
+          `[pi-acp] session/delete failed to unlink pi session file sessionId=${opts.sessionId} file=${validation.sessionFile}: ${error instanceof Error ? error.message : String(error)}`
+        )
+      }
+      return { sessionFile: validation.sessionFile, cwd: validation.header.cwd }
+    }
+
+    return null
+  }
+
+  private abortRecoverableWorkflowRunsForDeletedSession(sessionId: string, cwd: string): void {
+    const runs = listRecoverableWorkflowRunsForSession({ cwd, parentSessionId: sessionId })
+    for (const run of runs) {
+      try {
+        abortWorkflowRun(run.runDir || run.id, { reason: 'Parent ACP session was deleted.' })
+      } catch (error) {
+        console.error(
+          `[pi-acp] session/delete failed to abort workflow run sessionId=${sessionId} runId=${run.id}: ${error instanceof Error ? error.message : String(error)}`
+        )
+      }
+    }
   }
 
   async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {

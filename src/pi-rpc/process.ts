@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawn, type ChildProcessWithoutNullStreams, type SpawnOptions } from 'node:child_process'
 import * as readline from 'node:readline'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
 import { stripAnsi } from '../shared/ansi.js'
@@ -94,6 +94,8 @@ const PROMPT_REQUEST_TIMEOUT_MS = 0
 export const COMPACT_REQUEST_TIMEOUT_MS = 0
 const ABORT_REQUEST_TIMEOUT_MS = 3_000
 const WORKFLOW_CONTROL_REQUEST_TIMEOUT_MS = 5_000
+const TERMINATE_GRACE_TIMEOUT_MS = 1_500
+const TERMINATE_KILL_TIMEOUT_MS = 1_500
 const DIAGNOSTIC_TAIL_MAX_CHARS = 4_000
 const DIAGNOSTIC_TAIL_MAX_LINES = 40
 
@@ -139,6 +141,34 @@ export function buildPiRpcSpawnEnv(env: NodeJS.ProcessEnv = process.env): NodeJS
     ...env,
     PI_ACP: '1',
     PI_ACP_RPC: '1'
+  }
+}
+
+export function windowsProcessTreeKillCommand(pid: number): { command: string; args: string[]; options: SpawnOptions } {
+  return {
+    command: 'taskkill',
+    args: ['/PID', String(pid), '/T', '/F'],
+    options: { stdio: 'ignore', windowsHide: true }
+  }
+}
+
+export async function killProcessTree(pid: number, platform: NodeJS.Platform = process.platform): Promise<void> {
+  if (!Number.isInteger(pid) || pid <= 0) return
+
+  if (platform === 'win32') {
+    const { command, args, options } = windowsProcessTreeKillCommand(pid)
+    await new Promise<void>(resolve => {
+      const killer = spawn(command, args, options)
+      killer.once('error', () => resolve())
+      killer.once('close', () => resolve())
+    })
+    return
+  }
+
+  try {
+    process.kill(pid, 'SIGKILL')
+  } catch {
+    // ignore
   }
 }
 
@@ -308,12 +338,58 @@ export class PiRpcProcess {
   }
 
   dispose(signal: NodeJS.Signals | number = 'SIGTERM'): void {
-    if (this.child.killed) return
+    if (this.child.killed || this.closed) return
+    if (signal === 'SIGKILL' && process.platform === 'win32' && this.child.pid) void killProcessTree(this.child.pid)
     try {
       this.child.kill(signal as any)
     } catch {
       // ignore
     }
+  }
+
+  async terminate(
+    opts: {
+      attemptAbort?: boolean
+      gracefulTimeoutMs?: number
+      killTimeoutMs?: number
+    } = {}
+  ): Promise<void> {
+    if (this.closed) return
+
+    if (opts.attemptAbort) {
+      try {
+        await this.abort()
+      } catch {
+        // continue to process termination
+      }
+    }
+
+    this.dispose('SIGTERM')
+    if (await this.waitForClose(opts.gracefulTimeoutMs ?? TERMINATE_GRACE_TIMEOUT_MS)) return
+
+    if (this.child.pid) await killProcessTree(this.child.pid)
+    this.dispose('SIGKILL')
+    await this.waitForClose(opts.killTimeoutMs ?? TERMINATE_KILL_TIMEOUT_MS)
+  }
+
+  private waitForClose(timeoutMs: number): Promise<boolean> {
+    if (this.closed) return Promise.resolve(true)
+
+    return new Promise(resolve => {
+      const timeout = setTimeout(() => {
+        cleanup()
+        resolve(false)
+      }, timeoutMs)
+      const onClose = () => {
+        cleanup()
+        resolve(true)
+      }
+      const cleanup = () => {
+        clearTimeout(timeout)
+        this.child.off('close', onClose)
+      }
+      this.child.once('close', onClose)
+    })
   }
 
   /**
