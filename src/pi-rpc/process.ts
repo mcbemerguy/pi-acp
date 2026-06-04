@@ -339,7 +339,10 @@ export class PiRpcProcess {
 
   dispose(signal: NodeJS.Signals | number = 'SIGTERM'): void {
     if (this.child.killed || this.closed) return
-    if (signal === 'SIGKILL' && process.platform === 'win32' && this.child.pid) void killProcessTree(this.child.pid)
+    if (signal === 'SIGKILL' && process.platform === 'win32' && this.child.pid) {
+      console.error(`[pi-acp] Windows process-tree kill requested pid=${this.child.pid} signal=SIGKILL`)
+      void killProcessTree(this.child.pid)
+    }
     try {
       this.child.kill(signal as any)
     } catch {
@@ -367,9 +370,14 @@ export class PiRpcProcess {
     this.dispose('SIGTERM')
     if (await this.waitForClose(opts.gracefulTimeoutMs ?? TERMINATE_GRACE_TIMEOUT_MS)) return
 
+    console.error(
+      `[pi-acp] pi RPC process did not exit after SIGTERM; escalating to process-tree kill pid=${this.child.pid ?? 'unknown'}`
+    )
     if (this.child.pid) await killProcessTree(this.child.pid)
     this.dispose('SIGKILL')
-    await this.waitForClose(opts.killTimeoutMs ?? TERMINATE_KILL_TIMEOUT_MS)
+    if (!(await this.waitForClose(opts.killTimeoutMs ?? TERMINATE_KILL_TIMEOUT_MS))) {
+      console.error(`[pi-acp] pi RPC process still open after kill escalation pid=${this.child.pid ?? 'unknown'}`)
+    }
   }
 
   private waitForClose(timeoutMs: number): Promise<boolean> {

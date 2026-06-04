@@ -14,6 +14,8 @@ Pi RPC mode is effectively single-session, so the adapter maps:
 - `session/new` → spawn a dedicated `pi --mode rpc` process
 - `session/prompt` → send `{type:"prompt"}` to that process and stream events back as `session/update`
 - `session/cancel` → interrupt the active Pi turn without implying terminal workflow abort
+- `session/close` → non-destructive runtime cleanup; keep Pi JSONL history and mappings resumable
+- `session/delete` → close first, then remove only a validated backing Pi JSONL and session-map entry
 
 ### ACP server wiring (modeled after opencode)
 
@@ -57,6 +59,7 @@ For real validation, test with an ACP client (e.g. Zed external agent).
 - Keep pi RPC subprocess logic in `src/pi-rpc/*`.
 - Prefer small translation functions (pi event → ACP session/update) with unit tests.
 - Be strict about streaming and process cleanup (handle exit, drain stdout/stderr, timeouts).
+- Keep close/delete semantics distinct: Stop/Close never deletes history; Delete must validate the Pi JSONL header before unlinking and must not remove workflow audit directories or arbitrary paths.
 - Avoid producing unnecessary comments! Use comments sparingly to explain non-obvious decisions, not to narrate code.
 - Avoid using `any` in TypeScript; prefer explicit types and interfaces. Only use `any` when absolutely necessary (e.g. for untyped external data).
 

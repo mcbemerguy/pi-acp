@@ -946,7 +946,17 @@ export class PiAcpAgent implements ACPAgent {
     const activeSessionFile = active?.getSessionFile() ?? null
     const expectedCwd = activeCwd ?? stored?.cwd ?? this.lastSessionCwd
 
-    await this.closeManagedSession(sessionId)
+    console.error(
+      `[pi-acp] session/delete requested sessionId=${sessionId} active=${Boolean(active)} stored=${Boolean(stored)} expectedCwd=${expectedCwd ?? 'unknown'} activeSessionFile=${activeSessionFile ?? 'none'} storedSessionFile=${stored?.sessionFile ?? 'none'}`
+    )
+
+    try {
+      await this.closeManagedSession(sessionId)
+    } catch (error) {
+      const message = `Failed to close session before delete for ${sessionId}: ${error instanceof Error ? error.message : String(error)}`
+      console.error(`[pi-acp] session/delete close failed sessionId=${sessionId}: ${message}`)
+      throw RequestError.internalError({}, message)
+    }
 
     let deleted: { sessionFile: string; cwd: string } | null = null
     try {
@@ -1005,6 +1015,10 @@ export class PiAcpAgent implements ACPAgent {
         continue
       }
 
+      console.error(
+        `[pi-acp] session/delete resolved pi session file sessionId=${opts.sessionId} file=${validation.sessionFile} cwd=${validation.header.cwd}`
+      )
+
       try {
         unlinkSync(validation.sessionFile)
         console.error(
@@ -1019,6 +1033,7 @@ export class PiAcpAgent implements ACPAgent {
       return { sessionFile: validation.sessionFile, cwd: validation.header.cwd }
     }
 
+    console.error(`[pi-acp] session/delete found no validated pi session file sessionId=${opts.sessionId}`)
     return null
   }
 

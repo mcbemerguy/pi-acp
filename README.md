@@ -173,6 +173,24 @@ Practical local smoke configuration:
 
 If this cannot be smoke-tested manually, the unverified boundary is the browser click/submit step inside T3Code. Unit coverage verifies the adapter payloads and T3Code request/response shapes on both sides of that boundary.
 
+### Session close/delete lifecycle
+
+`session/close` and `session/delete` are intentionally different:
+
+- Close is non-destructive. It cancels active/queued work, lets pending ACP requests settle, disposes workflow monitors, and terminates the live `pi --mode rpc` subprocess. Pi JSONL history, `session-map.json`, and workflow artifacts remain available for `session/load`/recovery.
+- Delete is destructive for the backing Pi conversation only. It closes first, validates the resolved Pi JSONL header against the requested ACP session id and cwd, unlinks only that validated JSONL file, removes the `pi-acp` mapping entry, and marks recoverable workflow runs for that parent session aborted so they are not silently auto-resumed.
+- Delete does not remove arbitrary paths, project files, workflow audit directories, `events.jsonl`, child session artifacts, or global Pi configuration. Stale/unknown mappings are cleaned up without unlinking a file unless validation succeeds.
+
+Operational smoke tests:
+
+1. Idle delete: create a `pi-acp` session through an ACP client, delete it, confirm the session disappears from `session/list` and the mapped Pi JSONL no longer exists.
+2. Active-turn delete: start a long turn, delete the client thread/session, confirm close happens first, no `pi --mode rpc` child remains, and the JSONL is removed only after validation.
+3. Stuck cancel: simulate or reproduce a Pi turn that does not acknowledge abort; confirm logs show abort timeout/failure and subprocess kill escalation, then no live Pi process remains.
+4. Windows launcher cleanup: run through `pi.cmd`/shell on Windows and confirm escalation uses `taskkill /PID <pid> /T /F`, not only a shell kill.
+5. Stale/wrong mapping: delete an already-missing session and a mapping pointing at a wrong-session/wrong-cwd JSONL; confirm the mapping cleanup is safe and the wrong file remains.
+
+Diagnostics are written to stderr with `[pi-acp]` prefixes for delete request parameters, close-before-delete failure, resolved session file, validation refusal reason, unlink failure/success, workflow abort failure, and process kill escalation.
+
 ### Workflow recovery
 
 For detached Pi `/workflow:*` runs, `pi-acp` is a presenter/control bridge rather than the source of truth. Pi workflow artifacts remain authoritative: `run.json` stores the state machine, `events.jsonl` is the replayable event stream, child session artifacts prove final handoffs, and `audit.md` is the human-readable recovery record. Recovery does not depend on inserting workflow progress into model-visible context.
