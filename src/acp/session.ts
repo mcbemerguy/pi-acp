@@ -38,6 +38,8 @@ import { PI_USAGE_UPDATE_METHOD, piUsageTelemetryFromPiSessionStats, usageUpdate
 
 const CANCEL_ABORT_TIMEOUT_MS = 3_500
 const CANCEL_DRAIN_TIMEOUT_MS = 2_000
+const CLOSE_CANCEL_TIMEOUT_MS = 5_000
+const CLOSE_SETTLEMENT_TIMEOUT_MS = 1_000
 const USAGE_REFRESH_DEBOUNCE_MS = 150
 const USAGE_REFRESH_MIN_INTERVAL_MS = 250
 const AGENT_END_RETRY_GRACE_MS = 100
@@ -296,6 +298,7 @@ export class PiAcpSession {
   private drainingOutbound = false
   private outboundDrainWaiters: Array<() => void> = []
   private outboundDiagnosticQueued = false
+  private shuttingDown = false
   private outboundPressure: OutboundPressureSnapshot = {
     enqueued: 0,
     completed: 0,
@@ -342,6 +345,7 @@ export class PiAcpSession {
   }
 
   dispose(opts: { disposeProcess?: boolean; signal?: NodeJS.Signals | number; settle?: boolean } = {}): void {
+    this.beginShutdown()
     if (opts.settle !== false) this.settleCancelledWorkForShutdown()
     this.disposeRuntimeResources()
     if (opts.disposeProcess !== false) this.proc.dispose?.(opts.signal ?? 'SIGTERM')
@@ -352,9 +356,11 @@ export class PiAcpSession {
       `[pi-acp] session/close received sessionId=${this.sessionId} pendingTurn=${Boolean(this.pendingTurn)} workflowContinuation=${this.workflowContinuationActive} queuedTurns=${this.turnQueue.length}`
     )
 
+    this.beginShutdown()
+
     if (this.hasActiveWork()) {
       try {
-        await this.cancel()
+        await this.withTimeout(this.cancel(), CLOSE_CANCEL_TIMEOUT_MS, 'session close cancellation')
       } catch (error) {
         console.error(
           `[pi-acp] session close cancellation failed sessionId=${this.sessionId}: ${error instanceof Error ? error.message : String(error)}`
@@ -363,7 +369,13 @@ export class PiAcpSession {
     }
 
     this.settleCancelledWorkForShutdown()
-    await this.waitForTurnSettlement()
+    try {
+      await this.withTimeout(this.waitForTurnSettlement(), CLOSE_SETTLEMENT_TIMEOUT_MS, 'session close settlement')
+    } catch (error) {
+      console.error(
+        `[pi-acp] session close settlement timed out sessionId=${this.sessionId}: ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
 
     const proc = this.proc as PiRpcProcess & {
       terminate?: (opts?: { gracefulTimeoutMs?: number; killTimeoutMs?: number }) => Promise<void>
@@ -440,7 +452,7 @@ export class PiAcpSession {
       try {
         await this.withTimeout(this.proc.abort(), this.cancelAbortTimeoutMs, 'pi abort')
         if (this.workflowContinuationActive) {
-          this.startCancelledTurnDrain()
+          if (!this.shuttingDown) this.startCancelledTurnDrain()
           this.workflowContinuationCancel?.()
         } else {
           this.completingWorkflowMonitor?.dispose()
@@ -558,6 +570,11 @@ export class PiAcpSession {
   }
 
   private enqueueOutbound(item: OutboundQueueItem): void {
+    if (this.shuttingDown) {
+      item.resolve?.()
+      return
+    }
+
     this.outboundPressure.enqueued += 1
     if (this.coalesceOutbound(item)) {
       this.outboundPressure.coalesced += 1
@@ -653,8 +670,21 @@ export class PiAcpSession {
 
   private resolveOutboundDrainWaiters(): void {
     if (this.currentOutboundPending() !== 0) return
+    this.resolveAllOutboundDrainWaiters()
+  }
+
+  private resolveAllOutboundDrainWaiters(): void {
     const waiters = this.outboundDrainWaiters.splice(0, this.outboundDrainWaiters.length)
     for (const resolve of waiters) resolve()
+  }
+
+  private beginShutdown(): void {
+    if (this.shuttingDown) return
+    this.shuttingDown = true
+    const queued = this.outboundQueue.splice(0, this.outboundQueue.length)
+    for (const item of queued) item.resolve?.()
+    this.updateOutboundPendingPressure()
+    this.resolveAllOutboundDrainWaiters()
   }
 
   private emit(update: SessionUpdate): void {
@@ -776,7 +806,7 @@ export class PiAcpSession {
   }
 
   private async flushEmits(): Promise<void> {
-    if (this.currentOutboundPending() === 0) return
+    if (this.shuttingDown || this.currentOutboundPending() === 0) return
     await new Promise<void>(resolve => this.outboundDrainWaiters.push(resolve))
   }
 
@@ -928,6 +958,7 @@ export class PiAcpSession {
     this.proc
       .prompt(t.message, t.images)
       .then(() => {
+        if (this.shuttingDown) return
         this.handlePromptAccepted(t)
         this.promptAckFallbackTimer = setTimeout(() => {
           this.promptAckFallbackTimer = null
@@ -937,6 +968,7 @@ export class PiAcpSession {
         }, 100)
       })
       .catch(err => {
+        if (this.shuttingDown) return
         const authErr = maybeAuthRequiredError(err)
         if (authErr) {
           this.completeTurn('error', { reject: authErr, proceedQueue: false })
@@ -992,7 +1024,7 @@ export class PiAcpSession {
     const monitor = this.currentWorkflowMonitor
     this.currentWorkflowMonitor = null
     this.completingWorkflowMonitor = monitor
-    if (opts.drainPiEvents) this.startCancelledTurnDrain()
+    if (opts.drainPiEvents && !this.shuttingDown) this.startCancelledTurnDrain()
 
     void (async () => {
       if (monitor) {

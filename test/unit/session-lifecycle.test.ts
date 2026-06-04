@@ -44,6 +44,29 @@ test('PiAcpSession: close cancels active work and disposes the subprocess', asyn
   assert.equal(proc.disposeCount, 1)
 })
 
+test('PiAcpSession: close terminates even when outbound session updates are blocked', async () => {
+  const conn = new FakeAgentSideConnection()
+  conn.sessionUpdateBlocker = new Promise(() => {})
+  const proc = new FakePiRpcProcess()
+  const session = new PiAcpSession({
+    sessionId: 'blocked-close',
+    cwd: '/tmp/project',
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    cancelDrainTimeoutMs: 5
+  })
+
+  const prompt = session.prompt('work')
+  await wait()
+
+  const result = await Promise.race([session.close().then(() => 'closed'), wait(200).then(() => 'timeout')])
+
+  assert.equal(result, 'closed')
+  assert.equal(await prompt, 'cancelled')
+  assert.equal(proc.disposeCount, 1)
+})
+
 test('PiAcpAgent: session/close is safe for unknown sessions', async () => {
   const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
 
@@ -126,6 +149,31 @@ test('PiAcpAgent: delete removes stale store entries without unlinking arbitrary
 
   assert.deepEqual(deletedSessionIds, ['missing-session'])
   assert.equal(existsSync(missing), false)
+})
+
+test('PiAcpAgent: delete preserves store mapping and reports failure when unlink fails', async () => {
+  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
+  const deletedSessionIds: string[] = []
+
+  ;(agent as any).store = {
+    get: () => ({
+      sessionId: 'unlink-fails',
+      cwd: '/tmp/project',
+      sessionFile: '/tmp/project/unlink-fails.jsonl',
+      updatedAt: '2026-02-11T00:00:00.000Z'
+    }),
+    delete: (sessionId: string) => deletedSessionIds.push(sessionId),
+    list: () => []
+  }
+  ;(agent as any).deleteValidatedPiSessionFile = () => {
+    throw new Error('EACCES: permission denied')
+  }
+
+  await assert.rejects(
+    agent.unstable_deleteSession({ sessionId: 'unlink-fails', _meta: null } as any),
+    /Failed to delete session file for unlink-fails: EACCES/
+  )
+  assert.deepEqual(deletedSessionIds, [])
 })
 
 test('PiAcpAgent: delete refuses wrong-session and wrong-cwd mapped files', async () => {

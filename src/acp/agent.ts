@@ -947,14 +947,21 @@ export class PiAcpAgent implements ACPAgent {
     const expectedCwd = activeCwd ?? stored?.cwd ?? this.lastSessionCwd
 
     await this.closeManagedSession(sessionId)
-    this.store.delete(sessionId)
 
-    const deleted = this.deleteValidatedPiSessionFile({
-      sessionId,
-      expectedCwd,
-      activeSessionFile,
-      storedSessionFile: stored?.sessionFile ?? null
-    })
+    let deleted: { sessionFile: string; cwd: string } | null = null
+    try {
+      deleted = this.deleteValidatedPiSessionFile({
+        sessionId,
+        expectedCwd,
+        activeSessionFile,
+        storedSessionFile: stored?.sessionFile ?? null
+      })
+    } catch (error) {
+      const message = `Failed to delete session file for ${sessionId}: ${error instanceof Error ? error.message : String(error)}`
+      throw RequestError.internalError({}, message)
+    }
+
+    this.store.delete(sessionId)
 
     const workflowCwd = activeCwd ?? stored?.cwd ?? deleted?.cwd ?? expectedCwd
     if (workflowCwd) this.abortRecoverableWorkflowRunsForDeletedSession(sessionId, workflowCwd)
@@ -1007,6 +1014,7 @@ export class PiAcpAgent implements ACPAgent {
         console.error(
           `[pi-acp] session/delete failed to unlink pi session file sessionId=${opts.sessionId} file=${validation.sessionFile}: ${error instanceof Error ? error.message : String(error)}`
         )
+        throw error
       }
       return { sessionFile: validation.sessionFile, cwd: validation.header.cwd }
     }
