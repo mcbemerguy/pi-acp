@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -47,6 +47,57 @@ test('readWorkflowRunEvents does not consume an unterminated final JSONL record'
     )
     assert.equal(second.events[0]?.sequence, 2)
   } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('readWorkflowRunEvents stops parsing a large file after a limited page is satisfied', () => {
+  const root = join(tmpdir(), `pi-acp-workflows-large-page-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  const runDir = join(workflowRunsDir, 'run')
+  const eventsPath = join(runDir, 'events.jsonl')
+  mkdirSync(runDir, { recursive: true })
+  writeRunJson(runDir, { workflowId: 'wf' })
+  const fd = openSync(eventsPath, 'w')
+  let expectedNextOffset = 0
+  try {
+    for (let sequence = 1; sequence <= 5; sequence += 1) {
+      expectedNextOffset += writeSync(
+        fd,
+        `${JSON.stringify({ type: 'step_update', sequence, runId: 'run', workflowId: 'wf', stepId: `step-${sequence}` })}\n`
+      )
+    }
+    writeSync(fd, '{ malformed json after requested page\n')
+    const payload = 'x'.repeat(512)
+    for (let sequence = 6; sequence <= 12_000; sequence += 1) {
+      writeSync(
+        fd,
+        `${JSON.stringify({ type: 'child_pi_event', sequence, runId: 'run', workflowId: 'wf', stepId: 'bulk', payload })}\n`
+      )
+    }
+  } finally {
+    closeSync(fd)
+  }
+
+  const originalParse = JSON.parse
+  let parseCalls = 0
+  JSON.parse = ((text: string, reviver?: Parameters<typeof JSON.parse>[1]) => {
+    parseCalls += 1
+    return originalParse(text, reviver)
+  }) as typeof JSON.parse
+  try {
+    const replay = readWorkflowRunEvents('run', { workflowRunsDir, limit: 5 })
+    assert.deepEqual(
+      replay.events.map(event => event.sequence),
+      [1, 2, 3, 4, 5]
+    )
+    assert.equal(replay.nextOffset, expectedNextOffset)
+    assert.equal(replay.malformedLineCount, 0)
+    assert.equal(replay.lastSequence, 5)
+    assert.equal(parseCalls, 6)
+    assert.ok(replay.nextOffset < statSync(eventsPath).size)
+  } finally {
+    JSON.parse = originalParse
     rmSync(root, { recursive: true, force: true })
   }
 })

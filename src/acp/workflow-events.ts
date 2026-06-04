@@ -845,11 +845,9 @@ export class WorkflowEventMonitor {
     includeTerminalFallback: boolean
   ): void {
     let stat: ReturnType<typeof statSync>
-    let buffer: Buffer
     try {
       stat = statSync(tail.filePath)
       if (!stat.isFile()) return
-      buffer = readFileSync(tail.filePath)
     } catch {
       return
     }
@@ -859,51 +857,46 @@ export class WorkflowEventMonitor {
     tail.offset = stat.size
     tail.buffer = ''
     tail.bufferStartOffset = stat.size
-    let cursor = 0
     let sawRunEnd = false
     let maxSequence = 0
-    while (cursor < buffer.length) {
-      const lineStart = cursor
-      const newlineIndex = buffer.indexOf(0x0a, cursor)
-      if (newlineIndex === -1) {
-        tail.bufferStartOffset = lineStart
-        tail.buffer = tail.decoder.write(buffer.subarray(lineStart))
+
+    scanJsonlFile(tail.filePath, 0, stat.size, {
+      onLine: (line, lineStart, lineNextOffset) => {
+        const trimmed = line.toString('utf8').trim()
+        if (!trimmed) return true
+        let record: unknown
+        try {
+          record = JSON.parse(trimmed)
+        } catch {
+          this.ingestion.malformedLines += 1
+          return true
+        }
+        if (isObject(record)) {
+          this.ingestion.recordsObserved += 1
+          if (record.type === 'run_end') sawRunEnd = true
+          const sequence = nonNegativeInt(record.sequence)
+          if (sequence !== undefined) maxSequence = Math.max(maxSequence, sequence)
+          if (sinceSequence !== undefined && (sequence === undefined || sequence <= sinceSequence)) return true
+          this.onRecord?.(record, this.ingestion.recordsObserved - 1)
+          this.acceptLinkedSubWorkflowRun(record)
+        }
+        const sourceIdentity = {
+          sourceKey: tailSourceKey(tail),
+          startOffset: lineStart,
+          endOffset: lineNextOffset
+        }
+        const mapped = this.mapper.mapRecord(record, sourceIdentity)
+        for (const update of mapped.updates) this.emit(update)
+        if (mapped.usageTelemetry) this.onUsageTelemetry?.(mapped.usageTelemetry)
+        if (isObject(record) && record.type === 'run_end') tail.ended = true
+        return true
+      },
+      onRemainder: (remainder, remainderStartOffset) => {
+        tail.bufferStartOffset = remainderStartOffset
+        tail.buffer = tail.decoder.write(remainder)
         this.ingestion.maxTailBufferBytes = Math.max(this.ingestion.maxTailBufferBytes, Buffer.byteLength(tail.buffer))
-        break
       }
-      const lineEnd = newlineIndex
-      const lineNextOffset = newlineIndex + 1
-      cursor = lineNextOffset
-      let contentEnd = lineEnd
-      if (contentEnd > lineStart && buffer[contentEnd - 1] === 0x0d) contentEnd -= 1
-      const trimmed = buffer.subarray(lineStart, contentEnd).toString('utf8').trim()
-      if (!trimmed) continue
-      let record: unknown
-      try {
-        record = JSON.parse(trimmed)
-      } catch {
-        this.ingestion.malformedLines += 1
-        continue
-      }
-      if (isObject(record)) {
-        this.ingestion.recordsObserved += 1
-        if (record.type === 'run_end') sawRunEnd = true
-        const sequence = nonNegativeInt(record.sequence)
-        if (sequence !== undefined) maxSequence = Math.max(maxSequence, sequence)
-        if (sinceSequence !== undefined && (sequence === undefined || sequence <= sinceSequence)) continue
-        this.onRecord?.(record, this.ingestion.recordsObserved - 1)
-        this.acceptLinkedSubWorkflowRun(record)
-      }
-      const sourceIdentity = {
-        sourceKey: tailSourceKey(tail),
-        startOffset: lineStart,
-        endOffset: lineNextOffset
-      }
-      const mapped = this.mapper.mapRecord(record, sourceIdentity)
-      for (const update of mapped.updates) this.emit(update)
-      if (mapped.usageTelemetry) this.onUsageTelemetry?.(mapped.usageTelemetry)
-      if (isObject(record) && record.type === 'run_end') tail.ended = true
-    }
+    })
 
     if (!includeTerminalFallback || sawRunEnd || tail.ended) return
     const record = readTerminalRunEndRecord(runDir, this.acceptedRunDir ?? runDir, maxSequence + 1)
@@ -1186,6 +1179,61 @@ function readFileRange(
       text += decoder.write(buffer.subarray(0, bytesRead))
     }
     return { text, bytesRead: position - startOffset }
+  } finally {
+    closeSync(fd)
+  }
+}
+
+function scanJsonlFile(
+  filePath: string,
+  startOffset: number,
+  endOffset: number,
+  handlers: {
+    onLine: (line: Buffer, lineStartOffset: number, lineNextOffset: number) => boolean
+    onRemainder?: (remainder: Buffer, remainderStartOffset: number) => void
+  }
+): void {
+  let fd: number
+  try {
+    fd = openSync(filePath, 'r')
+  } catch {
+    return
+  }
+  try {
+    const readBuffer = Buffer.allocUnsafe(Math.min(TAIL_READ_CHUNK_BYTES, Math.max(1, endOffset - startOffset)))
+    let readOffset = startOffset
+    let pending = Buffer.alloc(0)
+    let pendingStartOffset = startOffset
+
+    while (readOffset < endOffset) {
+      const bytesRead = readSync(fd, readBuffer, 0, Math.min(readBuffer.byteLength, endOffset - readOffset), readOffset)
+      if (bytesRead <= 0) break
+      const chunk = readBuffer.subarray(0, bytesRead)
+      const data = pending.length ? Buffer.concat([pending, chunk]) : chunk
+      const dataStartOffset = pending.length ? pendingStartOffset : readOffset
+      readOffset += bytesRead
+
+      let cursor = 0
+      while (cursor < data.length) {
+        const newlineIndex = data.indexOf(0x0a, cursor)
+        if (newlineIndex === -1) break
+        let contentEnd = newlineIndex
+        if (contentEnd > cursor && data[contentEnd - 1] === 0x0d) contentEnd -= 1
+        const lineNextOffset = dataStartOffset + newlineIndex + 1
+        const shouldContinue = handlers.onLine(
+          data.subarray(cursor, contentEnd),
+          dataStartOffset + cursor,
+          lineNextOffset
+        )
+        cursor = newlineIndex + 1
+        if (!shouldContinue) return
+      }
+
+      pending = Buffer.from(data.subarray(cursor))
+      pendingStartOffset = dataStartOffset + cursor
+    }
+
+    if (pending.length > 0) handlers.onRemainder?.(pending, pendingStartOffset)
   } finally {
     closeSync(fd)
   }

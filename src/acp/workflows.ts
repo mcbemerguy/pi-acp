@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { basename, join, resolve, sep } from 'node:path'
 import { getAgentDir } from './pi-settings.js'
 
@@ -60,6 +60,7 @@ export type WorkflowRunControlOptions = {
 const TERMINAL_STATUSES = new Set<WorkflowRunStatus>(['completed', 'failed', 'aborted'])
 const RECOVERABLE_STATUSES = new Set<WorkflowRunStatus>(['running', 'paused', 'interrupted', 'recovering'])
 const WORKFLOW_EVENT_ENVELOPE_VERSION = 1
+const EVENT_READ_CHUNK_BYTES = 64 * 1024
 
 export function workflowRunsDir(): string {
   return join(getAgentDir(), 'workflow-runs')
@@ -137,70 +138,30 @@ export function readWorkflowRunEvents(
 ): WorkflowEventReplayResult {
   const run = readWorkflowRun(target, options.workflowRunsDir ?? workflowRunsDir())
   const eventsPath = join(run.runDir, 'events.jsonl')
-  let buffer: Buffer
-  try {
-    buffer = readFileSync(eventsPath)
-  } catch {
-    buffer = Buffer.alloc(0)
-  }
-
-  const start = Math.min(Math.max(0, options.offset ?? 0), buffer.length)
-  const completeFileStats = scanCompleteEventFileStats(buffer)
-  const events: Record<string, unknown>[] = []
-  let malformedLineCount = 0
-  let lastSequence: number | undefined
-  let nextOffset = start
-  const sinceSequence = options.sinceSequence
-  const limit = options.limit
-  let cursor = start
-
-  while (cursor < buffer.length && (limit === undefined || events.length < limit)) {
-    const lineStart = cursor
-    const newlineIndex = buffer.indexOf(0x0a, cursor)
-    if (newlineIndex === -1) break
-    const lineEnd = newlineIndex
-    const lineNextOffset = newlineIndex + 1
-    cursor = lineNextOffset
-    nextOffset = lineNextOffset
-    let contentEnd = lineEnd
-    if (contentEnd > lineStart && buffer[contentEnd - 1] === 0x0d) contentEnd -= 1
-    const trimmed = buffer.subarray(lineStart, contentEnd).toString('utf8').trim()
-    if (!trimmed) continue
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(trimmed)
-    } catch {
-      malformedLineCount += 1
-      continue
-    }
-    if (!isRecord(parsed) || typeof parsed.type !== 'string') {
-      malformedLineCount += 1
-      continue
-    }
-    const sequence = numberField(parsed.sequence)
-    if (sequence !== undefined) lastSequence = Math.max(lastSequence ?? 0, sequence)
-    if (sinceSequence !== undefined && (sequence === undefined || sequence <= sinceSequence)) continue
-    events.push(parsed)
-  }
-
-  if (cursor >= buffer.length) nextOffset = buffer.length
+  const scan = scanWorkflowEventFile(eventsPath, {
+    offset: options.offset,
+    sinceSequence: options.sinceSequence,
+    limit: options.limit
+  })
   const result: WorkflowEventReplayResult = {
-    events,
-    nextOffset,
-    malformedLineCount,
-    ...(lastSequence !== undefined ? { lastSequence } : {})
+    events: scan.events,
+    nextOffset: scan.nextOffset,
+    malformedLineCount: scan.malformedLineCount,
+    ...(scan.lastSequence !== undefined ? { lastSequence: scan.lastSequence } : {})
   }
 
-  if (
-    options.includeTerminalFallback &&
-    !completeFileStats.sawRunEnd &&
-    (limit === undefined || events.length < limit)
-  ) {
-    const fallback = terminalRunEndRecord(run, completeFileStats.maxSequence + 1)
-    if (fallback && (sinceSequence === undefined || numberField(fallback.sequence)! > sinceSequence)) {
-      result.events.push(fallback)
-      result.terminalFallback = fallback
-      result.lastSequence = Math.max(result.lastSequence ?? 0, numberField(fallback.sequence) ?? 0)
+  if (options.includeTerminalFallback && (options.limit === undefined || result.events.length < options.limit)) {
+    const stats = scan.startOffset === 0 && scan.reachedEnd ? scan : scanCompleteEventFileStats(eventsPath)
+    if (!stats.sawRunEnd) {
+      const fallback = terminalRunEndRecord(run, stats.maxSequence + 1)
+      if (
+        fallback &&
+        (options.sinceSequence === undefined || numberField(fallback.sequence)! > options.sinceSequence)
+      ) {
+        result.events.push(fallback)
+        result.terminalFallback = fallback
+        result.lastSequence = Math.max(result.lastSequence ?? 0, numberField(fallback.sequence) ?? 0)
+      }
     }
   }
 
@@ -277,20 +238,7 @@ export function abortWorkflowRun(target: string, options: WorkflowRunControlOpti
 }
 
 export function workflowRunHasRunEnd(runDir: string): boolean {
-  try {
-    const content = readFileSync(join(runDir, 'events.jsonl'), 'utf8')
-    return content.split(/\r?\n/).some(line => {
-      if (!line.trim()) return false
-      try {
-        const parsed: unknown = JSON.parse(line)
-        return isRecord(parsed) && parsed.type === 'run_end'
-      } catch {
-        return false
-      }
-    })
-  } catch {
-    return false
-  }
+  return scanCompleteEventFileStats(join(runDir, 'events.jsonl')).sawRunEnd
 }
 
 function safeReadRunDirs(root: string): string[] {
@@ -385,31 +333,143 @@ function numberField(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
-function scanCompleteEventFileStats(buffer: Buffer): { maxSequence: number; sawRunEnd: boolean } {
-  let cursor = 0
-  let maxSequence = 0
-  let sawRunEnd = false
-  while (cursor < buffer.length) {
-    const newlineIndex = buffer.indexOf(0x0a, cursor)
-    if (newlineIndex === -1) break
-    const lineStart = cursor
-    let contentEnd = newlineIndex
-    cursor = newlineIndex + 1
-    if (contentEnd > lineStart && buffer[contentEnd - 1] === 0x0d) contentEnd -= 1
-    const trimmed = buffer.subarray(lineStart, contentEnd).toString('utf8').trim()
-    if (!trimmed) continue
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(trimmed)
-    } catch {
-      continue
-    }
-    if (!isRecord(parsed)) continue
-    if (parsed.type === 'run_end') sawRunEnd = true
-    const sequence = numberField(parsed.sequence)
-    if (sequence !== undefined && sequence > maxSequence) maxSequence = sequence
+function scanWorkflowEventFile(
+  eventsPath: string,
+  options: { offset?: number; sinceSequence?: number; limit?: number }
+): {
+  events: Record<string, unknown>[]
+  nextOffset: number
+  lastSequence?: number
+  malformedLineCount: number
+  startOffset: number
+  reachedEnd: boolean
+  maxSequence: number
+  sawRunEnd: boolean
+} {
+  const size = readFileSize(eventsPath)
+  const startOffset = Math.min(Math.max(0, options.offset ?? 0), size)
+  const events: Record<string, unknown>[] = []
+  const result = {
+    events,
+    nextOffset: startOffset,
+    lastSequence: undefined as number | undefined,
+    malformedLineCount: 0,
+    startOffset,
+    reachedEnd: startOffset >= size,
+    maxSequence: 0,
+    sawRunEnd: false
   }
-  return { maxSequence, sawRunEnd }
+  if (options.limit !== undefined && options.limit <= 0) return result
+  if (startOffset >= size) return result
+
+  scanJsonlLines(eventsPath, startOffset, size, (line, lineNextOffset) => {
+    result.nextOffset = lineNextOffset
+    const parsed = parseEventLine(line)
+    if (parsed.status === 'blank') return true
+    if (parsed.status === 'malformed') {
+      result.malformedLineCount += 1
+      return true
+    }
+    const record = parsed.record
+    if (record.type === 'run_end') result.sawRunEnd = true
+    const sequence = numberField(record.sequence)
+    if (sequence !== undefined) {
+      result.lastSequence = Math.max(result.lastSequence ?? 0, sequence)
+      result.maxSequence = Math.max(result.maxSequence, sequence)
+    }
+    if (options.sinceSequence !== undefined && (sequence === undefined || sequence <= options.sinceSequence))
+      return true
+    events.push(record)
+    return options.limit === undefined || events.length < options.limit
+  })
+
+  result.reachedEnd = result.nextOffset >= size && (options.limit === undefined || events.length < options.limit)
+  if (result.reachedEnd) result.nextOffset = size
+  return result
+}
+
+function scanCompleteEventFileStats(eventsPath: string): { maxSequence: number; sawRunEnd: boolean } {
+  const size = readFileSize(eventsPath)
+  const stats = { maxSequence: 0, sawRunEnd: false }
+  if (size <= 0) return stats
+  scanJsonlLines(eventsPath, 0, size, line => {
+    const parsed = parseEventLine(line)
+    if (parsed.status !== 'event') return true
+    if (parsed.record.type === 'run_end') stats.sawRunEnd = true
+    const sequence = numberField(parsed.record.sequence)
+    if (sequence !== undefined && sequence > stats.maxSequence) stats.maxSequence = sequence
+    return true
+  })
+  return stats
+}
+
+function scanJsonlLines(
+  eventsPath: string,
+  startOffset: number,
+  size: number,
+  onLine: (line: Buffer, lineNextOffset: number) => boolean
+): void {
+  let fd: number
+  try {
+    fd = openSync(eventsPath, 'r')
+  } catch {
+    return
+  }
+  try {
+    const readBuffer = Buffer.allocUnsafe(Math.min(EVENT_READ_CHUNK_BYTES, Math.max(1, size - startOffset)))
+    let readOffset = startOffset
+    let pending = Buffer.alloc(0)
+    let pendingStartOffset = startOffset
+
+    while (readOffset < size) {
+      const bytesRead = readSync(fd, readBuffer, 0, Math.min(readBuffer.byteLength, size - readOffset), readOffset)
+      if (bytesRead <= 0) break
+      const chunk = readBuffer.subarray(0, bytesRead)
+      const data = pending.length ? Buffer.concat([pending, chunk]) : chunk
+      const dataStartOffset = pending.length ? pendingStartOffset : readOffset
+      readOffset += bytesRead
+
+      let cursor = 0
+      while (cursor < data.length) {
+        const newlineIndex = data.indexOf(0x0a, cursor)
+        if (newlineIndex === -1) break
+        let contentEnd = newlineIndex
+        if (contentEnd > cursor && data[contentEnd - 1] === 0x0d) contentEnd -= 1
+        const lineNextOffset = dataStartOffset + newlineIndex + 1
+        const shouldContinue = onLine(data.subarray(cursor, contentEnd), lineNextOffset)
+        cursor = newlineIndex + 1
+        if (!shouldContinue) return
+      }
+
+      pending = Buffer.from(data.subarray(cursor))
+      pendingStartOffset = dataStartOffset + cursor
+    }
+  } finally {
+    closeSync(fd)
+  }
+}
+
+function parseEventLine(
+  line: Buffer
+): { status: 'blank' } | { status: 'malformed' } | { status: 'event'; record: Record<string, unknown> } {
+  const trimmed = line.toString('utf8').trim()
+  if (!trimmed) return { status: 'blank' }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    return { status: 'malformed' }
+  }
+  if (!isRecord(parsed) || typeof parsed.type !== 'string') return { status: 'malformed' }
+  return { status: 'event', record: parsed }
+}
+
+function readFileSize(filePath: string): number {
+  try {
+    return statSync(filePath).size
+  } catch {
+    return 0
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
