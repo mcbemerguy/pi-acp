@@ -175,7 +175,7 @@ If this cannot be smoke-tested manually, the unverified boundary is the browser 
 
 ### Session close/delete lifecycle
 
-`session/close` and `session/delete` are intentionally different:
+`session/close` and private `_pi/session/delete` are intentionally different. ACP does not currently define a stable `session/delete`; `pi-acp` advertises destructive cleanup as a private extension in `_meta.piAcp.sessionDelete` with `sessionDeleteMethod: "_pi/session/delete"`. The legacy experimental `session/delete` SDK hook remains accepted for older clients, but is not advertised as stable ACP.
 
 - Close is non-destructive. It cancels active/queued work, lets pending ACP requests settle, disposes workflow monitors, and terminates the live `pi --mode rpc` subprocess. Pi JSONL history, `session-map.json`, and workflow artifacts remain available for `session/load`/recovery.
 - Delete is destructive for the backing Pi conversation only. It closes first, validates the resolved Pi JSONL header against the requested ACP session id and cwd, unlinks only that validated JSONL file, removes the `pi-acp` mapping entry, and marks recoverable workflow runs for that parent session aborted so they are not silently auto-resumed.
@@ -189,7 +189,7 @@ Operational smoke tests:
 4. Windows launcher cleanup: run through `pi.cmd`/shell on Windows and confirm escalation uses `taskkill /PID <pid> /T /F`, not only a shell kill.
 5. Stale/wrong mapping: delete an already-missing session and a mapping pointing at a wrong-session/wrong-cwd JSONL; confirm the mapping cleanup is safe and the wrong file remains.
 
-Diagnostics are written to stderr with `[pi-acp]` prefixes for delete request parameters, close-before-delete failure, resolved session file, validation refusal reason, unlink failure/success, workflow abort failure, and process kill escalation.
+Diagnostics are written to stderr with `[pi-acp]` prefixes for `_pi/session/delete` request parameters, close-before-delete failure, resolved session file, validation refusal reason, unlink failure/success, workflow abort failure, and process kill escalation.
 
 ### Workflow recovery
 

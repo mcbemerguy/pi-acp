@@ -182,6 +182,7 @@ export async function discoverAvailableCommands(
 import { fileURLToPath } from 'node:url'
 
 const PI_STEER_METHOD = '_pi/steer'
+const PI_SESSION_DELETE_METHOD = '_pi/session/delete'
 
 type PiSteerParams = {
   sessionId: string
@@ -291,11 +292,12 @@ export class PiAcpAgent implements ACPAgent {
         sessionCapabilities: {
           // Enables a native session picker in clients that support session/list.
           list: {},
-          close: {},
-          delete: {}
+          close: {}
         },
         _meta: {
           piAcp: {
+            sessionDelete: true,
+            sessionDeleteMethod: PI_SESSION_DELETE_METHOD,
             extensionUiEvents: true,
             extensionUiEventMethod: PI_EXTENSION_UI_EVENT_METHOD,
             usageTelemetry: true,
@@ -939,6 +941,10 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async unstable_deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+    return this.deleteBackingSession(params, 'session/delete')
+  }
+
+  private async deleteBackingSession(params: DeleteSessionRequest, method: string): Promise<DeleteSessionResponse> {
     const sessionId = params.sessionId
     const active = this.sessions.maybeGet(sessionId)
     const stored = this.store.get(sessionId)
@@ -947,20 +953,21 @@ export class PiAcpAgent implements ACPAgent {
     const expectedCwd = activeCwd ?? stored?.cwd ?? this.lastSessionCwd
 
     console.error(
-      `[pi-acp] session/delete requested sessionId=${sessionId} active=${Boolean(active)} stored=${Boolean(stored)} expectedCwd=${expectedCwd ?? 'unknown'} activeSessionFile=${activeSessionFile ?? 'none'} storedSessionFile=${stored?.sessionFile ?? 'none'}`
+      `[pi-acp] ${method} requested sessionId=${sessionId} active=${Boolean(active)} stored=${Boolean(stored)} expectedCwd=${expectedCwd ?? 'unknown'} activeSessionFile=${activeSessionFile ?? 'none'} storedSessionFile=${stored?.sessionFile ?? 'none'}`
     )
 
     try {
       await this.closeManagedSession(sessionId)
     } catch (error) {
       const message = `Failed to close session before delete for ${sessionId}: ${error instanceof Error ? error.message : String(error)}`
-      console.error(`[pi-acp] session/delete close failed sessionId=${sessionId}: ${message}`)
+      console.error(`[pi-acp] ${method} close failed sessionId=${sessionId}: ${message}`)
       throw RequestError.internalError({}, message)
     }
 
     let deleted: { sessionFile: string; cwd: string } | null = null
     try {
       deleted = this.deleteValidatedPiSessionFile({
+        method,
         sessionId,
         expectedCwd,
         activeSessionFile,
@@ -974,7 +981,7 @@ export class PiAcpAgent implements ACPAgent {
     this.store.delete(sessionId)
 
     const workflowCwd = activeCwd ?? stored?.cwd ?? deleted?.cwd ?? expectedCwd
-    if (workflowCwd) this.abortRecoverableWorkflowRunsForDeletedSession(sessionId, workflowCwd)
+    if (workflowCwd) this.abortRecoverableWorkflowRunsForDeletedSession(sessionId, workflowCwd, method)
 
     return {}
   }
@@ -989,6 +996,7 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   private deleteValidatedPiSessionFile(opts: {
+    method: string
     sessionId: string
     expectedCwd?: string | null
     activeSessionFile?: string | null
@@ -1010,47 +1018,53 @@ export class PiAcpAgent implements ACPAgent {
       const validation = validatePiSessionFile(candidate.file, { sessionId: opts.sessionId, cwd: candidate.cwd })
       if (!validation.ok) {
         console.error(
-          `[pi-acp] session/delete refused to unlink invalid session file sessionId=${opts.sessionId} file=${candidate.file} reason=${validation.reason}`
+          `[pi-acp] ${opts.method} refused to unlink invalid session file sessionId=${opts.sessionId} file=${candidate.file} reason=${validation.reason}`
         )
         continue
       }
 
       console.error(
-        `[pi-acp] session/delete resolved pi session file sessionId=${opts.sessionId} file=${validation.sessionFile} cwd=${validation.header.cwd}`
+        `[pi-acp] ${opts.method} resolved pi session file sessionId=${opts.sessionId} file=${validation.sessionFile} cwd=${validation.header.cwd}`
       )
 
       try {
         unlinkSync(validation.sessionFile)
         console.error(
-          `[pi-acp] session/delete unlinked pi session file sessionId=${opts.sessionId} file=${validation.sessionFile}`
+          `[pi-acp] ${opts.method} unlinked pi session file sessionId=${opts.sessionId} file=${validation.sessionFile}`
         )
       } catch (error) {
         console.error(
-          `[pi-acp] session/delete failed to unlink pi session file sessionId=${opts.sessionId} file=${validation.sessionFile}: ${error instanceof Error ? error.message : String(error)}`
+          `[pi-acp] ${opts.method} failed to unlink pi session file sessionId=${opts.sessionId} file=${validation.sessionFile}: ${error instanceof Error ? error.message : String(error)}`
         )
         throw error
       }
       return { sessionFile: validation.sessionFile, cwd: validation.header.cwd }
     }
 
-    console.error(`[pi-acp] session/delete found no validated pi session file sessionId=${opts.sessionId}`)
+    console.error(`[pi-acp] ${opts.method} found no validated pi session file sessionId=${opts.sessionId}`)
     return null
   }
 
-  private abortRecoverableWorkflowRunsForDeletedSession(sessionId: string, cwd: string): void {
+  private abortRecoverableWorkflowRunsForDeletedSession(sessionId: string, cwd: string, method: string): void {
     const runs = listRecoverableWorkflowRunsForSession({ cwd, parentSessionId: sessionId })
     for (const run of runs) {
       try {
         abortWorkflowRun(run.runDir || run.id, { reason: 'Parent ACP session was deleted.' })
       } catch (error) {
         console.error(
-          `[pi-acp] session/delete failed to abort workflow run sessionId=${sessionId} runId=${run.id}: ${error instanceof Error ? error.message : String(error)}`
+          `[pi-acp] ${method} failed to abort workflow run sessionId=${sessionId} runId=${run.id}: ${error instanceof Error ? error.message : String(error)}`
         )
       }
     }
   }
 
   async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (method === PI_SESSION_DELETE_METHOD) {
+      const sessionId = typeof params.sessionId === 'string' ? params.sessionId.trim() : ''
+      if (!sessionId) throw RequestError.invalidParams({}, 'sessionId must be a non-empty string')
+      return this.deleteBackingSession({ sessionId }, method)
+    }
+
     if (method === PI_STEER_METHOD) {
       const steerParams = this.parsePiSteerParams(params)
       const session = this.sessions.get(steerParams.sessionId)

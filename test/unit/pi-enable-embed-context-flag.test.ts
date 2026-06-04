@@ -39,6 +39,8 @@ test('PiAcpAgent: advertises Pi ACP extension UI custom notifications in capabil
   const res = await agent.initialize({ protocolVersion: 1 } as any)
 
   assert.deepEqual(res.agentCapabilities?._meta?.piAcp, {
+    sessionDelete: true,
+    sessionDeleteMethod: '_pi/session/delete',
     extensionUiEvents: true,
     extensionUiEventMethod: '_pi/extension_ui_event',
     usageTelemetry: true,

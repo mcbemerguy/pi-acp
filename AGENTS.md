@@ -15,7 +15,7 @@ Pi RPC mode is effectively single-session, so the adapter maps:
 - `session/prompt` → send `{type:"prompt"}` to that process and stream events back as `session/update`
 - `session/cancel` → interrupt the active Pi turn without implying terminal workflow abort
 - `session/close` → non-destructive runtime cleanup; keep Pi JSONL history and mappings resumable
-- `session/delete` → close first, then remove only a validated backing Pi JSONL and session-map entry
+- `_pi/session/delete` private extension → close first, then remove only a validated backing Pi JSONL and session-map entry (legacy experimental `session/delete` may be accepted for old clients, but is not advertised as stable ACP)
 
 ### ACP server wiring (modeled after opencode)
 

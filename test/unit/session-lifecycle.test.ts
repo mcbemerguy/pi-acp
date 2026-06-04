@@ -11,14 +11,16 @@ import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpe
 
 const wait = (ms = 0) => new Promise(resolve => setTimeout(resolve, ms))
 
-test('PiAcpAgent: advertises close and experimental delete session capabilities', async () => {
+test('PiAcpAgent: advertises close and private Pi delete session capabilities', async () => {
   const conn = new FakeAgentSideConnection()
   const agent = new PiAcpAgent(asAgentConn(conn))
 
   const response = await agent.initialize({ protocolVersion: 1, clientCapabilities: {}, _meta: null } as any)
 
   assert.deepEqual(response.agentCapabilities?.sessionCapabilities?.close, {})
-  assert.deepEqual(response.agentCapabilities?.sessionCapabilities?.delete, {})
+  assert.equal((response.agentCapabilities?.sessionCapabilities as any)?.delete, undefined)
+  assert.deepEqual((response.agentCapabilities?._meta as any)?.piAcp?.sessionDelete, true)
+  assert.deepEqual((response.agentCapabilities?._meta as any)?.piAcp?.sessionDeleteMethod, '_pi/session/delete')
 })
 
 test('PiAcpSession: close cancels active work and disposes the subprocess', async () => {
@@ -104,6 +106,33 @@ test('PiAcpAgent: delete closes an active session, removes the store entry, and 
 
     assert.equal(closedSessionId, 'delete-active')
     assert.deepEqual(deletedSessionIds, ['delete-active'])
+    assert.equal(existsSync(sessionFile), false)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('PiAcpAgent: private delete extension removes a validated mapped session', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-private-delete-'))
+  const sessionFile = writeSessionFile(root, 'private-delete', '/tmp/project')
+  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
+  const deletedSessionIds: string[] = []
+
+  ;(agent as any).store = {
+    get: () => ({
+      sessionId: 'private-delete',
+      cwd: '/tmp/project',
+      sessionFile,
+      updatedAt: '2026-02-11T00:00:00.000Z'
+    }),
+    delete: (sessionId: string) => deletedSessionIds.push(sessionId),
+    list: () => []
+  }
+
+  try {
+    await agent.extMethod('_pi/session/delete', { sessionId: 'private-delete' })
+
+    assert.deepEqual(deletedSessionIds, ['private-delete'])
     assert.equal(existsSync(sessionFile), false)
   } finally {
     rmSync(root, { recursive: true, force: true })
