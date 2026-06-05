@@ -27,7 +27,7 @@ import {
 } from '@agentclientprotocol/sdk'
 import { getAuthMethods } from './auth.js'
 import { SessionManager } from './session.js'
-import { SessionStore } from './session-store.js'
+import { SessionStore, type StoredSession } from './session-store.js'
 import { PiRpcProcess, PiRpcProcessLifecycleError, PiRpcSpawnError } from '../pi-rpc/process.js'
 import { findPiSessionFile, listPiSessions, resolveStoredPiSessionFile, validatePiSessionFile } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
@@ -957,7 +957,7 @@ export class PiAcpAgent implements ACPAgent {
   private async deleteBackingSession(params: DeleteSessionRequest, method: string): Promise<DeleteSessionResponse> {
     const sessionId = params.sessionId
     const active = this.sessions.maybeGet(sessionId)
-    const stored = this.store.get(sessionId)
+    const stored = this.getStoredSessionForDelete(sessionId)
     const activeCwd = active?.cwd ?? null
     const activeSessionFile = active?.getSessionFile() ?? null
     const expectedCwd = activeCwd ?? stored?.cwd ?? this.lastSessionCwd
@@ -1020,6 +1020,11 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     this.sessions.close(sessionId)
+  }
+
+  private getStoredSessionForDelete(sessionId: string): StoredSession | null {
+    const store = this.store as SessionStore & { getIncludingMissing?: (sessionId: string) => StoredSession | null }
+    return typeof store.getIncludingMissing === 'function' ? store.getIncludingMissing(sessionId) : store.get(sessionId)
   }
 
   private deleteValidatedPiSessionFile(opts: {
@@ -1091,9 +1096,10 @@ export class PiAcpAgent implements ACPAgent {
     const runs = listRecoverableWorkflowRunsForSession({ cwd, parentSessionId: sessionId })
     const cleanup: DeleteWorkflowCleanup = { abortedRunIds: [], failures: [] }
     for (const run of runs) {
+      if (!isRecoverableWorkflowStatus(run.status)) continue
       try {
-        abortWorkflowRun(run.runDir || run.id, { reason: 'Parent ACP session was deleted.' })
-        cleanup.abortedRunIds.push(run.id)
+        const next = abortWorkflowRun(run.runDir || run.id, { reason: 'Parent ACP session was deleted.' })
+        if (next.status === 'aborted') cleanup.abortedRunIds.push(run.id)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         cleanup.failures.push({ runId: run.id, error: message })

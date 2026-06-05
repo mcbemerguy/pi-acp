@@ -54,6 +54,11 @@ export class SessionStore {
     return null
   }
 
+  getIncludingMissing(sessionId: string): StoredSession | null {
+    const db = loadFile(this.path)
+    return db.sessions[sessionId] ?? null
+  }
+
   list(): StoredSession[] {
     const db = loadFile(this.path)
     const sessions = Object.values(db.sessions).filter(entry => existsSync(entry.sessionFile))

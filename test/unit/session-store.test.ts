@@ -40,7 +40,9 @@ test('SessionStore: prunes mappings whose session files no longer exist', () => 
 
   const store = new SessionStore(mapPath)
 
+  assert.equal(store.getIncludingMissing('missing')?.sessionFile, missingSessionFile)
   assert.equal(store.get('missing'), null)
+  assert.equal(store.getIncludingMissing('missing'), null)
   assert.deepEqual(
     store.list().map(entry => entry.sessionId),
     ['existing']

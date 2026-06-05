@@ -6,6 +6,7 @@ import { join } from 'node:path'
 
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { PiAcpSession } from '../../src/acp/session.js'
+import { SessionStore } from '../../src/acp/session-store.js'
 import { windowsProcessTreeKillCommand } from '../../src/pi-rpc/process.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
@@ -188,30 +189,30 @@ test('PiAcpAgent: delete unlinks an inactive listed session discovered from pi s
 })
 
 test('PiAcpAgent: private delete with no active process and missing JSONL is bounded and removes the stale store entry', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-missing-delete-'))
+  const oldEnv = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = root
   const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
-  const missing = join(tmpdir(), `pi-acp-missing-delete-${Date.now()}.jsonl`)
-  const deletedSessionIds: string[] = []
+  const missing = join(root, 'missing-session.jsonl')
+  const store = new SessionStore(join(root, 'session-map.json'))
+  store.upsert({ sessionId: 'missing-session', cwd: '/tmp/project', sessionFile: missing })
+  ;(agent as any).store = store
 
-  ;(agent as any).store = {
-    get: () => ({
-      sessionId: 'missing-session',
-      cwd: '/tmp/project',
-      sessionFile: missing,
-      updatedAt: '2026-02-11T00:00:00.000Z'
-    }),
-    delete: (sessionId: string) => deletedSessionIds.push(sessionId),
-    list: () => []
+  try {
+    const result = await Promise.race([
+      agent.extMethod('_pi/session/delete', { sessionId: 'missing-session' }),
+      wait(200).then(() => 'timeout')
+    ])
+
+    assert.notEqual(result, 'timeout')
+    assert.equal(store.getIncludingMissing('missing-session'), null)
+    assert.equal(existsSync(missing), false)
+    assert.equal(((result as any)._meta as any).piAcp.deleteCleanup.sessionFile.status, 'missing')
+  } finally {
+    if (oldEnv === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = oldEnv
+    rmSync(root, { recursive: true, force: true })
   }
-
-  const result = await Promise.race([
-    agent.extMethod('_pi/session/delete', { sessionId: 'missing-session' }),
-    wait(200).then(() => 'timeout')
-  ])
-
-  assert.notEqual(result, 'timeout')
-  assert.deepEqual(deletedSessionIds, ['missing-session'])
-  assert.equal(existsSync(missing), false)
-  assert.equal(((result as any)._meta as any).piAcp.deleteCleanup.sessionFile.status, 'missing')
 })
 
 test('PiAcpAgent: delete preserves store mapping and reports failure when unlink fails', async () => {
@@ -258,7 +259,9 @@ test('PiAcpAgent: delete refuses wrong-session and wrong-cwd mapped files', asyn
 test('PiAcpAgent: delete marks recoverable workflow runs aborted instead of auto-resumable', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-delete-workflow-'))
   const runDir = join(root, 'workflow-runs', 'wf-run')
+  const terminalRunDir = join(root, 'workflow-runs', 'wf-terminal')
   mkdirSync(runDir, { recursive: true })
+  mkdirSync(terminalRunDir, { recursive: true })
   writeFileSync(
     join(runDir, 'run.json'),
     JSON.stringify({
@@ -273,30 +276,40 @@ test('PiAcpAgent: delete marks recoverable workflow runs aborted instead of auto
     'utf8'
   )
   writeFileSync(join(runDir, 'events.jsonl'), '{"type":"run_start","runId":"wf-run"}\n', 'utf8')
+  writeFileSync(
+    join(terminalRunDir, 'run.json'),
+    JSON.stringify({
+      id: 'wf-terminal',
+      workflowId: 'review',
+      cwd: '/tmp/project',
+      parentSessionId: 'workflow-parent',
+      runDir: terminalRunDir,
+      status: 'failed',
+      steps: [{ id: 'code', status: 'failed' }]
+    }),
+    'utf8'
+  )
+  writeFileSync(join(terminalRunDir, 'events.jsonl'), '{"type":"run_start","runId":"wf-terminal"}\n', 'utf8')
   const oldEnv = process.env.PI_CODING_AGENT_DIR
   process.env.PI_CODING_AGENT_DIR = root
   const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
+  const store = new SessionStore(join(root, 'session-map.json'))
+  store.upsert({ sessionId: 'workflow-parent', cwd: '/tmp/project', sessionFile: join(root, 'missing.jsonl') })
+  ;(agent as any).store = store
 
   try {
-    ;(agent as any).store = {
-      get: () => ({
-        sessionId: 'workflow-parent',
-        cwd: '/tmp/project',
-        sessionFile: join(root, 'missing.jsonl'),
-        updatedAt: '2026-02-11T00:00:00.000Z'
-      }),
-      delete: () => {},
-      list: () => []
-    }
-
     const response = await agent.unstable_deleteSession({ sessionId: 'workflow-parent', _meta: null } as any)
 
     const run = JSON.parse(readFileSync(join(runDir, 'run.json'), 'utf8'))
+    const terminalRun = JSON.parse(readFileSync(join(terminalRunDir, 'run.json'), 'utf8'))
     assert.equal(run.status, 'aborted')
     assert.equal(run.error, 'Parent ACP session was deleted.')
     assert.equal(run.steps[0].status, 'aborted')
+    assert.equal(terminalRun.status, 'failed')
     assert.equal(existsSync(runDir), true)
     assert.equal(existsSync(join(runDir, 'events.jsonl')), true)
+    assert.equal(existsSync(terminalRunDir), true)
+    assert.equal(existsSync(join(terminalRunDir, 'events.jsonl')), true)
     assert.deepEqual((response._meta as any).piAcp.deleteCleanup.workflows.abortedRunIds, ['wf-run'])
   } finally {
     if (oldEnv === undefined) delete process.env.PI_CODING_AGENT_DIR
