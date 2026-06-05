@@ -908,6 +908,99 @@ test('WorkflowEventMonitor attached replay buffers an unterminated final record 
   }
 })
 
+test('WorkflowEventMonitor wait-for-run-end resolves when a workflow pauses without terminal run_end', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-paused-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  const runDir = join(workflowRunsDir, 'paused')
+  mkdirSync(runDir, { recursive: true })
+  const eventsPath = join(runDir, 'events.jsonl')
+  writeFileSync(
+    eventsPath,
+    `${JSON.stringify({ type: 'run_start', sequence: 1, timestamp: 't1', runId: 'paused', workflowId: 'wf', cwd: '/repo', status: 'running' })}\n`,
+    'utf8'
+  )
+  writeFileSync(
+    join(runDir, 'run.json'),
+    JSON.stringify({ id: 'paused', workflowId: 'wf', cwd: '/repo', runDir, status: 'running' }),
+    'utf8'
+  )
+  const updates: any[] = []
+  const monitor = new WorkflowEventMonitor('/repo', update => updates.push(update), {
+    workflowRunsDir,
+    pollIntervalMs: 5,
+    graceMs: 20,
+    attach: { runId: 'paused', runDir, sinceSequence: 0 }
+  })
+
+  try {
+    monitor.start()
+    await waitUntil(() => updates.some(update => update.sessionUpdate === 'tool_call'))
+    writeFileSync(
+      join(runDir, 'run.json'),
+      JSON.stringify({ id: 'paused', workflowId: 'wf', cwd: '/repo', runDir, status: 'paused' }),
+      'utf8'
+    )
+    appendFileSync(
+      eventsPath,
+      `${JSON.stringify({ type: 'run_paused', sequence: 2, timestamp: 't2', runId: 'paused', workflowId: 'wf', status: 'paused', reason: 'user stop' })}\n`,
+      'utf8'
+    )
+    await monitor.waitForRunEndAfterPromptResolution()
+
+    assert.ok(
+      updates.some(
+        update =>
+          update.sessionUpdate === 'agent_message_chunk' &&
+          update.content.type === 'text' &&
+          update.content.text === 'Workflow wf paused.'
+      )
+    )
+    assert.equal(
+      updates.some(
+        update =>
+          update.sessionUpdate === 'tool_call_update' &&
+          update.toolCallId === 'workflow:paused' &&
+          update.status === 'completed'
+      ),
+      false
+    )
+  } finally {
+    monitor.dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('WorkflowEventMonitor wait-for-run-end resolves from paused run.json when the control event was missed', async () => {
+  const root = join(tmpdir(), `pi-acp-workflow-paused-json-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  const runDir = join(workflowRunsDir, 'paused-json')
+  mkdirSync(runDir, { recursive: true })
+  writeFileSync(
+    join(runDir, 'events.jsonl'),
+    `${JSON.stringify({ type: 'run_start', sequence: 1, timestamp: 't1', runId: 'paused-json', workflowId: 'wf', cwd: '/repo', status: 'running' })}\n`,
+    'utf8'
+  )
+  writeFileSync(
+    join(runDir, 'run.json'),
+    JSON.stringify({ id: 'paused-json', workflowId: 'wf', cwd: '/repo', runDir, status: 'paused' }),
+    'utf8'
+  )
+  const monitor = new WorkflowEventMonitor('/repo', () => undefined, {
+    workflowRunsDir,
+    pollIntervalMs: 5,
+    graceMs: 20,
+    attach: { runId: 'paused-json', runDir, sinceSequence: 0 }
+  })
+
+  try {
+    monitor.start()
+    await monitor.waitForRunEndAfterPromptResolution()
+  } finally {
+    monitor.dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('WorkflowEventMonitor attached replay emits terminal run.json fallback when run_end is missing', async () => {
   const root = join(tmpdir(), `pi-acp-workflow-attach-terminal-${process.pid}-${Date.now()}`)
   const workflowRunsDir = join(root, 'workflow-runs')

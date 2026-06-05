@@ -771,6 +771,7 @@ export class WorkflowEventMonitor {
   private stopResolve: (() => void) | null = null
   private stopRequestedAt: number | null = null
   private stopMode: 'grace' | 'run_end' | null = null
+  private recoverableRunControlObserved = false
   private terminalRunJsonFallback: TerminalRunJsonFallbackState | null = null
 
   constructor(cwd: string, emit: EmitSessionUpdate, options: WorkflowEventMonitorOptions = {}) {
@@ -922,6 +923,7 @@ export class WorkflowEventMonitor {
           if (sinceSequence !== undefined && (sequence === undefined || sequence <= sinceSequence)) return true
           this.onRecord?.(record, this.ingestion.recordsObserved - 1)
           this.acceptLinkedSubWorkflowRun(record)
+          this.noteRecoverableRunControl(record)
         }
         const sourceIdentity = {
           sourceKey: tailSourceKey(tail),
@@ -965,6 +967,18 @@ export class WorkflowEventMonitor {
     const eventsPath = join(resolvedRunDir, 'events.jsonl')
     if (this.tails.has(eventsPath)) return
     this.tails.set(eventsPath, createTail(eventsPath))
+  }
+
+  private noteRecoverableRunControl(record: Record<string, unknown>): void {
+    const type = stringField(record.type)
+    if (type === 'run_paused' || type === 'run_interrupted') this.recoverableRunControlObserved = true
+  }
+
+  private acceptedRunHasRecoverableStatus(): boolean {
+    if (!this.acceptedRunDir) return false
+    const runDir = this.acceptedRunDirPath ?? join(this.workflowRunsDir, this.acceptedRunDir)
+    const status = stringField(readJsonObject(join(runDir, 'run.json'))?.status)?.toLowerCase()
+    return status === 'paused' || status === 'interrupted'
   }
 
   private matchRunDir(dir: string, runDir: string): RunMatch {
@@ -1014,8 +1028,9 @@ export class WorkflowEventMonitor {
       if (isObject(record)) {
         this.ingestion.recordsObserved += 1
         this.onRecord?.(record, this.ingestion.recordsObserved - 1)
+        this.acceptLinkedSubWorkflowRun(record)
+        this.noteRecoverableRunControl(record)
       }
-      if (isObject(record)) this.acceptLinkedSubWorkflowRun(record)
       const sourceIdentity = {
         sourceKey: tailSourceKey(tail),
         startOffset: line.startOffset,
@@ -1111,6 +1126,14 @@ export class WorkflowEventMonitor {
 
     if (this.stopMode === 'run_end') {
       if (this.acceptedRunDir && noActiveTails) {
+        this.dispose()
+        return
+      }
+      if (
+        this.acceptedRunDir &&
+        graceElapsed &&
+        (this.recoverableRunControlObserved || this.acceptedRunHasRecoverableStatus())
+      ) {
         this.dispose()
         return
       }
@@ -1314,7 +1337,8 @@ function readTerminalRunEndRecord(
 
   const status = stringField(runJson.status)?.toLowerCase()
   const endedAt = stringField(runJson.endedAt)
-  if (!endedAt && (!status || status === 'running')) return null
+  const terminalStatus = status === 'completed' || status === 'failed' || status === 'aborted' || status === 'error'
+  if (!endedAt && !terminalStatus) return null
 
   const metadata = metadataFromRunJson(runJson, runDir)
   return {
