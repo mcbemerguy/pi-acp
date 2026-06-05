@@ -129,7 +129,7 @@ export function readWorkflowRun(target: string, root = workflowRunsDir()): Workf
 export function readWorkflowRunLastSequence(runDir: string): number {
   const stats = scanCompleteEventFileStats(join(runDir, 'events.jsonl'))
   const run = readWorkflowRunFromDir(runDir)
-  const fallback = run ? terminalRunEndRecord(run, stats.maxSequence + 1) : null
+  const fallback = run && !stats.sawRunEnd ? terminalRunEndRecord(run, stats.maxSequence + 1) : null
   return Math.max(stats.maxSequence, numberField(fallback?.sequence) ?? 0)
 }
 

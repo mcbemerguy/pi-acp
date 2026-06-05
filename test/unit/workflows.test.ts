@@ -123,6 +123,26 @@ test('readWorkflowRun includes the latest workflow event sequence', () => {
   }
 })
 
+test('readWorkflowRun does not synthesize a terminal sequence when run_end exists', () => {
+  const root = join(tmpdir(), `pi-acp-workflows-run-end-sequence-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  const runDir = join(workflowRunsDir, 'run')
+  mkdirSync(runDir, { recursive: true })
+  writeRunJson(runDir, { workflowId: 'wf', status: 'completed', endedAt: '2026-05-30T00:00:00.000Z' })
+  writeFileSync(
+    join(runDir, 'events.jsonl'),
+    `${JSON.stringify({ type: 'run_start', sequence: 1, runId: 'run', workflowId: 'wf' })}\n` +
+      `${JSON.stringify({ type: 'run_end', sequence: 8, runId: 'run', workflowId: 'wf', status: 'completed' })}\n`,
+    'utf8'
+  )
+
+  try {
+    assert.equal(readWorkflowRun('run', workflowRunsDir).lastSequence, 8)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('offline workflow controls update run.json without appending events.jsonl records', () => {
   const root = join(tmpdir(), `pi-acp-workflows-control-${process.pid}-${Date.now()}`)
   const workflowRunsDir = join(root, 'workflow-runs')
