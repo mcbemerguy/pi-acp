@@ -123,7 +123,14 @@ export function readWorkflowRun(target: string, root = workflowRunsDir()): Workf
   const runDir = resolveWorkflowRunDir(target, root)
   const run = readWorkflowRunFromDir(runDir)
   if (!run) throw new Error(`Unknown workflow run: ${target}`)
-  return run
+  return { ...run, lastSequence: readWorkflowRunLastSequence(run.runDir) }
+}
+
+export function readWorkflowRunLastSequence(runDir: string): number {
+  const stats = scanCompleteEventFileStats(join(runDir, 'events.jsonl'))
+  const run = readWorkflowRunFromDir(runDir)
+  const fallback = run ? terminalRunEndRecord(run, stats.maxSequence + 1) : null
+  return Math.max(stats.maxSequence, numberField(fallback?.sequence) ?? 0)
 }
 
 export function readWorkflowRunEvents(
@@ -136,7 +143,9 @@ export function readWorkflowRunEvents(
     workflowRunsDir?: string
   } = {}
 ): WorkflowEventReplayResult {
-  const run = readWorkflowRun(target, options.workflowRunsDir ?? workflowRunsDir())
+  const runDir = resolveWorkflowRunDir(target, options.workflowRunsDir ?? workflowRunsDir())
+  const run = readWorkflowRunFromDir(runDir)
+  if (!run) throw new Error(`Unknown workflow run: ${target}`)
   const eventsPath = join(run.runDir, 'events.jsonl')
   const scan = scanWorkflowEventFile(eventsPath, {
     offset: options.offset,

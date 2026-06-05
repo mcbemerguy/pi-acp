@@ -7,6 +7,7 @@ import {
   abortWorkflowRun,
   interruptWorkflowRun,
   pauseWorkflowRun,
+  readWorkflowRun,
   readWorkflowRunEvents,
   resumeWorkflowRun
 } from '../../src/acp/workflows.js'
@@ -98,6 +99,26 @@ test('readWorkflowRunEvents stops parsing a large file after a limited page is s
     assert.ok(replay.nextOffset < statSync(eventsPath).size)
   } finally {
     JSON.parse = originalParse
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('readWorkflowRun includes the latest workflow event sequence', () => {
+  const root = join(tmpdir(), `pi-acp-workflows-run-sequence-${process.pid}-${Date.now()}`)
+  const workflowRunsDir = join(root, 'workflow-runs')
+  const runDir = join(workflowRunsDir, 'run')
+  mkdirSync(runDir, { recursive: true })
+  writeRunJson(runDir, { workflowId: 'wf' })
+  writeFileSync(
+    join(runDir, 'events.jsonl'),
+    `${JSON.stringify({ type: 'run_start', sequence: 1, runId: 'run', workflowId: 'wf' })}\n` +
+      `${JSON.stringify({ type: 'run_interrupted', sequence: 8, runId: 'run', workflowId: 'wf', status: 'interrupted' })}\n`,
+    'utf8'
+  )
+
+  try {
+    assert.equal(readWorkflowRun('run', workflowRunsDir).lastSequence, 8)
+  } finally {
     rmSync(root, { recursive: true, force: true })
   }
 })
