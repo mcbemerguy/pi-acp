@@ -58,10 +58,38 @@ test('PiAcpSession: emits agent_thought_chunk for thinking_delta', async () => {
 
   assert.equal(conn.updates.length, 1)
   assert.equal(conn.updates[0]!.sessionId, 's1')
-  assert.deepEqual(conn.updates[0]!.update, {
-    sessionUpdate: 'agent_thought_chunk',
-    content: { type: 'text', text: 'thinking...' }
+  assert.equal((conn.updates[0]!.update as any).sessionUpdate, 'agent_thought_chunk')
+  assert.match((conn.updates[0]!.update as any).messageId, /^[0-9a-f-]{36}$/)
+  assert.deepEqual((conn.updates[0]!.update as any).content, { type: 'text', text: 'thinking...' })
+})
+
+test('PiAcpSession: keeps thought message ids stable until thinking_end', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
   })
+
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'thinking_start' } })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'one' } })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'two' } })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'thinking_end' } })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'three' } })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const thoughts = conn.updates.map(update => update.update as any)
+  assert.equal(thoughts.length, 3)
+  assert.match(thoughts[0]!.messageId, /^[0-9a-f-]{36}$/)
+  assert.equal(thoughts[1]!.messageId, thoughts[0]!.messageId)
+  assert.match(thoughts[2]!.messageId, /^[0-9a-f-]{36}$/)
+  assert.notEqual(thoughts[2]!.messageId, thoughts[0]!.messageId)
 })
 
 test('PiAcpSession: refreshes usage after tool result message end', async () => {
@@ -696,13 +724,14 @@ test('PiAcpSession: ignores streamed toolcall message updates while preserving t
 
   await new Promise(r => setTimeout(r, 0))
 
-  assert.deepEqual(
-    conn.updates.map(u => u.update),
-    [
-      { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hello ' } },
-      { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thinking' } }
-    ]
-  )
+  assert.equal(conn.updates.length, 2)
+  assert.deepEqual(conn.updates[0]!.update, {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'hello ' }
+  })
+  assert.equal((conn.updates[1]!.update as any).sessionUpdate, 'agent_thought_chunk')
+  assert.match((conn.updates[1]!.update as any).messageId, /^[0-9a-f-]{36}$/)
+  assert.deepEqual((conn.updates[1]!.update as any).content, { type: 'text', text: 'thinking' })
   assert.equal(
     conn.updates.some(u => u.update.sessionUpdate === 'tool_call'),
     false

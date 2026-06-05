@@ -253,6 +253,8 @@ export class PiAcpSession {
   private currentAgentMessageId: string | null = null
   private currentAgentMessageText = ''
   private currentAgentMessageOpen = false
+  private currentThoughtMessageId: string | null = null
+  private currentThoughtOpen = false
 
   readonly proc: PiRpcProcess
   private readonly conn: AgentSideConnection
@@ -930,6 +932,7 @@ export class PiAcpSession {
     this.clearAgentEndFallbackTimer()
     this.stopCancelledTurnDrain()
     this.resetAgentMessageStream()
+    this.resetThoughtStream()
     this.beginAgentMessageStream()
     const workflowTarget = parseWorkflowCommandPrompt(t.message)
     this.currentWorkflowMonitor = isWorkflowCommandPrompt(t.message)
@@ -1055,6 +1058,7 @@ export class PiAcpSession {
       this.completionReasonOverride = null
       this.sawAgentActivity = false
       this.resetAgentMessageStream()
+      this.resetThoughtStream()
       this.resolveTurnSettledWaiters()
 
       const proceedQueue = (opts.proceedQueue ?? true) && !this.drainingCancelledTurn
@@ -1146,9 +1150,23 @@ export class PiAcpSession {
     this.currentAgentMessageOpen = false
   }
 
+  private beginThoughtStream(): void {
+    this.currentThoughtMessageId = crypto.randomUUID()
+    this.currentThoughtOpen = true
+  }
+
+  private resetThoughtStream(): void {
+    this.currentThoughtMessageId = null
+    this.currentThoughtOpen = false
+  }
+
   private ensureAgentMessageStream(): void {
     if (!this.pendingTurn) return
     if (!this.currentAgentMessageId || !this.currentAgentMessageOpen) this.beginAgentMessageStream()
+  }
+
+  private ensureThoughtStream(): void {
+    if (!this.currentThoughtMessageId || !this.currentThoughtOpen) this.beginThoughtStream()
   }
 
   private clearAgentEndFallbackTimer(): void {
@@ -1249,15 +1267,23 @@ export class PiAcpSession {
           break
         }
 
+        if (ame?.type === 'thinking_start') {
+          this.beginThoughtStream()
+          break
+        }
+
         if (ame?.type === 'thinking_delta' && typeof ame.delta === 'string') {
+          this.ensureThoughtStream()
           this.emit({
             sessionUpdate: 'agent_thought_chunk',
+            ...(this.currentThoughtMessageId ? { messageId: this.currentThoughtMessageId } : {}),
             content: { type: 'text', text: ame.delta } satisfies ContentBlock
           })
           break
         }
 
         if (ame?.type === 'thinking_end') {
+          this.resetThoughtStream()
           this.scheduleUsageRefresh()
           break
         }
@@ -1282,6 +1308,7 @@ export class PiAcpSession {
           this.reconcileAssistantMessageEnd((ev as any).message)
           this.currentAgentMessageOpen = false
           this.currentAgentMessageText = ''
+          this.resetThoughtStream()
           this.scheduleUsageRefresh()
         } else if (role === 'toolResult') {
           this.scheduleUsageRefresh()
@@ -1447,6 +1474,7 @@ export class PiAcpSession {
       case 'auto_retry_start': {
         this.clearAgentEndFallbackTimer()
         this.resetAgentMessageStream()
+        this.resetThoughtStream()
         this.emit({
           sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: formatAutoRetryMessage(ev) } satisfies ContentBlock
@@ -1487,7 +1515,10 @@ export class PiAcpSession {
 
       case 'agent_start': {
         this.sawAgentActivity = true
-        if (this.inAgentLoop) this.resetAgentMessageStream()
+        if (this.inAgentLoop) {
+          this.resetAgentMessageStream()
+          this.resetThoughtStream()
+        }
         this.inAgentLoop = true
         this.clearAgentEndFallbackTimer()
         break
