@@ -136,12 +136,31 @@ function isUnknownWorkflowControlCommand(error: unknown): boolean {
   return typeof error === 'string' && /unknown command:\s*workflow_control/i.test(error)
 }
 
+const ASK_USER_QUESTIONS_TOOL_NAME = 'ask_user_questions'
+
+function withoutParentOnlyDelegatedToolCaps(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const cap = env.PI_DELEGATED_TOOL_CAP
+  if (cap === undefined) return env
+
+  const remaining = cap
+    .split(',')
+    .map(tool => tool.trim())
+    .filter(tool => tool.length > 0 && tool !== ASK_USER_QUESTIONS_TOOL_NAME)
+
+  if (remaining.length > 0) {
+    return { ...env, PI_DELEGATED_TOOL_CAP: remaining.join(',') }
+  }
+
+  const { PI_DELEGATED_TOOL_CAP: _removed, ...next } = env
+  return next
+}
+
 export function buildPiRpcSpawnEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  return {
+  return withoutParentOnlyDelegatedToolCaps({
     ...env,
     PI_ACP: '1',
     PI_ACP_RPC: '1'
-  }
+  })
 }
 
 export function windowsProcessTreeKillCommand(pid: number): { command: string; args: string[]; options: SpawnOptions } {

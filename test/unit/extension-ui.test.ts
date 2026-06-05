@@ -204,8 +204,12 @@ test('PiAcpSession: extension UI requests do not resolve prompt turns before age
 
 test('PiRpcProcess: ACP RPC marker does not imply global ask_user_questions tool enablement', () => {
   const marked = buildPiRpcSpawnEnv({ PATH: '/bin', PI_DELEGATED_TOOL_CAP: 'read,bash' })
+  const stripped = buildPiRpcSpawnEnv({ PATH: '/bin', PI_DELEGATED_TOOL_CAP: 'read,ask_user_questions,bash' })
+  const removed = buildPiRpcSpawnEnv({ PATH: '/bin', PI_DELEGATED_TOOL_CAP: 'ask_user_questions' })
 
   assert.equal(marked.PI_ACP_RPC, '1')
   assert.equal(marked.PI_DELEGATED_TOOL_CAP, 'read,bash')
+  assert.equal(stripped.PI_DELEGATED_TOOL_CAP, 'read,bash')
+  assert.equal(removed.PI_DELEGATED_TOOL_CAP, undefined)
   assert.equal(buildPiRpcSpawnEnv({ PATH: '/bin' }).PI_DELEGATED_TOOL_CAP, undefined)
 })

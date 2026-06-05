@@ -144,7 +144,7 @@ Pi has three supported interactive question paths:
 2. Local terminal Pi sessions render the built-in TUI questionnaire.
 3. ACP/RPC sessions use Pi's standard RPC dialog requests. `pi-acp` marks child Pi processes with `PI_ACP_RPC=1`, then translates blocking dialog requests to `conn.extMethod("cursor/ask_question", payload)` for compatible ACP clients such as T3Code Custom ACP.
 
-The ACP bridge is transport support only. `ask_user_questions` remains opt-in and is not added to default Pi tool caps. To smoke-test it through an ACP client, explicitly expose the tool, for example with `PI_DELEGATED_TOOL_CAP=ask_user_questions` in the ACP server environment.
+The ACP bridge is transport support only. `ask_user_questions` remains workflow-step opt-in and is not added to default Pi tool caps. `pi-acp` strips `ask_user_questions` from `PI_DELEGATED_TOOL_CAP` before spawning the parent Pi RPC process; workflow steps that explicitly include the tool still receive it through their step `--tools` list.
 
 `pi-acp` sends these `cursor/ask_question` payloads:
 
@@ -168,8 +168,7 @@ Practical local smoke configuration:
    - Environment:
      - `PI_ACP_PI_COMMAND=/home/marcosb/.pi/bin/pi`
      - `PI_CODING_AGENT_DIR=/home/marcosb/.pi/agent`
-     - `PI_DELEGATED_TOOL_CAP=ask_user_questions`
-4. Start a Custom ACP thread and ask the agent to call `ask_user_questions` with a small single-select question. Expected flow: Pi emits an RPC `select`, `pi-acp` sends `cursor/ask_question`, T3Code shows a blocking user-input prompt, the chosen/custom answer returns as `{ answers: { selection: "..." } }`, and Pi resumes the tool call.
+4. Start a Custom ACP thread and run a Pi workflow step that explicitly includes `ask_user_questions` in its step tools. Expected flow: the workflow child is spawned with `--tools ...ask_user_questions...`, Pi emits an RPC `select`, `pi-acp` sends `cursor/ask_question`, T3Code shows a blocking user-input prompt, the chosen/custom answer returns as `{ answers: { selection: "..." } }`, and Pi resumes the tool call.
 
 If this cannot be smoke-tested manually, the unverified boundary is the browser click/submit step inside T3Code. Unit coverage verifies the adapter payloads and T3Code request/response shapes on both sides of that boundary.
 
