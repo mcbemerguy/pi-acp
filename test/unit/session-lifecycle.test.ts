@@ -69,27 +69,53 @@ test('PiAcpSession: close terminates even when outbound session updates are bloc
   assert.equal(proc.disposeCount, 1)
 })
 
+test('PiAcpSession: close tolerates an already-dead Pi RPC process during cancellation', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.abortError = new Error('Pi RPC process exited before abort could be sent')
+  const session = new PiAcpSession({
+    sessionId: 'dead-process-close',
+    cwd: '/tmp/project',
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    cancelDrainTimeoutMs: 5
+  })
+
+  const prompt = session.prompt('work')
+  await wait()
+
+  const result = await Promise.race([session.close().then(() => 'closed'), wait(200).then(() => 'timeout')])
+
+  assert.equal(result, 'closed')
+  assert.equal(await prompt, 'cancelled')
+  assert.equal(proc.abortCount, 1)
+  assert.equal(proc.terminateCount, 1)
+  assert.equal(proc.disposeCount, 2)
+})
+
 test('PiAcpAgent: session/close is safe for unknown sessions', async () => {
   const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
 
   await agent.closeSession({ sessionId: 'already-closed', _meta: null } as any)
 })
 
-test('PiAcpAgent: delete closes an active session, removes the store entry, and unlinks only the validated JSONL', async () => {
+test('PiAcpAgent: private delete closes an active session process, removes the store entry, and unlinks only the validated JSONL', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-delete-active-'))
   const sessionFile = writeSessionFile(root, 'delete-active', '/tmp/project')
-  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
-  let closedSessionId: string | null = null
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const agent = new PiAcpAgent(asAgentConn(conn))
   const deletedSessionIds: string[] = []
 
-  ;(agent as any).sessions = {
-    maybeGet: (sessionId: string) =>
-      sessionId === 'delete-active' ? { cwd: '/tmp/project', getSessionFile: () => sessionFile } : undefined,
-    closeSession: async (sessionId: string) => {
-      closedSessionId = sessionId
-    },
-    close: () => {}
-  }
+  ;(agent as any).sessions.getOrCreate('delete-active', {
+    cwd: '/tmp/project',
+    mcpServers: [],
+    conn: asAgentConn(conn),
+    proc: proc as any,
+    fileCommands: [],
+    sessionFile
+  })
   ;(agent as any).store = {
     get: () => ({
       sessionId: 'delete-active',
@@ -102,11 +128,14 @@ test('PiAcpAgent: delete closes an active session, removes the store entry, and 
   }
 
   try {
-    await agent.unstable_deleteSession({ sessionId: 'delete-active', _meta: null } as any)
+    const response = await agent.extMethod('_pi/session/delete', { sessionId: 'delete-active' })
 
-    assert.equal(closedSessionId, 'delete-active')
+    assert.equal(proc.terminateCount, 1)
+    assert.equal(proc.disposeCount, 1)
     assert.deepEqual(deletedSessionIds, ['delete-active'])
     assert.equal(existsSync(sessionFile), false)
+    assert.equal((response._meta as any).piAcp.deleteCleanup.sessionFile.status, 'deleted')
+    assert.equal((agent as any).sessions.maybeGet('delete-active'), undefined)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
@@ -158,7 +187,7 @@ test('PiAcpAgent: delete unlinks an inactive listed session discovered from pi s
   }
 })
 
-test('PiAcpAgent: delete removes stale store entries without unlinking arbitrary paths', async () => {
+test('PiAcpAgent: private delete with no active process and missing JSONL is bounded and removes the stale store entry', async () => {
   const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
   const missing = join(tmpdir(), `pi-acp-missing-delete-${Date.now()}.jsonl`)
   const deletedSessionIds: string[] = []
@@ -174,10 +203,15 @@ test('PiAcpAgent: delete removes stale store entries without unlinking arbitrary
     list: () => []
   }
 
-  await agent.unstable_deleteSession({ sessionId: 'missing-session', _meta: null } as any)
+  const result = await Promise.race([
+    agent.extMethod('_pi/session/delete', { sessionId: 'missing-session' }),
+    wait(200).then(() => 'timeout')
+  ])
 
+  assert.notEqual(result, 'timeout')
   assert.deepEqual(deletedSessionIds, ['missing-session'])
   assert.equal(existsSync(missing), false)
+  assert.equal(((result as any)._meta as any).piAcp.deleteCleanup.sessionFile.status, 'missing')
 })
 
 test('PiAcpAgent: delete preserves store mapping and reports failure when unlink fails', async () => {
@@ -238,6 +272,7 @@ test('PiAcpAgent: delete marks recoverable workflow runs aborted instead of auto
     }),
     'utf8'
   )
+  writeFileSync(join(runDir, 'events.jsonl'), '{"type":"run_start","runId":"wf-run"}\n', 'utf8')
   const oldEnv = process.env.PI_CODING_AGENT_DIR
   process.env.PI_CODING_AGENT_DIR = root
   const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
@@ -254,12 +289,15 @@ test('PiAcpAgent: delete marks recoverable workflow runs aborted instead of auto
       list: () => []
     }
 
-    await agent.unstable_deleteSession({ sessionId: 'workflow-parent', _meta: null } as any)
+    const response = await agent.unstable_deleteSession({ sessionId: 'workflow-parent', _meta: null } as any)
 
     const run = JSON.parse(readFileSync(join(runDir, 'run.json'), 'utf8'))
     assert.equal(run.status, 'aborted')
     assert.equal(run.error, 'Parent ACP session was deleted.')
     assert.equal(run.steps[0].status, 'aborted')
+    assert.equal(existsSync(runDir), true)
+    assert.equal(existsSync(join(runDir, 'events.jsonl')), true)
+    assert.deepEqual((response._meta as any).piAcp.deleteCleanup.workflows.abortedRunIds, ['wf-run'])
   } finally {
     if (oldEnv === undefined) delete process.env.PI_CODING_AGENT_DIR
     else process.env.PI_CODING_AGENT_DIR = oldEnv

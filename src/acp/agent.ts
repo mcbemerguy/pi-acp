@@ -190,6 +190,16 @@ type PiSteerParams = {
   mode: 'steer' | 'follow_up'
 }
 
+type DeletePiSessionFileCleanup =
+  | { status: 'deleted'; sessionFile: string; cwd: string }
+  | { status: 'missing'; sessionFile: string }
+  | { status: 'not_found'; refused: Array<{ sessionFile: string; reason: string }> }
+
+type DeleteWorkflowCleanup = {
+  abortedRunIds: string[]
+  failures: Array<{ runId: string; error: string }>
+}
+
 const pkg = readNearestPackageJson(import.meta.url)
 
 function shouldReplayLoadSessionHistory(params: InitializeRequest): boolean {
@@ -964,9 +974,9 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.internalError({}, message)
     }
 
-    let deleted: { sessionFile: string; cwd: string } | null = null
+    let sessionFileCleanup: DeletePiSessionFileCleanup
     try {
-      deleted = this.deleteValidatedPiSessionFile({
+      sessionFileCleanup = this.deleteValidatedPiSessionFile({
         method,
         sessionId,
         expectedCwd,
@@ -980,10 +990,27 @@ export class PiAcpAgent implements ACPAgent {
 
     this.store.delete(sessionId)
 
-    const workflowCwd = activeCwd ?? stored?.cwd ?? deleted?.cwd ?? expectedCwd
-    if (workflowCwd) this.abortRecoverableWorkflowRunsForDeletedSession(sessionId, workflowCwd, method)
+    const workflowCwd =
+      activeCwd ??
+      stored?.cwd ??
+      (sessionFileCleanup.status === 'deleted' ? sessionFileCleanup.cwd : null) ??
+      expectedCwd
+    const workflows = workflowCwd
+      ? this.abortRecoverableWorkflowRunsForDeletedSession(sessionId, workflowCwd, method)
+      : { abortedRunIds: [], failures: [] }
 
-    return {}
+    return {
+      _meta: {
+        piAcp: {
+          deleteCleanup: {
+            close: { active: Boolean(active), attempted: true, ok: true },
+            sessionFile: sessionFileCleanup,
+            sessionMap: { removedSessionId: sessionId },
+            workflows
+          }
+        }
+      }
+    }
   }
 
   private async closeManagedSession(sessionId: string): Promise<void> {
@@ -1001,7 +1028,7 @@ export class PiAcpAgent implements ACPAgent {
     expectedCwd?: string | null
     activeSessionFile?: string | null
     storedSessionFile?: string | null
-  }): { sessionFile: string; cwd: string } | null {
+  }): DeletePiSessionFileCleanup {
     const candidates: Array<{ file: string; cwd?: string | null }> = []
     const addCandidate = (file: string | null | undefined, cwd?: string | null) => {
       if (!file || !file.trim()) return
@@ -1014,9 +1041,12 @@ export class PiAcpAgent implements ACPAgent {
     addCandidate(findPiSessionFile(opts.sessionId, opts.expectedCwd), opts.expectedCwd)
     if (!opts.expectedCwd) addCandidate(findPiSessionFile(opts.sessionId), null)
 
+    const refused: Array<{ sessionFile: string; reason: string }> = []
+
     for (const candidate of candidates) {
       const validation = validatePiSessionFile(candidate.file, { sessionId: opts.sessionId, cwd: candidate.cwd })
       if (!validation.ok) {
+        refused.push({ sessionFile: candidate.file, reason: validation.reason })
         console.error(
           `[pi-acp] ${opts.method} refused to unlink invalid session file sessionId=${opts.sessionId} file=${candidate.file} reason=${validation.reason}`
         )
@@ -1038,24 +1068,41 @@ export class PiAcpAgent implements ACPAgent {
         )
         throw error
       }
-      return { sessionFile: validation.sessionFile, cwd: validation.header.cwd }
+      return { status: 'deleted', sessionFile: validation.sessionFile, cwd: validation.header.cwd }
+    }
+
+    const missing = refused.find(item => item.reason === 'missing')
+    if (missing && refused.every(item => item.reason === 'missing')) {
+      console.error(
+        `[pi-acp] ${opts.method} backing pi session file missing sessionId=${opts.sessionId} file=${missing.sessionFile}`
+      )
+      return { status: 'missing', sessionFile: missing.sessionFile }
     }
 
     console.error(`[pi-acp] ${opts.method} found no validated pi session file sessionId=${opts.sessionId}`)
-    return null
+    return { status: 'not_found', refused }
   }
 
-  private abortRecoverableWorkflowRunsForDeletedSession(sessionId: string, cwd: string, method: string): void {
+  private abortRecoverableWorkflowRunsForDeletedSession(
+    sessionId: string,
+    cwd: string,
+    method: string
+  ): DeleteWorkflowCleanup {
     const runs = listRecoverableWorkflowRunsForSession({ cwd, parentSessionId: sessionId })
+    const cleanup: DeleteWorkflowCleanup = { abortedRunIds: [], failures: [] }
     for (const run of runs) {
       try {
         abortWorkflowRun(run.runDir || run.id, { reason: 'Parent ACP session was deleted.' })
+        cleanup.abortedRunIds.push(run.id)
       } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        cleanup.failures.push({ runId: run.id, error: message })
         console.error(
-          `[pi-acp] ${method} failed to abort workflow run sessionId=${sessionId} runId=${run.id}: ${error instanceof Error ? error.message : String(error)}`
+          `[pi-acp] ${method} failed to abort workflow run sessionId=${sessionId} runId=${run.id}: ${message}`
         )
       }
     }
+    return cleanup
   }
 
   async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {

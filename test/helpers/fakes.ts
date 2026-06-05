@@ -61,6 +61,8 @@ export class FakePiRpcProcess {
   workflowControlResult: unknown = null
   abortCount = 0
   disposeCount = 0
+  terminateCount = 0
+  terminateOpts: Array<{ gracefulTimeoutMs?: number; killTimeoutMs?: number; attemptAbort?: boolean }> = []
   getSessionStatsCount = 0
   sessionStats: unknown = {
     tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, total: 15 },
@@ -68,6 +70,7 @@ export class FakePiRpcProcess {
     cost: 0
   }
   abortPromise: Promise<void> | null = null
+  abortError: unknown = null
   promptError: unknown = null
 
   onEvent(handler: (ev: PiRpcEvent) => void): () => void {
@@ -96,11 +99,20 @@ export class FakePiRpcProcess {
 
   async abort(): Promise<void> {
     this.abortCount += 1
+    if (this.abortError) throw this.abortError
     if (this.abortPromise) await this.abortPromise
   }
 
   dispose(): void {
     this.disposeCount += 1
+  }
+
+  async terminate(
+    opts: { gracefulTimeoutMs?: number; killTimeoutMs?: number; attemptAbort?: boolean } = {}
+  ): Promise<void> {
+    this.terminateCount += 1
+    this.terminateOpts.push(opts)
+    this.dispose()
   }
 
   async sendExtensionUiResponse(id: string, payload: Record<string, unknown>): Promise<void> {
