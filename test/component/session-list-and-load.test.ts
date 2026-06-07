@@ -6,7 +6,8 @@ import { join } from 'node:path'
 
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { validatePiSessionFile } from '../../src/acp/pi-sessions.js'
-import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
+import { PiAcpSession } from '../../src/acp/session.js'
+import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
 // We mock PiRpcProcess.spawn so loadSession doesn't actually spawn `pi`.
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
@@ -244,6 +245,7 @@ test('PiAcpAgent: repeated loadSession of the same active session reuses the liv
     updateSessionFile: (value: string | null) => {
       updatedSessionFile = value
     },
+    updateFileCommands: () => {},
     attachWorkflowRun: async () => {
       throw new Error('no workflow runs should be attached in this test')
     }
@@ -301,6 +303,67 @@ test('PiAcpAgent: repeated loadSession of the same active session reuses the liv
   } finally {
     PiRpcProcess.spawn = originalSpawn
   }
+})
+
+test('PiAcpAgent: repeated active load refreshes file slash commands used by prompt expansion', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'pi-acp-active-command-refresh-'))
+  const promptsDir = join(cwd, '.pi', 'prompts')
+  const sessionFile = join(cwd, 'active.jsonl')
+  const commandName = 'refresh_active_load_command'
+  mkdirSync(promptsDir, { recursive: true })
+  writeFileSync(join(promptsDir, `${commandName}.md`), 'Refreshed $1', 'utf8')
+  writeFileSync(
+    sessionFile,
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'active-command-session',
+      timestamp: '2026-02-11T00:00:00.000Z',
+      cwd
+    }) + '\n',
+    'utf8'
+  )
+
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = new PiAcpSession({
+    sessionId: 'active-command-session',
+    cwd,
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: [
+      {
+        name: commandName,
+        description: 'stale',
+        content: 'Stale $1',
+        source: '(test)'
+      }
+    ],
+    sessionFile
+  })
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).store = {
+    get: () => null,
+    list: () => [],
+    delete: () => {},
+    upsert: () => {}
+  }
+  ;(agent as any).sessions = {
+    maybeGet: (sessionId: string) => (sessionId === 'active-command-session' ? session : undefined),
+    close: () => {
+      throw new Error('active session should not be closed')
+    }
+  }
+
+  await agent.loadSession({ sessionId: 'active-command-session', cwd, mcpServers: [], _meta: null } as any)
+
+  const prompt = session.prompt(`/${commandName} topic`)
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'turn_end' })
+  proc.emit({ type: 'agent_end' })
+  assert.equal(await prompt, 'end_turn')
+  assert.equal(proc.prompts[0]?.message, 'Refreshed topic')
 })
 
 test('PiAcpAgent: repeated active load falls back to close and spawn when cwd mismatches', async () => {

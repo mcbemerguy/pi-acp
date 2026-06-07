@@ -258,7 +258,7 @@ export class PiAcpSession {
 
   readonly proc: PiRpcProcess
   private readonly conn: AgentSideConnection
-  private readonly fileCommands: FileSlashCommand[]
+  private fileCommands: FileSlashCommand[]
   private readonly cancelAbortTimeoutMs: number
   private readonly cancelDrainTimeoutMs: number
   private sessionFile: string | null
@@ -390,6 +390,10 @@ export class PiAcpSession {
 
   getSessionFile(): string | null {
     return this.sessionFile
+  }
+
+  updateFileCommands(fileCommands: FileSlashCommand[]): void {
+    this.fileCommands = fileCommands.slice()
   }
 
   async prompt(message: string, images: unknown[] = [], lifecycle?: PromptLifecycleOptions): Promise<StopReason> {

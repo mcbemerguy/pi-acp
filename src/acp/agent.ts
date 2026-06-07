@@ -367,6 +367,8 @@ export class PiAcpAgent implements ACPAgent {
     enableSkillCommands: boolean,
     state?: unknown
   ): Promise<LoadSessionResponse> {
+    session.updateFileCommands(fileCommands)
+
     if (!this.refreshSessionMapFromPiState(params.sessionId, params.cwd, state, session)) {
       this.upsertKnownSessionFile(params.sessionId, params.cwd, session.getSessionFile(), session)
     }
