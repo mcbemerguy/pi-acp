@@ -189,6 +189,267 @@ test('PiAcpAgent: listSessions lists pi sessions and loadSession replays history
   }
 })
 
+test('PiAcpAgent: repeated loadSession of the same active session reuses the live pi process', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-active-load-'))
+  const sessionFile = join(root, 'active.jsonl')
+  mkdirSync(root, { recursive: true })
+  writeFileSync(
+    sessionFile,
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'active-session',
+      timestamp: '2026-02-11T00:00:00.000Z',
+      cwd: '/tmp/project'
+    }) + '\n',
+    'utf8'
+  )
+
+  const originalSpawn = PiRpcProcess.spawn
+  let spawnCalls = 0
+  let closeCalls = 0
+  let closeAllExceptCalls = 0
+  let getMessagesCalls = 0
+  let getCommandsCalls = 0
+  let updatedSessionFile: string | null = null
+  const upserts: Array<{ sessionId: string; cwd: string; sessionFile: string }> = []
+
+  const proc = {
+    getState: async () => ({
+      sessionId: 'active-session',
+      cwd: '/tmp/project',
+      sessionFile,
+      thinkingLevel: 'high',
+      model: { provider: 'test', id: 'fast' }
+    }),
+    getAvailableModels: async () => ({ models: [{ provider: 'test', id: 'fast', name: 'Fast' }] }),
+    getMessages: async () => {
+      getMessagesCalls += 1
+      return { messages: [{ role: 'user', content: 'should not replay active history' }] }
+    },
+    getCommands: async () => {
+      getCommandsCalls += 1
+      throw new Error('use file command fallback')
+    },
+    dispose: () => {
+      throw new Error('active process should not be disposed')
+    }
+  }
+
+  const activeSession = {
+    sessionId: 'active-session',
+    cwd: '/tmp/project',
+    proc,
+    getSessionFile: () => sessionFile,
+    updateSessionFile: (value: string | null) => {
+      updatedSessionFile = value
+    },
+    attachWorkflowRun: async () => {
+      throw new Error('no workflow runs should be attached in this test')
+    }
+  }
+
+  try {
+    ;(PiRpcProcess as any).spawn = async () => {
+      spawnCalls += 1
+      throw new Error('spawn should not be called for active idempotent load')
+    }
+
+    const conn = new FakeAgentSideConnection()
+    const agent = new PiAcpAgent(asAgentConn(conn))
+    ;(agent as any).store = {
+      get: () => null,
+      list: () => [],
+      delete: () => {},
+      upsert: (entry: { sessionId: string; cwd: string; sessionFile: string }) => upserts.push(entry)
+    }
+    ;(agent as any).sessions = {
+      maybeGet: (sessionId: string) => (sessionId === 'active-session' ? activeSession : undefined),
+      close: () => {
+        closeCalls += 1
+      },
+      getOrCreate: () => {
+        throw new Error('getOrCreate should not be called for active idempotent load')
+      },
+      closeAllExcept: () => {
+        closeAllExceptCalls += 1
+      }
+    }
+
+    const response = await agent.loadSession({
+      sessionId: 'active-session',
+      cwd: '/tmp/project',
+      mcpServers: [],
+      _meta: null
+    } as any)
+
+    assert.equal(spawnCalls, 0)
+    assert.equal(closeCalls, 0)
+    assert.equal(closeAllExceptCalls, 0)
+    assert.equal(getMessagesCalls, 0)
+    assert.equal(updatedSessionFile, sessionFile)
+    assert.deepEqual(upserts, [{ sessionId: 'active-session', cwd: '/tmp/project', sessionFile }])
+    assert.equal(response.configOptions?.find(option => option.id === 'model')?.currentValue, 'test/fast')
+    assert.equal(response.configOptions?.find(option => option.id === 'thinking_level')?.currentValue, 'high')
+
+    await new Promise(resolve => setTimeout(resolve, 10))
+    assert.equal(getCommandsCalls, 1)
+    assert.ok(
+      conn.updates.some(update => (update.update as any).sessionUpdate === 'available_commands_update'),
+      'loadSession should re-advertise commands for active sessions'
+    )
+  } finally {
+    PiRpcProcess.spawn = originalSpawn
+  }
+})
+
+test('PiAcpAgent: repeated active load falls back to close and spawn when cwd mismatches', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-active-cwd-mismatch-'))
+  const sessionFile = join(root, 'target.jsonl')
+  mkdirSync(root, { recursive: true })
+  writeFileSync(
+    sessionFile,
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'same-session',
+      timestamp: '2026-02-11T00:00:00.000Z',
+      cwd: '/tmp/project'
+    }) + '\n',
+    'utf8'
+  )
+
+  const originalSpawn = PiRpcProcess.spawn
+  let spawnCalls = 0
+  let closeCalls = 0
+
+  try {
+    ;(PiRpcProcess as any).spawn = async () => {
+      spawnCalls += 1
+      return {
+        onEvent: () => () => {},
+        getMessages: async () => ({ messages: [] }),
+        getState: async () => ({ sessionId: 'same-session', sessionFile, thinkingLevel: 'medium' }),
+        getAvailableModels: async () => ({ models: [] }),
+        getCommands: async () => ({ commands: [] })
+      } as any
+    }
+
+    const conn = new FakeAgentSideConnection()
+    const agent = new PiAcpAgent(asAgentConn(conn))
+    ;(agent as any).store = {
+      get: () => ({
+        sessionId: 'same-session',
+        cwd: '/tmp/project',
+        sessionFile,
+        updatedAt: '2026-02-11T00:00:00.000Z'
+      }),
+      list: () => [],
+      delete: () => {},
+      upsert: () => {}
+    }
+    ;(agent as any).sessions = {
+      maybeGet: () => ({
+        sessionId: 'same-session',
+        cwd: '/tmp/other-project',
+        proc: { getState: async () => ({ sessionId: 'same-session', cwd: '/tmp/other-project' }) },
+        getSessionFile: () => null,
+        updateSessionFile: () => {}
+      }),
+      close: (sessionId: string) => {
+        assert.equal(sessionId, 'same-session')
+        closeCalls += 1
+      },
+      getOrCreate: (_sessionId: string, params: any) => ({
+        sessionId: 'same-session',
+        cwd: '/tmp/project',
+        proc: params.proc,
+        getSessionFile: () => sessionFile,
+        updateSessionFile: () => {},
+        attachWorkflowRun: async () => {}
+      }),
+      closeAllExcept: () => {}
+    }
+
+    await agent.loadSession({ sessionId: 'same-session', cwd: '/tmp/project', mcpServers: [], _meta: null } as any)
+
+    assert.equal(closeCalls, 1)
+    assert.equal(spawnCalls, 1)
+  } finally {
+    PiRpcProcess.spawn = originalSpawn
+  }
+})
+
+test('PiAcpAgent: loading a different session spawns and enforces one live pi process', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-load-different-'))
+  const sessionFile = join(root, 'target.jsonl')
+  mkdirSync(root, { recursive: true })
+  writeFileSync(
+    sessionFile,
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'target-session',
+      timestamp: '2026-02-11T00:00:00.000Z',
+      cwd: '/tmp/project'
+    }) + '\n',
+    'utf8'
+  )
+
+  const originalSpawn = PiRpcProcess.spawn
+  let spawnCalls = 0
+  const closeAllExceptArgs: string[] = []
+
+  try {
+    ;(PiRpcProcess as any).spawn = async () => {
+      spawnCalls += 1
+      return {
+        onEvent: () => () => {},
+        getMessages: async () => ({ messages: [] }),
+        getState: async () => ({ sessionId: 'target-session', sessionFile, thinkingLevel: 'medium' }),
+        getAvailableModels: async () => ({ models: [] }),
+        getCommands: async () => ({ commands: [] })
+      } as any
+    }
+
+    const conn = new FakeAgentSideConnection()
+    const agent = new PiAcpAgent(asAgentConn(conn))
+    ;(agent as any).store = {
+      get: () => ({
+        sessionId: 'target-session',
+        cwd: '/tmp/project',
+        sessionFile,
+        updatedAt: '2026-02-11T00:00:00.000Z'
+      }),
+      list: () => [],
+      delete: () => {},
+      upsert: () => {}
+    }
+    ;(agent as any).sessions = {
+      maybeGet: () => undefined,
+      close: () => {
+        throw new Error('target session should not be closed before spawn when it is not active')
+      },
+      getOrCreate: (_sessionId: string, params: any) => ({
+        sessionId: 'target-session',
+        cwd: '/tmp/project',
+        proc: params.proc,
+        getSessionFile: () => sessionFile,
+        updateSessionFile: () => {},
+        attachWorkflowRun: async () => {}
+      }),
+      closeAllExcept: (sessionId: string) => closeAllExceptArgs.push(sessionId)
+    }
+
+    await agent.loadSession({ sessionId: 'target-session', cwd: '/tmp/project', mcpServers: [], _meta: null } as any)
+
+    assert.equal(spawnCalls, 1)
+    assert.deepEqual(closeAllExceptArgs, ['target-session'])
+  } finally {
+    PiRpcProcess.spawn = originalSpawn
+  }
+})
+
 test('PiAcpAgent: loadSession replays and reattaches recoverable workflow runs', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-workflow-load-'))
   const sessionsDir = join(root, 'sessions', '--tmp--project--')
@@ -251,15 +512,23 @@ test('PiAcpAgent: loadSession replays and reattaches recoverable workflow runs',
   const oldEnv = process.env.PI_CODING_AGENT_DIR
   process.env.PI_CODING_AGENT_DIR = root
   const originalSpawn = PiRpcProcess.spawn
+  let spawnCalls = 0
+  let getMessagesCalls = 0
 
   try {
-    ;(PiRpcProcess as any).spawn = async () =>
-      ({
+    ;(PiRpcProcess as any).spawn = async () => {
+      spawnCalls += 1
+      return {
         onEvent: () => () => {},
-        getMessages: async () => ({ messages: [] }),
-        getState: async () => ({ sessionId: 'workflow-session', sessionFile }),
-        getAvailableModels: async () => ({ models: [] })
-      }) as any
+        getMessages: async () => {
+          getMessagesCalls += 1
+          return { messages: [] }
+        },
+        getState: async () => ({ sessionId: 'workflow-session', cwd: '/tmp/project', sessionFile }),
+        getAvailableModels: async () => ({ models: [] }),
+        getCommands: async () => ({ commands: [] })
+      } as any
+    }
 
     const conn = new FakeAgentSideConnection()
     const agent = new PiAcpAgent(asAgentConn(conn))
@@ -274,6 +543,16 @@ test('PiAcpAgent: loadSession replays and reattaches recoverable workflow runs',
     assert.ok(
       conn.extNotifications.some(item => item.method === '_pi/workflows/events' && item.params.runId === 'wf-run')
     )
+
+    await agent.loadSession({ sessionId: 'workflow-session', cwd: '/tmp/project', mcpServers: [], _meta: null } as any)
+    const updatesAfterRepeatedLoad = conn.updates.map(item => item.update as any)
+    assert.equal(spawnCalls, 1)
+    assert.equal(getMessagesCalls, 1)
+    assert.deepEqual(
+      updatesAfterRepeatedLoad.filter(update => update.sessionUpdate === 'tool_call').map(update => update.toolCallId),
+      ['workflow:wf-run']
+    )
+    assert.equal(updatesAfterRepeatedLoad.filter(update => update.sessionUpdate === 'plan').length, 1)
   } finally {
     PiRpcProcess.spawn = originalSpawn
     if (oldEnv === undefined) delete process.env.PI_CODING_AGENT_DIR

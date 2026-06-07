@@ -26,7 +26,7 @@ import {
   type StopReason
 } from '@agentclientprotocol/sdk'
 import { getAuthMethods } from './auth.js'
-import { SessionManager } from './session.js'
+import { PiAcpSession, SessionManager } from './session.js'
 import { SessionStore, type StoredSession } from './session-store.js'
 import { PiRpcProcess, PiRpcProcessLifecycleError, PiRpcSpawnError } from '../pi-rpc/process.js'
 import { findPiSessionFile, listPiSessions, resolveStoredPiSessionFile, validatePiSessionFile } from './pi-sessions.js'
@@ -256,9 +256,8 @@ export class PiAcpAgent implements ACPAgent {
     state: unknown,
     session?: { updateSessionFile(sessionFile: string | null): void }
   ): string | null {
-    const data = state && typeof state === 'object' ? (state as Record<string, unknown>) : null
-    const stateSessionId = typeof data?.sessionId === 'string' && data.sessionId.trim() ? data.sessionId : null
-    const sessionFile = typeof data?.sessionFile === 'string' && data.sessionFile.trim() ? data.sessionFile : null
+    const stateSessionId = this.stateString(state, 'sessionId')
+    const sessionFile = this.stateString(state, 'sessionFile')
 
     if (stateSessionId && stateSessionId !== sessionId) return null
     if (!sessionFile) return null
@@ -271,6 +270,123 @@ export class PiAcpAgent implements ACPAgent {
     this.store.upsert({ sessionId, cwd, sessionFile })
     session?.updateSessionFile(sessionFile)
     return sessionFile
+  }
+
+  private stateString(state: unknown, key: string): string | null {
+    const data = state && typeof state === 'object' ? (state as Record<string, unknown>) : null
+    const value = data?.[key]
+    return typeof value === 'string' && value.trim() ? value : null
+  }
+
+  private upsertKnownSessionFile(
+    sessionId: string,
+    cwd: string,
+    sessionFile: string | null | undefined,
+    session?: { updateSessionFile(sessionFile: string | null): void }
+  ): boolean {
+    if (!sessionFile || !existsSync(sessionFile)) return false
+    const validation = validatePiSessionFile(sessionFile, { sessionId, cwd })
+    if (!validation.ok) return false
+    this.store.upsert({ sessionId, cwd, sessionFile })
+    session?.updateSessionFile(sessionFile)
+    return true
+  }
+
+  private async getReusableActiveLoadState(
+    session: PiAcpSession,
+    params: Pick<LoadSessionRequest, 'sessionId' | 'cwd'>
+  ): Promise<{ reusable: true; state: unknown } | { reusable: false }> {
+    if (session.cwd !== params.cwd) return { reusable: false }
+
+    let state: unknown
+    try {
+      state = await session.proc.getState()
+    } catch {
+      return { reusable: false }
+    }
+
+    const stateSessionId = this.stateString(state, 'sessionId')
+    if (stateSessionId && stateSessionId !== params.sessionId) return { reusable: false }
+
+    const stateCwd = this.stateString(state, 'cwd')
+    if (stateCwd && stateCwd !== params.cwd) return { reusable: false }
+
+    const stateSessionFile = this.stateString(state, 'sessionFile')
+    if (stateSessionFile && existsSync(stateSessionFile)) {
+      const validation = validatePiSessionFile(stateSessionFile, { sessionId: params.sessionId, cwd: params.cwd })
+      if (!validation.ok) return { reusable: false }
+    }
+
+    const knownSessionFile = stateSessionFile ?? session.getSessionFile()
+    if (knownSessionFile && existsSync(knownSessionFile)) {
+      const validation = validatePiSessionFile(knownSessionFile, { sessionId: params.sessionId, cwd: params.cwd })
+      if (!validation.ok) return { reusable: false }
+    }
+
+    return { reusable: true, state }
+  }
+
+  private async attachRecoverableWorkflowRuns(
+    session: PiAcpSession,
+    cwd: string,
+    parentSessionId: string
+  ): Promise<void> {
+    const recoverableWorkflowRuns = listRecoverableWorkflowRunsForSession({ cwd, parentSessionId })
+    for (const run of recoverableWorkflowRuns) await session.attachWorkflowRun(run, 0)
+  }
+
+  private scheduleAvailableCommandsUpdate(
+    sessionId: string,
+    proc: Pick<PiRpcProcess, 'getCommands'>,
+    fileCommands: ReturnType<typeof loadSlashCommands>,
+    enableSkillCommands: boolean
+  ): void {
+    setTimeout(() => {
+      void (async () => {
+        const availableCommands = await discoverAvailableCommands(proc, fileCommands, enableSkillCommands)
+
+        await this.conn.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'available_commands_update',
+            availableCommands
+          }
+        })
+      })().catch(error => {
+        console.error(
+          `[pi-acp] available commands update failed sessionId=${sessionId}: ${error instanceof Error ? error.message : String(error)}`
+        )
+      })
+    }, 0)
+  }
+
+  private async buildLoadSessionResponse(
+    session: PiAcpSession,
+    params: Pick<LoadSessionRequest, 'sessionId' | 'cwd'>,
+    fileCommands: ReturnType<typeof loadSlashCommands>,
+    enableSkillCommands: boolean,
+    state?: unknown
+  ): Promise<LoadSessionResponse> {
+    if (!this.refreshSessionMapFromPiState(params.sessionId, params.cwd, state, session)) {
+      this.upsertKnownSessionFile(params.sessionId, params.cwd, session.getSessionFile(), session)
+    }
+
+    await this.attachRecoverableWorkflowRuns(session, params.cwd, params.sessionId)
+
+    const configOptions = await getSessionConfigOptions(session.proc, { state })
+
+    const response = {
+      configOptions,
+      _meta: {
+        piAcp: {
+          startupInfo: null
+        }
+      }
+    }
+
+    this.scheduleAvailableCommandsUpdate(session.sessionId, session.proc, fileCommands, enableSkillCommands)
+
+    return response
   }
 
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
@@ -422,22 +538,8 @@ export class PiAcpAgent implements ACPAgent {
       }
     }
 
-    // Advertise slash commands (ACP: available_commands_update)
-    // Important: some clients (e.g. Zed) will ignore notifications for an unknown sessionId.
-    // So we must send this *after* the session/new response has been delivered.
-    setTimeout(() => {
-      void (async () => {
-        const availableCommands = await discoverAvailableCommands(session.proc, fileCommands, enableSkillCommands)
-
-        await this.conn.sessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: 'available_commands_update',
-            availableCommands
-          }
-        })
-      })()
-    }, 0)
+    // Advertise slash commands after the response so the client knows the session exists.
+    this.scheduleAvailableCommandsUpdate(session.sessionId, session.proc, fileCommands, enableSkillCommands)
 
     return response
   }
@@ -1294,12 +1396,29 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
     }
 
-    // If the client is re-loading a session that is already active, tear down the existing
-    // pi subprocess so we can start fresh and re-advertise commands reliably.
-    // (Some clients may call session/load when restoring from history.)
-    this.sessions.close(params.sessionId)
-
     this.lastSessionCwd = params.cwd
+
+    const fileCommands = loadSlashCommands(params.cwd)
+    const enableSkillCommands = getEnableSkillCommands(params.cwd)
+    const activeSession = this.sessions.maybeGet(params.sessionId)
+
+    if (activeSession) {
+      const activeLoadState = await this.getReusableActiveLoadState(activeSession, params)
+      if (activeLoadState.reusable) {
+        return this.buildLoadSessionResponse(
+          activeSession,
+          params,
+          fileCommands,
+          enableSkillCommands,
+          activeLoadState.state
+        )
+      }
+
+      if (activeSession.cwd === params.cwd) {
+        this.upsertKnownSessionFile(params.sessionId, params.cwd, activeSession.getSessionFile(), activeSession)
+      }
+      this.sessions.close(params.sessionId)
+    }
 
     // MVP: ignore mcpServers.
     // Prefer ACP-created mapping first (fast path), otherwise scan pi sessions dir.
@@ -1331,17 +1450,11 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     const loadedState = await proc.getState().catch(() => null)
-    const stateSessionId =
-      loadedState && typeof loadedState === 'object' && typeof (loadedState as any).sessionId === 'string'
-        ? String((loadedState as any).sessionId)
-        : null
+    const stateSessionId = this.stateString(loadedState, 'sessionId')
     if (stateSessionId && stateSessionId !== params.sessionId) {
       proc.dispose()
       throw RequestError.invalidParams(`Loaded pi session ${stateSessionId} did not match ${params.sessionId}`)
     }
-
-    const fileCommands = loadSlashCommands(params.cwd)
-    const enableSkillCommands = getEnableSkillCommands(params.cwd)
 
     const session = this.sessions.getOrCreate(params.sessionId, {
       cwd: params.cwd,
@@ -1430,11 +1543,7 @@ export class PiAcpAgent implements ACPAgent {
       }
     }
 
-    const recoverableWorkflowRuns = listRecoverableWorkflowRunsForSession({
-      cwd: params.cwd,
-      parentSessionId: params.sessionId
-    })
-    for (const run of recoverableWorkflowRuns) await session.attachWorkflowRun(run, 0)
+    await this.attachRecoverableWorkflowRuns(session, params.cwd, params.sessionId)
 
     const configOptions = await getSessionConfigOptions(proc)
 
@@ -1448,19 +1557,7 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     // Advertise slash commands after the response so the client knows the session exists.
-    setTimeout(() => {
-      void (async () => {
-        const availableCommands = await discoverAvailableCommands(proc, fileCommands, enableSkillCommands)
-
-        await this.conn.sessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: 'available_commands_update',
-            availableCommands
-          }
-        })
-      })()
-    }, 0)
+    this.scheduleAvailableCommandsUpdate(session.sessionId, proc, fileCommands, enableSkillCommands)
 
     return response
   }

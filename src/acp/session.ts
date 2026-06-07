@@ -790,7 +790,7 @@ export class PiAcpSession {
 
   async attachWorkflowRun(run: Pick<WorkflowRunRecord, 'id' | 'runDir'>, sinceSequence = 0): Promise<void> {
     const existing = this.attachedWorkflowMonitors.get(run.id)
-    existing?.dispose()
+    if (existing) return
     const monitor = new WorkflowEventMonitor(this.cwd, update => this.emit(update), {
       attach: { runId: run.id, runDir: run.runDir, sinceSequence },
       onRecord: (record, sequence) => this.emitWorkflowEventNotification(record, sequence),

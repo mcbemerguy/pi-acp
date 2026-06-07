@@ -41,8 +41,10 @@ test('PiAcpAgent: skips loadSession history replay for t3-code clients', async (
   ;(globalThis as any).setTimeout = () => 0 as any
 
   let getMessagesCalls = 0
+  let spawnCalls = 0
   const originalSpawn = PiRpcProcess.spawn
   ;(PiRpcProcess as any).spawn = async () => {
+    spawnCalls += 1
     return {
       onEvent: () => () => {},
       getMessages: async () => {
@@ -55,7 +57,8 @@ test('PiAcpAgent: skips loadSession history replay for t3-code clients', async (
         }
       },
       getAvailableModels: async () => ({ models: [] }),
-      getState: async () => ({ thinkingLevel: 'medium', sessionId: 's1', sessionFile })
+      getState: async () => ({ thinkingLevel: 'medium', sessionId: 's1', cwd: process.cwd(), sessionFile }),
+      getCommands: async () => ({ commands: [] })
     } as any
   }
 
@@ -71,7 +74,9 @@ test('PiAcpAgent: skips loadSession history replay for t3-code clients', async (
     } as any)
 
     await agent.loadSession({ sessionId: 's1', cwd: process.cwd(), mcpServers: [] } as any)
+    await agent.loadSession({ sessionId: 's1', cwd: process.cwd(), mcpServers: [] } as any)
 
+    assert.equal(spawnCalls, 1)
     assert.equal(getMessagesCalls, 0)
     assert.equal(
       conn.updates.some(update => {
