@@ -11,6 +11,7 @@ import { maybeAuthRequiredError } from './auth-required.js'
 import { readFileSync, statSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { PiRpcProcess, PiRpcProcessLifecycleError, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
+import { DEFAULT_PROJECT_TRUST_POLICY, type PiProjectTrustPolicy } from '../pi-rpc/trust.js'
 import { SessionStore } from './session-store.js'
 import {
   TOOL_PRESENTATION_LIMITS,
@@ -50,6 +51,7 @@ type SessionCreateParams = {
   conn: AgentSideConnection
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
+  projectTrustPolicy?: PiProjectTrustPolicy
 }
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
@@ -173,7 +175,8 @@ export class SessionManager {
     try {
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
-        piCommand: params.piCommand
+        piCommand: params.piCommand,
+        projectTrustPolicy: params.projectTrustPolicy
       })
     } catch (e) {
       if (e instanceof PiRpcSpawnError) {
@@ -206,7 +209,8 @@ export class SessionManager {
       proc,
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
-      sessionFile
+      sessionFile,
+      projectTrustPolicy: params.projectTrustPolicy
     })
 
     this.sessions.set(sessionId, session)
@@ -237,7 +241,8 @@ export class SessionManager {
       proc: params.proc,
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
-      sessionFile: params.sessionFile ?? null
+      sessionFile: params.sessionFile ?? null,
+      projectTrustPolicy: params.projectTrustPolicy
     })
 
     this.sessions.set(sessionId, session)
@@ -257,6 +262,7 @@ export class PiAcpSession {
   private currentThoughtOpen = false
 
   readonly proc: PiRpcProcess
+  readonly projectTrustPolicy: PiProjectTrustPolicy
   private readonly conn: AgentSideConnection
   private fileCommands: FileSlashCommand[]
   private readonly cancelAbortTimeoutMs: number
@@ -329,6 +335,7 @@ export class PiAcpSession {
     proc: PiRpcProcess
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
+    projectTrustPolicy?: PiProjectTrustPolicy
     cancelAbortTimeoutMs?: number
     cancelDrainTimeoutMs?: number
     sessionFile?: string | null
@@ -337,6 +344,7 @@ export class PiAcpSession {
     this.cwd = opts.cwd
     this.mcpServers = opts.mcpServers
     this.proc = opts.proc
+    this.projectTrustPolicy = opts.projectTrustPolicy ?? DEFAULT_PROJECT_TRUST_POLICY
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
     this.cancelAbortTimeoutMs = opts.cancelAbortTimeoutMs ?? CANCEL_ABORT_TIMEOUT_MS

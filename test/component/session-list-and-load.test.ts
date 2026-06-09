@@ -340,7 +340,8 @@ test('PiAcpAgent: repeated active load refreshes file slash commands used by pro
         source: '(test)'
       }
     ],
-    sessionFile
+    sessionFile,
+    projectTrustPolicy: 'trusted'
   })
   const agent = new PiAcpAgent(asAgentConn(conn))
   ;(agent as any).store = {
@@ -356,7 +357,12 @@ test('PiAcpAgent: repeated active load refreshes file slash commands used by pro
     }
   }
 
-  await agent.loadSession({ sessionId: 'active-command-session', cwd, mcpServers: [], _meta: null } as any)
+  await agent.loadSession({
+    sessionId: 'active-command-session',
+    cwd,
+    mcpServers: [],
+    _meta: { piAcp: { projectTrust: 'trusted' } }
+  } as any)
 
   const prompt = session.prompt(`/${commandName} topic`)
   proc.emit({ type: 'agent_start' })

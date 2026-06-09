@@ -120,8 +120,12 @@ Point your ACP client to the built `dist/index.js`:
 - `PI_ACP_ENABLE_EMBEDDED_CONTEXT=true` advertises ACP `promptCapabilities.embeddedContext` support to the client.
 - Default: unset/any other value means `false`.
 - When disabled, compliant ACP clients should avoid sending embedded `resource` blocks. If they send them anyway, `pi-acp` still degrades gracefully by converting them into plain-text prompt context.
+- `PI_ACP_PROJECT_TRUST=auto|trusted|untrusted` controls project-local inputs for child `pi --mode rpc` processes.
+  - `auto` (default): pass no trust override. Pi uses its trust store; unsaved projects stay untrusted in non-interactive RPC.
+  - `trusted`: pass `--approve` and allow the adapter's fallback project `.pi/prompts` / `.pi/settings.json` reads.
+  - `untrusted`: pass `--no-approve` and do not read project `.pi` resources from the adapter.
 
-You can add the environment variable in the Zed settings with:
+You can add environment variables in the Zed settings with:
 
 ```json
   "agent_servers": {
@@ -131,10 +135,29 @@ You can add the environment variable in the Zed settings with:
       "args": ["/path/to/pi-acp/dist/index.js"],
       "env": {
           "PI_ACP_ENABLE_EMBEDDED_CONTEXT": "true",
+          "PI_ACP_PROJECT_TRUST": "auto"
       }
     }
   }
 ```
+
+### Project trust
+
+Pi 0.79 gates project-local inputs (`AGENTS.md` / `CLAUDE.md`, `.pi/settings.json`, `.pi/prompts`, project extensions/packages, and project skills) behind project trust. Because ACP sessions spawn Pi in non-interactive RPC mode, `pi-acp` defaults to `PI_ACP_PROJECT_TRUST=auto`: Pi honors saved trust decisions in `~/.pi/agent/trust.json`, and ignores project-local inputs when no saved decision exists.
+
+Use one of these intentional opt-ins when an ACP client or local configuration should override that default for a session:
+
+- Set `PI_ACP_PROJECT_TRUST=trusted` to spawn Pi with `--approve` for the run.
+- Set `PI_ACP_PROJECT_TRUST=untrusted` to spawn Pi with `--no-approve` for the run.
+- Pi-aware ACP clients may set request metadata `_meta.piAcp.projectTrust` to `"auto"`, `"trusted"`, or `"untrusted"` on `session/new` or `session/load`; request metadata takes precedence over env/config.
+
+Adapter-side project resource discovery is also gated. In `auto` and `untrusted`, `pi-acp` does not directly read `<cwd>/.pi/prompts` or `<cwd>/.pi/settings.json`; command discovery comes from Pi RPC `get_commands` when available, after Pi has resolved trust. Only `trusted` enables fallback adapter reads of project prompt/settings files.
+
+Smoke-test checklist for a project containing `.pi/settings.json`, `.pi/prompts`, and `AGENTS.md`:
+
+1. With default `auto` and no saved Pi trust decision, start an ACP session and confirm project prompts/settings/instructions are not loaded.
+2. Save trust with Pi interactive `/trust` or run the adapter with `PI_ACP_PROJECT_TRUST=trusted`; confirm Pi RPC command discovery exposes trusted project prompts and project settings take effect.
+3. Run with `PI_ACP_PROJECT_TRUST=untrusted`; confirm project prompts/settings/instructions remain hidden even if a saved trust decision exists.
 
 ### Interactive questions and `ask_user_questions`
 
@@ -214,10 +237,10 @@ Generic ACP clients can ignore those methods and still receive replayed standard
 
 #### 1) File-based commands (aka prompts)
 
-Loaded from:
+Command discovery primarily uses Pi RPC `get_commands`, which reflects Pi's project-trust decision. The adapter fallback reads:
 
 - User commands: `~/.pi/agent/prompts/**/*.md`
-- Project commands: `<cwd>/.pi/prompts/**/*.md`
+- Project commands: `<cwd>/.pi/prompts/**/*.md` only when `PI_ACP_PROJECT_TRUST=trusted` or equivalent request metadata is used
 
 #### 2) Built-in commands
 

@@ -29,6 +29,12 @@ import { getAuthMethods } from './auth.js'
 import { PiAcpSession, SessionManager } from './session.js'
 import { SessionStore, type StoredSession } from './session-store.js'
 import { PiRpcProcess, PiRpcProcessLifecycleError, PiRpcSpawnError } from '../pi-rpc/process.js'
+import {
+  allowsAdapterProjectLocalReads,
+  resolveProjectTrustPolicy,
+  type PiProjectTrustConfig,
+  type PiProjectTrustPolicy
+} from '../pi-rpc/trust.js'
 import { findPiSessionFile, listPiSessions, resolveStoredPiSessionFile, validatePiSessionFile } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
 import { toolResultToText } from './translate/pi-tools.js'
@@ -165,12 +171,11 @@ function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableC
 export async function discoverAvailableCommands(
   proc: Pick<PiRpcProcess, 'getCommands'>,
   fileCommands: ReturnType<typeof loadSlashCommands>,
-  enableSkillCommands: boolean
+  _enableSkillCommands: boolean
 ): Promise<AvailableCommand[]> {
   try {
     const pi = (await proc.getCommands()) as unknown
     const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
-      enableSkillCommands,
       includeExtensionCommands: true
     })
 
@@ -215,6 +220,7 @@ function compactError(error: unknown): RequestError {
 
 export class PiAcpAgent implements ACPAgent {
   private readonly conn: AgentSideConnection
+  private readonly config: PiProjectTrustConfig | null
   private readonly sessions = new SessionManager()
   private readonly store = new SessionStore()
   private replayLoadSessionHistory = true
@@ -226,9 +232,17 @@ export class PiAcpAgent implements ACPAgent {
   // Remember recent session cwd and use it as the default filter.
   private lastSessionCwd: string | null = null
 
-  constructor(conn: AgentSideConnection, _config?: unknown) {
+  constructor(conn: AgentSideConnection, config?: PiProjectTrustConfig | null) {
     this.conn = conn
-    void _config
+    this.config = config ?? null
+  }
+
+  private projectTrustPolicyForRequest(params: { _meta?: unknown }): PiProjectTrustPolicy {
+    return resolveProjectTrustPolicy({ requestMeta: params._meta, config: this.config })
+  }
+
+  private allowsProjectLocalReads(policy: PiProjectTrustPolicy): boolean {
+    return allowsAdapterProjectLocalReads(policy)
   }
 
   private cleanupFailedNewSession(sessionId: string, state?: any | null): void {
@@ -449,8 +463,10 @@ export class PiAcpAgent implements ACPAgent {
 
     this.lastSessionCwd = params.cwd
 
-    const fileCommands = loadSlashCommands(params.cwd)
-    const enableSkillCommands = getEnableSkillCommands(params.cwd)
+    const projectTrustPolicy = this.projectTrustPolicyForRequest(params as { _meta?: unknown })
+    const allowProjectLocalReads = this.allowsProjectLocalReads(projectTrustPolicy)
+    const fileCommands = loadSlashCommands(params.cwd, { includeProject: allowProjectLocalReads })
+    const enableSkillCommands = getEnableSkillCommands(params.cwd, { includeProject: allowProjectLocalReads })
 
     // Pi doesn't support mcpServers, but we accept and store.
     const session = await this.sessions.create({
@@ -458,7 +474,8 @@ export class PiAcpAgent implements ACPAgent {
       mcpServers: params.mcpServers,
       conn: this.conn,
       fileCommands,
-      piCommand: process.env.PI_ACP_PI_COMMAND
+      piCommand: process.env.PI_ACP_PI_COMMAND,
+      projectTrustPolicy
     })
 
     // Fetch state + models once (parallel) to reduce startup latency.
@@ -1400,12 +1417,18 @@ export class PiAcpAgent implements ACPAgent {
 
     this.lastSessionCwd = params.cwd
 
-    const fileCommands = loadSlashCommands(params.cwd)
-    const enableSkillCommands = getEnableSkillCommands(params.cwd)
+    const projectTrustPolicy = this.projectTrustPolicyForRequest(params as { _meta?: unknown })
+    const allowProjectLocalReads = this.allowsProjectLocalReads(projectTrustPolicy)
+    const fileCommands = loadSlashCommands(params.cwd, { includeProject: allowProjectLocalReads })
+    const enableSkillCommands = getEnableSkillCommands(params.cwd, { includeProject: allowProjectLocalReads })
     const activeSession = this.sessions.maybeGet(params.sessionId)
 
     if (activeSession) {
-      const activeLoadState = await this.getReusableActiveLoadState(activeSession, params)
+      const activePolicy = activeSession.projectTrustPolicy ?? 'auto'
+      const activeLoadState =
+        activePolicy === projectTrustPolicy
+          ? await this.getReusableActiveLoadState(activeSession, params)
+          : { reusable: false as const }
       if (activeLoadState.reusable) {
         return this.buildLoadSessionResponse(
           activeSession,
@@ -1439,7 +1462,8 @@ export class PiAcpAgent implements ACPAgent {
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
         sessionPath: sessionFile,
-        piCommand: process.env.PI_ACP_PI_COMMAND
+        piCommand: process.env.PI_ACP_PI_COMMAND,
+        projectTrustPolicy
       })
     } catch (e: unknown) {
       if (e instanceof PiRpcSpawnError) {
@@ -1464,7 +1488,8 @@ export class PiAcpAgent implements ACPAgent {
       conn: this.conn,
       proc,
       fileCommands,
-      sessionFile
+      sessionFile,
+      projectTrustPolicy
     })
 
     // Policy: within a single ACP connection (one Zed window), keep only one live pi subprocess.

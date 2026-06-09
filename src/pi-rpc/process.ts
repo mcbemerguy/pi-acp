@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams, type SpawnOptions } from 'node:child_process'
 import * as readline from 'node:readline'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
+import { DEFAULT_PROJECT_TRUST_POLICY, piArgsForProjectTrustPolicy, type PiProjectTrustPolicy } from './trust.js'
 import { stripAnsi } from '../shared/ansi.js'
 
 export class PiRpcSpawnError extends Error {
@@ -83,10 +84,9 @@ export type PiRpcEvent = Record<string, unknown>
 
 type SpawnParams = {
   cwd: string
-  /** Optional override for `pi` executable name/path */
   piCommand?: string
-  /** If set, pi will persist the session to this exact file (via `--session <path>`). */
   sessionPath?: string
+  projectTrustPolicy?: PiProjectTrustPolicy
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
@@ -161,6 +161,18 @@ export function buildPiRpcSpawnEnv(env: NodeJS.ProcessEnv = process.env): NodeJS
     PI_ACP: '1',
     PI_ACP_RPC: '1'
   })
+}
+
+export function buildPiRpcSpawnArgs(
+  params: {
+    sessionPath?: string
+    projectTrustPolicy?: PiProjectTrustPolicy
+  } = {}
+): string[] {
+  const policy = params.projectTrustPolicy ?? DEFAULT_PROJECT_TRUST_POLICY
+  const args = ['--mode', 'rpc', '--no-themes', ...piArgsForProjectTrustPolicy(policy)]
+  if (params.sessionPath) args.push('--session', params.sessionPath)
+  return args
 }
 
 export function windowsProcessTreeKillCommand(pid: number): { command: string; args: string[]; options: SpawnOptions } {
@@ -275,12 +287,10 @@ export class PiRpcProcess {
     // On Windows, npm commonly creates pi.cmd / pi.bat launcher scripts.
     const cmd = getPiCommand(params.piCommand)
 
-    // Speed/robustness for ACP:
-    // - themes are irrelevant in rpc mode and can be noisy/slow to load.
-    // Keep extensions + prompt templates enabled because ACP users may rely on them
-    // (e.g. MCP extensions, prompt templates for workflows).
-    const args = ['--mode', 'rpc', '--no-themes']
-    if (params.sessionPath) args.push('--session', params.sessionPath)
+    const args = buildPiRpcSpawnArgs({
+      sessionPath: params.sessionPath,
+      projectTrustPolicy: params.projectTrustPolicy
+    })
 
     const child = spawn(cmd, args, {
       cwd: params.cwd,

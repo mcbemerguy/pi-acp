@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { discoverAvailableCommands } from '../../src/acp/agent.js'
 
-test('discoverAvailableCommands includes Pi extension commands by default and preserves skill filtering', async () => {
+test('discoverAvailableCommands includes Pi extension commands and trusts Pi command filtering', async () => {
   const commands = await discoverAvailableCommands(
     {
       async getCommands() {
@@ -25,7 +25,7 @@ test('discoverAvailableCommands includes Pi extension commands by default and pr
   )
   assert.equal(
     commands.some(command => command.name === 'skill:docs'),
-    false
+    true
   )
   assert.equal(
     commands.some(command => command.name === 'prompt'),

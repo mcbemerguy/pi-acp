@@ -16,12 +16,12 @@ function deepMerge(a: Record<string, unknown>, b: Record<string, unknown>): Reco
   return out
 }
 
-function getMergedSettings(cwd: string): Record<string, unknown> {
+function getMergedSettings(cwd: string, opts: { includeProject?: boolean } = {}): Record<string, unknown> {
   const globalSettingsPath = join(getAgentDir(), 'settings.json')
   const projectSettingsPath = resolve(cwd, '.pi', 'settings.json')
 
   const global = readJsonObjectCached(globalSettingsPath)
-  const project = readJsonObjectCached(projectSettingsPath)
+  const project = opts.includeProject === true ? readJsonObjectCached(projectSettingsPath) : {}
   return deepMerge(global, project)
 }
 
@@ -29,12 +29,8 @@ export function getAgentDir(): string {
   return process.env.PI_CODING_AGENT_DIR ? resolve(process.env.PI_CODING_AGENT_DIR) : join(homedir(), '.pi', 'agent')
 }
 
-/**
- * Mirror pi settings semantics (global + project merge, project overrides global).
- * Only returns the bits we currently need.
- */
-export function getEnableSkillCommands(cwd: string): boolean {
-  const merged = getMergedSettings(cwd)
+export function getEnableSkillCommands(cwd: string, opts: { includeProject?: boolean } = {}): boolean {
+  const merged = getMergedSettings(cwd, opts)
 
   const direct = merged.enableSkillCommands
   if (typeof direct === 'boolean') return direct

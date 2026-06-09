@@ -4,14 +4,11 @@ import { join, resolve } from 'node:path'
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
 import { readTextFileCached, statFile, type FileMetadata } from './file-cache.js'
 
-/**
- * File-based slash command (mirrors pi-coding-agent semantics).
- */
 export type FileSlashCommand = {
   name: string
   description: string
   content: string
-  source: string // e.g. "(user)", "(project)", "(project:frontend)"
+  source: string
 }
 
 function parseFrontmatter(content: string): {
@@ -115,17 +112,16 @@ function parseCommandFile(file: CommandFile): FileSlashCommand | null {
   }
 }
 
-/**
- * Load prompt templates from pi's prompt directories (formerly "commands").
- *  - user:    ~/.pi/agent/prompts/**\/*.md
- *  - project: <cwd>/.pi/prompts/**\/*.md
- */
-export function loadSlashCommands(cwd: string): FileSlashCommand[] {
+export function loadSlashCommands(cwd: string, opts: { includeProject?: boolean } = {}): FileSlashCommand[] {
   const userDir = join(homedir(), '.pi', 'agent', 'prompts')
   const projectDir = resolve(cwd, '.pi', 'prompts')
-  const cacheKey = `${resolve(cwd)}\0${userDir}\0${projectDir}`
+  const includeProject = opts.includeProject === true
+  const cacheKey = `${resolve(cwd)}\0${userDir}\0${projectDir}\0${includeProject ? 'project' : 'user-only'}`
 
-  const files = [...collectCommandFiles(userDir, 'user'), ...collectCommandFiles(projectDir, 'project')]
+  const files = [
+    ...collectCommandFiles(userDir, 'user'),
+    ...(includeProject ? collectCommandFiles(projectDir, 'project') : [])
+  ]
   const signature = commandFilesSignature(files)
   const cached = slashCommandCache.get(cacheKey)
   if (cached?.signature === signature) return cached.commands.slice()
@@ -139,10 +135,6 @@ export function loadSlashCommands(cwd: string): FileSlashCommand[] {
   return commands.slice()
 }
 
-/**
- * Convert file-based commands to ACP AvailableCommand objects.
- * De-dupes by name (first wins).
- */
 export function toAvailableCommands(fileCommands: FileSlashCommand[]): AvailableCommand[] {
   const seen = new Set<string>()
   const out: AvailableCommand[] = []
@@ -161,9 +153,6 @@ export function toAvailableCommands(fileCommands: FileSlashCommand[]): Available
   return out
 }
 
-/**
- * Parse command args (bash-style quotes).
- */
 export function parseCommandArgs(argsString: string): string[] {
   const args: string[] = []
   let current = ''
@@ -194,9 +183,6 @@ export function parseCommandArgs(argsString: string): string[] {
   return args
 }
 
-/**
- * Substitute $1, $2, ... and $@.
- */
 export function substituteArgs(content: string, args: string[]): string {
   let result = content
 
@@ -209,10 +195,6 @@ export function substituteArgs(content: string, args: string[]): string {
   return result
 }
 
-/**
- * Expand a leading /command using the loaded file commands.
- * Returns original text if it's not a known slash command.
- */
 export function expandSlashCommand(text: string, fileCommands: FileSlashCommand[]): string {
   if (!text.startsWith('/')) return text
 
