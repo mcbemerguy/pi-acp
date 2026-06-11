@@ -36,6 +36,13 @@ import {
   PI_EXTENSION_UI_EVENT_METHOD
 } from './extension-ui.js'
 import { PI_USAGE_UPDATE_METHOD, piUsageTelemetryFromPiSessionStats, usageUpdateFromPiSessionStats } from './usage.js'
+import {
+  CANCEL_PRESENTATION_MODE,
+  DEFAULT_CANCEL_PRESENTATION_STATS,
+  filterCancelReplayBacklog,
+  isCancelSemanticPresentationItem,
+  type CancelPresentationStats
+} from './cancel-presentation.js'
 
 const CANCEL_ABORT_TIMEOUT_MS = 3_500
 const CANCEL_DRAIN_TIMEOUT_MS = 2_000
@@ -92,6 +99,7 @@ export type OutboundPressureSnapshot = {
   maxPending: number
   coalesced: number
   diagnostics: number
+  cancelPresentation: CancelPresentationStats
 }
 
 type OutboundQueueItem = {
@@ -297,6 +305,7 @@ export class PiAcpSession {
   private completionReasonOverride: StopReason | null = null
   private drainingCancelledTurn = false
   private cancelDrainTimer: NodeJS.Timeout | null = null
+  private cancelPresentationActive = false
   private turnSettledWaiters: Array<() => void> = []
 
   private editSnapshots = new Map<string, { path: string; oldText?: string; skippedReason?: string }>()
@@ -314,7 +323,8 @@ export class PiAcpSession {
     pending: 0,
     maxPending: 0,
     coalesced: 0,
-    diagnostics: 0
+    diagnostics: 0,
+    cancelPresentation: { ...DEFAULT_CANCEL_PRESENTATION_STATS }
   }
 
   private cachedPiState: unknown
@@ -447,6 +457,7 @@ export class PiAcpSession {
       `[pi-acp] session/cancel received sessionId=${this.sessionId} pendingTurn=${Boolean(this.pendingTurn)} workflowContinuation=${this.workflowContinuationActive} queuedTurns=${this.turnQueue.length}`
     )
     this.cancelRequested = true
+    this.beginCancelPresentationBoundary()
 
     if (this.turnQueue.length) {
       const queued = this.turnQueue.splice(0, this.turnQueue.length)
@@ -489,13 +500,14 @@ export class PiAcpSession {
         }
       }
       await this.waitForTurnSettlement()
+      this.endCancelPresentationBoundary()
       return
     }
 
     try {
       await this.withTimeout(this.proc.abort(), this.cancelAbortTimeoutMs, 'pi abort')
-      if (!this.interruptCompletingTurn('cancelled', { drainPiEvents: true })) {
-        this.completeTurn('cancelled', { drainPiEvents: true })
+      if (!this.interruptCompletingTurn('cancelled', { cancelPresentationDrain: true })) {
+        this.completeTurn('cancelled', { cancelPresentationDrain: true })
       }
     } catch (error) {
       console.error(
@@ -511,6 +523,7 @@ export class PiAcpSession {
     }
 
     await this.waitForTurnSettlement()
+    this.endCancelPresentationBoundary()
   }
 
   wasCancelRequested(): boolean {
@@ -580,7 +593,62 @@ export class PiAcpSession {
   }
 
   getOutboundPressureSnapshot(): OutboundPressureSnapshot {
-    return { ...this.outboundPressure }
+    return {
+      ...this.outboundPressure,
+      cancelPresentation: { ...this.outboundPressure.cancelPresentation }
+    }
+  }
+
+  private beginCancelPresentationBoundary(): void {
+    this.cancelPresentationActive = true
+    if (!this.outboundQueue.length) return
+
+    const result = filterCancelReplayBacklog(this.outboundQueue)
+    if (!result.dropped.length && !result.coalesced.length) return
+
+    this.outboundQueue = result.kept
+    for (const item of [...result.dropped, ...result.coalesced]) item.resolve?.()
+    this.outboundPressure.cancelPresentation.droppedReplayBacklog += result.stats.droppedReplayBacklog
+    this.outboundPressure.cancelPresentation.coalescedReplayBacklog += result.stats.coalescedReplayBacklog
+    this.outboundPressure.cancelPresentation.preservedSemanticBacklog += result.stats.preservedSemanticBacklog
+    this.outboundPressure.cancelPresentation.preservedRoutineBacklog += result.stats.preservedRoutineBacklog
+    this.updateOutboundPendingPressure()
+    this.emitCancelPresentationDiagnostic(result.stats)
+  }
+
+  private endCancelPresentationBoundary(): void {
+    this.cancelPresentationActive = false
+  }
+
+  private emitCancelPresentationDiagnostic(stats: {
+    droppedReplayBacklog: number
+    coalescedReplayBacklog: number
+    preservedSemanticBacklog: number
+    preservedRoutineBacklog: number
+  }): void {
+    if (!stats.droppedReplayBacklog && !stats.coalescedReplayBacklog) return
+    this.outboundPressure.cancelPresentation.diagnostics += 1
+    console.error(
+      `[pi-acp] cancel presentation suppressed stale replay/backlog sessionId=${this.sessionId} dropped=${stats.droppedReplayBacklog} coalesced=${stats.coalescedReplayBacklog} preservedSemantic=${stats.preservedSemanticBacklog} preservedRoutine=${stats.preservedRoutineBacklog}`
+    )
+    this.emit({
+      sessionUpdate: 'agent_message_chunk',
+      content: {
+        type: 'text',
+        text: `Cancel presentation suppressed stale replay/backlog (${stats.droppedReplayBacklog} dropped, ${stats.coalescedReplayBacklog} coalesced); semantic workflow/tool updates are still forwarded.`
+      } satisfies ContentBlock,
+      _meta: {
+        piAcp: {
+          cancelPresentation: {
+            mode: CANCEL_PRESENTATION_MODE,
+            staleReplayBacklogDropped: stats.droppedReplayBacklog,
+            staleReplayBacklogCoalesced: stats.coalescedReplayBacklog,
+            semanticBacklogPreserved: stats.preservedSemanticBacklog,
+            routineBacklogPreserved: stats.preservedRoutineBacklog
+          }
+        }
+      }
+    })
   }
 
   private enqueueOutbound(item: OutboundQueueItem): void {
@@ -659,6 +727,9 @@ export class PiAcpSession {
           item.resolve?.()
         } catch (err) {
           this.outboundPressure.failed += 1
+          if (this.cancelPresentationActive && isCancelSemanticPresentationItem(item)) {
+            this.outboundPressure.cancelPresentation.actualSendFailures += 1
+          }
           item.reject?.(err)
         } finally {
           this.sendingOutbound = false
@@ -905,6 +976,7 @@ export class PiAcpSession {
     }
     this.clearAgentEndFallbackTimer()
     this.drainingCancelledTurn = false
+    this.cancelPresentationActive = false
   }
 
   private withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -1017,10 +1089,10 @@ export class PiAcpSession {
     })
   }
 
-  private interruptCompletingTurn(reason: StopReason, opts: { drainPiEvents?: boolean } = {}): boolean {
+  private interruptCompletingTurn(reason: StopReason, opts: { cancelPresentationDrain?: boolean } = {}): boolean {
     if (!this.pendingTurn || !this.completingTurn) return false
     this.completionReasonOverride = reason
-    if (opts.drainPiEvents) this.startCancelledTurnDrain()
+    if (opts.cancelPresentationDrain) this.startCancelledTurnDrain()
     this.currentWorkflowMonitor?.dispose()
     this.currentWorkflowMonitor = null
     this.completingWorkflowMonitor?.dispose()
@@ -1030,7 +1102,7 @@ export class PiAcpSession {
 
   private completeTurn(
     reason: StopReason,
-    opts: { reject?: unknown; proceedQueue?: boolean; drainPiEvents?: boolean } = {}
+    opts: { reject?: unknown; proceedQueue?: boolean; cancelPresentationDrain?: boolean } = {}
   ): void {
     if (!this.pendingTurn || this.completingTurn) return
     this.completingTurn = true
@@ -1039,11 +1111,11 @@ export class PiAcpSession {
     const monitor = this.currentWorkflowMonitor
     this.currentWorkflowMonitor = null
     this.completingWorkflowMonitor = monitor
-    if (opts.drainPiEvents && !this.shuttingDown) this.startCancelledTurnDrain()
+    if (opts.cancelPresentationDrain && !this.shuttingDown) this.startCancelledTurnDrain()
 
     void (async () => {
       if (monitor) {
-        if (reason === 'end_turn' && !opts.reject && !opts.drainPiEvents) {
+        if (reason === 'end_turn' && !opts.reject && !opts.cancelPresentationDrain) {
           await monitor.waitForRunEndAfterPromptResolution()
         } else {
           await monitor.stopAfterPromptResolution()
@@ -1091,6 +1163,7 @@ export class PiAcpSession {
   }
 
   private startCancelledTurnDrain(): void {
+    this.cancelPresentationActive = true
     this.drainingCancelledTurn = true
     if (this.cancelDrainTimer) clearTimeout(this.cancelDrainTimer)
     this.cancelDrainTimer = setTimeout(() => this.stopCancelledTurnDrain(), this.cancelDrainTimeoutMs)
@@ -1105,6 +1178,7 @@ export class PiAcpSession {
     }
 
     this.resolveTurnSettledWaiters()
+    if (!this.pendingTurn && !this.workflowContinuationActive) this.endCancelPresentationBoundary()
 
     if (!this.pendingTurn && !this.workflowContinuationActive && this.turnQueue.length) {
       const next = this.turnQueue.shift()

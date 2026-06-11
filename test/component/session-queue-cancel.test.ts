@@ -4,6 +4,7 @@ import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PiAcpSession } from '../../src/acp/session.js'
+import { PI_WORKFLOWS_EVENTS_METHOD } from '../../src/acp/workflows.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
 async function waitForMicrotasks(): Promise<void> {
@@ -136,6 +137,65 @@ test('PiAcpSession: cancel forwards late events and waits for drain before retur
 
   proc.emit({ type: 'agent_end' })
   assert.equal(await second, 'end_turn')
+})
+
+test('PiAcpSession: cancel suppresses stale replay backlog but preserves semantic workflow updates', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  let releaseUpdates!: () => void
+  conn.sessionUpdateBlocker = new Promise<void>(resolve => {
+    releaseUpdates = resolve
+  })
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: [],
+    cancelDrainTimeoutMs: 5
+  })
+
+  const first = session.prompt('one')
+  await waitForMicrotasks()
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'text_delta', delta: 'stale replay text' }
+  } as any)
+  ;(session as any).emitCustomNotification(PI_WORKFLOWS_EVENTS_METHOD, {
+    sessionId: 's1',
+    runId: 'run',
+    sequence: 2,
+    event: { type: 'run_interrupted', runId: 'run', sequence: 2 }
+  })
+
+  const cancelPromise = session.cancel()
+  await waitForMicrotasks()
+  ;(session as any).emitCustomNotification(PI_WORKFLOWS_EVENTS_METHOD, {
+    sessionId: 's1',
+    runId: 'run',
+    sequence: 3,
+    event: { type: 'run_interrupted', runId: 'run', sequence: 3 }
+  })
+
+  releaseUpdates()
+  await cancelPromise
+  assert.equal(await first, 'cancelled')
+
+  assert.equal(
+    conn.updates.some(update => JSON.stringify(update).includes('stale replay text')),
+    false
+  )
+  assert.deepEqual(
+    conn.extNotifications
+      .filter(notification => notification.method === PI_WORKFLOWS_EVENTS_METHOD)
+      .map(notification => notification.params.sequence),
+    [2, 3]
+  )
+  const pressure = session.getOutboundPressureSnapshot()
+  assert.equal(pressure.cancelPresentation.droppedReplayBacklog >= 1, true)
+  assert.equal(pressure.cancelPresentation.preservedSemanticBacklog >= 1, true)
 })
 
 test('PiAcpSession: continues a recoverable workflow run through Pi RPC control', async () => {

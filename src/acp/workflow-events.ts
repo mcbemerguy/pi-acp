@@ -91,6 +91,7 @@ type TerminalRunJsonFallbackState = {
 
 type WorkflowMeta = {
   runId: string
+  eventType?: string
   workflowId?: string
   commandName?: string
   runDir?: string
@@ -1757,6 +1758,7 @@ function subWorkflowCallToolId(runId: string, stepId: string, toolName: string, 
 function metaFromRecord(record: Record<string, unknown>, source?: WorkflowEventSourceIdentity): WorkflowMeta {
   return {
     runId: String(record.runId),
+    eventType: stringField(record.type),
     workflowId: stringField(record.workflowId),
     commandName: stringField(record.commandName),
     runDir: stringField(record.runDir),
