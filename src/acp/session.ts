@@ -40,6 +40,7 @@ import {
   CANCEL_PRESENTATION_MODE,
   DEFAULT_CANCEL_PRESENTATION_STATS,
   filterCancelReplayBacklog,
+  isCancelPresentationDiagnosticItem,
   isCancelSemanticPresentationItem,
   type CancelPresentationStats
 } from './cancel-presentation.js'
@@ -306,6 +307,7 @@ export class PiAcpSession {
   private drainingCancelledTurn = false
   private cancelDrainTimer: NodeJS.Timeout | null = null
   private cancelPresentationActive = false
+  private cancelPresentationDiagnosticEmitted = false
   private turnSettledWaiters: Array<() => void> = []
 
   private editSnapshots = new Map<string, { path: string; oldText?: string; skippedReason?: string }>()
@@ -600,24 +602,36 @@ export class PiAcpSession {
   }
 
   private beginCancelPresentationBoundary(): void {
+    const wasActive = this.cancelPresentationActive
     this.cancelPresentationActive = true
+    if (!wasActive) this.cancelPresentationDiagnosticEmitted = false
     if (!this.outboundQueue.length) return
 
     const result = filterCancelReplayBacklog(this.outboundQueue)
+    this.recordCancelPresentationStats(result.stats)
     if (!result.dropped.length && !result.coalesced.length) return
 
     this.outboundQueue = result.kept
     for (const item of [...result.dropped, ...result.coalesced]) item.resolve?.()
-    this.outboundPressure.cancelPresentation.droppedReplayBacklog += result.stats.droppedReplayBacklog
-    this.outboundPressure.cancelPresentation.coalescedReplayBacklog += result.stats.coalescedReplayBacklog
-    this.outboundPressure.cancelPresentation.preservedSemanticBacklog += result.stats.preservedSemanticBacklog
-    this.outboundPressure.cancelPresentation.preservedRoutineBacklog += result.stats.preservedRoutineBacklog
     this.updateOutboundPendingPressure()
     this.emitCancelPresentationDiagnostic(result.stats)
   }
 
   private endCancelPresentationBoundary(): void {
     this.cancelPresentationActive = false
+    this.cancelPresentationDiagnosticEmitted = false
+  }
+
+  private recordCancelPresentationStats(stats: {
+    droppedReplayBacklog: number
+    coalescedReplayBacklog: number
+    preservedSemanticBacklog: number
+    preservedRoutineBacklog: number
+  }): void {
+    this.outboundPressure.cancelPresentation.droppedReplayBacklog += stats.droppedReplayBacklog
+    this.outboundPressure.cancelPresentation.coalescedReplayBacklog += stats.coalescedReplayBacklog
+    this.outboundPressure.cancelPresentation.preservedSemanticBacklog += stats.preservedSemanticBacklog
+    this.outboundPressure.cancelPresentation.preservedRoutineBacklog += stats.preservedRoutineBacklog
   }
 
   private emitCancelPresentationDiagnostic(stats: {
@@ -627,10 +641,12 @@ export class PiAcpSession {
     preservedRoutineBacklog: number
   }): void {
     if (!stats.droppedReplayBacklog && !stats.coalescedReplayBacklog) return
-    this.outboundPressure.cancelPresentation.diagnostics += 1
     console.error(
       `[pi-acp] cancel presentation suppressed stale replay/backlog sessionId=${this.sessionId} dropped=${stats.droppedReplayBacklog} coalesced=${stats.coalescedReplayBacklog} preservedSemantic=${stats.preservedSemanticBacklog} preservedRoutine=${stats.preservedRoutineBacklog}`
     )
+    if (this.cancelPresentationDiagnosticEmitted) return
+    this.cancelPresentationDiagnosticEmitted = true
+    this.outboundPressure.cancelPresentation.diagnostics += 1
     this.emit({
       sessionUpdate: 'agent_message_chunk',
       content: {
@@ -651,6 +667,20 @@ export class PiAcpSession {
     })
   }
 
+  private cancelPresentationFilterForNewItem(item: OutboundQueueItem): {
+    keep: boolean
+    stats: {
+      droppedReplayBacklog: number
+      coalescedReplayBacklog: number
+      preservedSemanticBacklog: number
+      preservedRoutineBacklog: number
+    }
+  } | null {
+    if (!this.cancelPresentationActive || isCancelPresentationDiagnosticItem(item)) return null
+    const result = filterCancelReplayBacklog([item])
+    return { keep: result.kept.length > 0, stats: result.stats }
+  }
+
   private enqueueOutbound(item: OutboundQueueItem): void {
     if (this.shuttingDown) {
       item.resolve?.()
@@ -658,12 +688,32 @@ export class PiAcpSession {
     }
 
     this.outboundPressure.enqueued += 1
+    const cancelFilter = this.cancelPresentationFilterForNewItem(item)
+    if (cancelFilter && !cancelFilter.keep) {
+      this.recordCancelPresentationStats(cancelFilter.stats)
+      item.resolve?.()
+      this.updateOutboundPendingPressure()
+      this.emitCancelPresentationDiagnostic(cancelFilter.stats)
+      return
+    }
+
     if (this.coalesceOutbound(item)) {
       this.outboundPressure.coalesced += 1
+      if (cancelFilter) {
+        const coalescedStats = {
+          ...cancelFilter.stats,
+          coalescedReplayBacklog: cancelFilter.stats.coalescedReplayBacklog + 1,
+          preservedRoutineBacklog: 0,
+          preservedSemanticBacklog: 0
+        }
+        this.recordCancelPresentationStats(coalescedStats)
+        this.emitCancelPresentationDiagnostic(coalescedStats)
+      }
       this.updateOutboundPendingPressure()
       return
     }
 
+    if (cancelFilter) this.recordCancelPresentationStats(cancelFilter.stats)
     this.outboundQueue.push(item)
     this.updateOutboundPendingPressure()
     this.queueOutboundDiagnosticIfNeeded()

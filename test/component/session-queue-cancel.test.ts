@@ -79,7 +79,7 @@ test('PiAcpSession: cancel clears queued prompts', async () => {
   assert.equal(proc.prompts.length, 1)
 })
 
-test('PiAcpSession: cancel forwards late events and waits for drain before returning', async () => {
+test('PiAcpSession: cancel suppresses late stale presentation and waits for drain before returning', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -114,20 +114,36 @@ test('PiAcpSession: cancel forwards late events and waits for drain before retur
     toolName: 'read',
     result: { content: [{ type: 'text', text: 'late tool result' }] }
   })
+  ;(session as any).emitCustomNotification(PI_WORKFLOWS_EVENTS_METHOD, {
+    sessionId: 's1',
+    runId: 'run',
+    sequence: 9,
+    event: { type: 'run_interrupted', runId: 'run', sequence: 9 }
+  })
   await waitForMicrotasks()
   assert.equal(cancelSettled, false)
   assert.equal(proc.prompts.length, 1)
   assert.equal(
     conn.updates.some(u => JSON.stringify(u).includes('late thought')),
-    true
+    false
   )
   assert.equal(
     conn.updates.some(u => JSON.stringify(u).includes('late text')),
-    true
+    false
+  )
+  assert.equal(
+    conn.updates.some(u => u.update.sessionUpdate === 'tool_call' && (u.update as any).toolCallId === 'late-tool'),
+    false
   )
   assert.equal(
     conn.updates.some(u => JSON.stringify(u).includes('late tool result')),
     true
+  )
+  assert.deepEqual(
+    conn.extNotifications
+      .filter(notification => notification.method === PI_WORKFLOWS_EVENTS_METHOD)
+      .map(notification => notification.params.sequence),
+    [9]
   )
 
   proc.emit({ type: 'agent_end' })
@@ -178,6 +194,10 @@ test('PiAcpSession: cancel suppresses stale replay backlog but preserves semanti
     sequence: 3,
     event: { type: 'run_interrupted', runId: 'run', sequence: 3 }
   })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'text_delta', delta: 'post-cancel stale replay text' }
+  } as any)
 
   releaseUpdates()
   await cancelPromise
@@ -185,6 +205,10 @@ test('PiAcpSession: cancel suppresses stale replay backlog but preserves semanti
 
   assert.equal(
     conn.updates.some(update => JSON.stringify(update).includes('stale replay text')),
+    false
+  )
+  assert.equal(
+    conn.updates.some(update => JSON.stringify(update).includes('post-cancel stale replay text')),
     false
   )
   assert.deepEqual(
@@ -195,6 +219,51 @@ test('PiAcpSession: cancel suppresses stale replay backlog but preserves semanti
   )
   const pressure = session.getOutboundPressureSnapshot()
   assert.equal(pressure.cancelPresentation.droppedReplayBacklog >= 1, true)
+  assert.equal(pressure.cancelPresentation.preservedSemanticBacklog >= 1, true)
+})
+
+test('PiAcpSession: cancel diagnostics count preserved-only semantic backlog', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  let releaseUpdates!: () => void
+  conn.sessionUpdateBlocker = new Promise<void>(resolve => {
+    releaseUpdates = resolve
+  })
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: [],
+    cancelDrainTimeoutMs: 5
+  })
+
+  const first = session.prompt('one')
+  await waitForMicrotasks()
+  ;(session as any).emitCustomNotification(PI_WORKFLOWS_EVENTS_METHOD, {
+    sessionId: 's1',
+    runId: 'run',
+    sequence: 4,
+    event: { type: 'run_interrupted', runId: 'run', sequence: 4 }
+  })
+
+  const cancelPromise = session.cancel()
+  await waitForMicrotasks()
+  releaseUpdates()
+  await cancelPromise
+  assert.equal(await first, 'cancelled')
+
+  assert.deepEqual(
+    conn.extNotifications
+      .filter(notification => notification.method === PI_WORKFLOWS_EVENTS_METHOD)
+      .map(notification => notification.params.sequence),
+    [4]
+  )
+  const pressure = session.getOutboundPressureSnapshot()
+  assert.equal(pressure.cancelPresentation.droppedReplayBacklog, 0)
+  assert.equal(pressure.cancelPresentation.coalescedReplayBacklog, 0)
   assert.equal(pressure.cancelPresentation.preservedSemanticBacklog >= 1, true)
 })
 

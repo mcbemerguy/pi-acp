@@ -103,6 +103,10 @@ export function isCancelSemanticPresentationItem(item: CancelPresentationOutboun
   return classification.disposition === 'preserve' && classification.semantic
 }
 
+export function isCancelPresentationDiagnosticItem(item: CancelPresentationOutboundItem): boolean {
+  return item.kind === 'sessionUpdate' && Boolean(item.update && cancelPresentationMetadata(item.update))
+}
+
 function classifyCancelReplayBacklogItem(item: CancelPresentationOutboundItem): Classification {
   if (item.kind === 'extNotification') return classifyCancelReplayBacklogNotification(item)
   if (!item.update) return { disposition: 'drop' }
@@ -126,8 +130,10 @@ function classifyCancelReplayBacklogItem(item: CancelPresentationOutboundItem): 
     return { disposition: 'drop' }
   }
 
-  if (sessionUpdate === 'agent_message_chunk' && isUserVisibleErrorOrWarning(update)) {
-    return { disposition: 'preserve', semantic: true }
+  if (sessionUpdate === 'agent_message_chunk') {
+    if (cancelPresentationMetadata(update) || isUserVisibleErrorOrWarning(update)) {
+      return { disposition: 'preserve', semantic: true }
+    }
   }
 
   if (sessionUpdate === 'session_info_update') return { disposition: 'coalesce', key: 'session_info_update' }
@@ -147,6 +153,10 @@ function isUserVisibleErrorOrWarning(update: Record<string, unknown>): boolean {
   const content = objectField(update.content)
   const text = typeof content?.text === 'string' ? content.text : ''
   return /(?:failed|error|warning|timed out|did not acknowledge|permission denied)/i.test(text)
+}
+
+function cancelPresentationMetadata(value: unknown): Record<string, unknown> | undefined {
+  return objectField(objectField(objectField(objectField(value)?._meta)?.piAcp)?.cancelPresentation)
 }
 
 function workflowEventType(value: unknown): string | undefined {
