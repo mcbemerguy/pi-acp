@@ -41,6 +41,14 @@ test('PiAcpSession: workflow continuation participates in turn queue and session
     await wait(5)
     assert.equal(proc.prompts.length, 0)
 
+    assert.deepEqual(proc.workflowControls, [
+      {
+        action: 'resume',
+        target: root,
+        opts: { continuationMessage: 'continue workflow' }
+      }
+    ])
+
     await session.cancel()
     assert.equal(proc.abortCount, 1)
     assert.equal(await continuation, 'cancelled')
