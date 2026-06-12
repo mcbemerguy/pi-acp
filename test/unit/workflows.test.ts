@@ -143,7 +143,7 @@ test('readWorkflowRun does not synthesize a terminal sequence when run_end exist
   }
 })
 
-test('offline workflow controls update run.json without appending events.jsonl records', () => {
+test('offline recoverable workflow controls update run.json and append replayable events', () => {
   const root = join(tmpdir(), `pi-acp-workflows-control-${process.pid}-${Date.now()}`)
   const workflowRunsDir = join(root, 'workflow-runs')
   const runDir = join(workflowRunsDir, 'run')
@@ -162,7 +162,11 @@ test('offline workflow controls update run.json without appending events.jsonl r
     assert.equal(interruptWorkflowRun('run', { workflowRunsDir, reason: 'stop' }).status, 'interrupted')
     assert.equal(abortWorkflowRun('run', { workflowRunsDir, reason: 'explicit abort' }).status, 'aborted')
 
-    assert.equal(readFileSync(eventsPath, 'utf8'), initialEvents)
+    const eventTypes = readFileSync(eventsPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line).type)
+    assert.deepEqual(eventTypes, ['run_start', 'run_paused', 'run_resume_requested', 'run_interrupted'])
     const run = JSON.parse(readFileSync(join(runDir, 'run.json'), 'utf8'))
     assert.equal(run.control.controlSource, 'pi-acp-offline')
     assert.equal(run.status, 'aborted')

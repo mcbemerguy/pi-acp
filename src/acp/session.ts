@@ -25,9 +25,11 @@ import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import { isWorkflowCommandPrompt, parseWorkflowCommandPrompt, WorkflowEventMonitor } from './workflow-events.js'
 import {
   PI_WORKFLOWS_EVENTS_METHOD,
+  interruptWorkflowRun,
   readWorkflowRun,
   type WorkflowRunControlOptions,
-  type WorkflowRunRecord
+  type WorkflowRunRecord,
+  type WorkflowRunStatus
 } from './workflows.js'
 import {
   handleExtensionUiRequest,
@@ -47,8 +49,10 @@ import {
 
 const CANCEL_ABORT_TIMEOUT_MS = 3_500
 const CANCEL_DRAIN_TIMEOUT_MS = 2_000
-const CLOSE_CANCEL_TIMEOUT_MS = 5_000
+const CLOSE_CANCEL_TIMEOUT_MS = 6_500
 const CLOSE_SETTLEMENT_TIMEOUT_MS = 1_000
+const ATTACHED_WORKFLOW_INTERRUPT_TIMEOUT_MS = 4_000
+const ATTACHED_WORKFLOW_SETTLE_TIMEOUT_MS = 1_500
 const USAGE_REFRESH_DEBOUNCE_MS = 150
 const USAGE_REFRESH_MIN_INTERVAL_MS = 250
 const AGENT_END_RETRY_GRACE_MS = 100
@@ -91,6 +95,8 @@ type ToolMetadata = {
   title: string
   kind: ToolKind
 }
+
+type AttachedWorkflowRun = Pick<WorkflowRunRecord, 'id' | 'runDir'>
 
 export type OutboundPressureSnapshot = {
   enqueued: number
@@ -303,6 +309,7 @@ export class PiAcpSession {
   private workflowContinuationActive = false
   private workflowContinuationCancel: (() => void) | null = null
   private readonly attachedWorkflowMonitors = new Map<string, WorkflowEventMonitor>()
+  private readonly attachedWorkflowRuns = new Map<string, AttachedWorkflowRun>()
   private completionReasonOverride: StopReason | null = null
   private drainingCancelledTurn = false
   private cancelDrainTimer: NodeJS.Timeout | null = null
@@ -476,6 +483,7 @@ export class PiAcpSession {
     }
 
     if (!this.pendingTurn) {
+      await this.interruptAttachedWorkflowRuns('ACP session cancellation requested.')
       try {
         await this.withTimeout(this.proc.abort(), this.cancelAbortTimeoutMs, 'pi abort')
         if (this.workflowContinuationActive) {
@@ -922,6 +930,7 @@ export class PiAcpSession {
   }
 
   async attachWorkflowRun(run: Pick<WorkflowRunRecord, 'id' | 'runDir'>, sinceSequence = 0): Promise<void> {
+    this.attachedWorkflowRuns.set(run.id, { id: run.id, runDir: run.runDir })
     const existing = this.attachedWorkflowMonitors.get(run.id)
     if (existing) return
     const monitor = new WorkflowEventMonitor(this.cwd, update => this.emit(update), {
@@ -976,13 +985,68 @@ export class PiAcpSession {
     }
   }
 
+  private attachedWorkingWorkflowRuns(): AttachedWorkflowRun[] {
+    const runs: AttachedWorkflowRun[] = []
+    for (const [runId, target] of this.attachedWorkflowRuns) {
+      const run = readWorkflowRunIfAvailable(target.runDir || target.id)
+      if (!run) {
+        this.attachedWorkflowRuns.delete(runId)
+        this.attachedWorkflowMonitors.get(runId)?.dispose()
+        this.attachedWorkflowMonitors.delete(runId)
+        continue
+      }
+      const status = readWorkflowStatusIfAvailable(run.runDir)
+      if (isWorkingWorkflowStatus(status)) runs.push(run)
+    }
+    return runs
+  }
+
+  private async interruptAttachedWorkflowRuns(reason: string): Promise<void> {
+    const runs = this.attachedWorkingWorkflowRuns()
+    if (!runs.length) return
+    await Promise.all(runs.map(run => this.interruptAttachedWorkflowRun(run, reason)))
+  }
+
+  private async interruptAttachedWorkflowRun(run: AttachedWorkflowRun, reason: string): Promise<void> {
+    const target = run.runDir || run.id
+    try {
+      await this.withTimeout(
+        this.proc.workflowControl('interrupt', target, { reason }),
+        ATTACHED_WORKFLOW_INTERRUPT_TIMEOUT_MS,
+        `workflow interrupt ${run.id}`
+      )
+    } catch (error) {
+      console.error(
+        `[pi-acp] live workflow interrupt failed sessionId=${this.sessionId} runId=${run.id}: ${error instanceof Error ? error.message : String(error)}`
+      )
+      try {
+        interruptWorkflowRun(target, { reason })
+      } catch (fallbackError) {
+        console.error(
+          `[pi-acp] offline workflow interrupt failed sessionId=${this.sessionId} runId=${run.id}: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`
+        )
+      }
+    }
+    await this.waitForWorkflowNotWorking(target, ATTACHED_WORKFLOW_SETTLE_TIMEOUT_MS)
+  }
+
+  private async waitForWorkflowNotWorking(target: string, timeoutMs: number): Promise<void> {
+    const startedAt = Date.now()
+    while (Date.now() - startedAt < timeoutMs) {
+      const status = readWorkflowStatusIfAvailable(target)
+      if (!isWorkingWorkflowStatus(status)) return
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+  }
+
   private hasActiveWork(): boolean {
     return Boolean(
       this.pendingTurn ||
       this.workflowContinuationActive ||
       this.completingTurn ||
       this.drainingCancelledTurn ||
-      this.turnQueue.length
+      this.turnQueue.length ||
+      this.attachedWorkingWorkflowRuns().length
     )
   }
 
@@ -1016,6 +1080,7 @@ export class PiAcpSession {
     this.completingWorkflowMonitor = null
     for (const monitor of this.attachedWorkflowMonitors.values()) monitor.dispose()
     this.attachedWorkflowMonitors.clear()
+    this.attachedWorkflowRuns.clear()
     if (this.cancelDrainTimer) {
       clearTimeout(this.cancelDrainTimer)
       this.cancelDrainTimer = null
@@ -1716,6 +1781,18 @@ function readWorkflowRunIfAvailable(target: string): Pick<WorkflowRunRecord, 'id
   } catch {
     return null
   }
+}
+
+function readWorkflowStatusIfAvailable(target: string): WorkflowRunStatus | null {
+  try {
+    return readWorkflowRun(target).status
+  } catch {
+    return null
+  }
+}
+
+function isWorkingWorkflowStatus(status: WorkflowRunStatus | null): boolean {
+  return status === 'running' || status === 'recovering'
 }
 
 function mergeTextChunkUpdate(previous: SessionUpdate, next: SessionUpdate): boolean {

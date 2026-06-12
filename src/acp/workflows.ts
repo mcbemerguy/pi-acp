@@ -190,6 +190,7 @@ export function pauseWorkflowRun(target: string, options: WorkflowRunControlOpti
   }
   updateActiveSteps(run, 'paused', now, options.reason)
   writeWorkflowRun(run)
+  appendWorkflowControlEvent(run, 'run_paused', { reason: options.reason })
   return run
 }
 
@@ -206,6 +207,7 @@ export function interruptWorkflowRun(target: string, options: WorkflowRunControl
   }
   updateActiveSteps(run, 'interrupted', now, options.reason)
   writeWorkflowRun(run)
+  appendWorkflowControlEvent(run, 'run_interrupted', { reason: options.reason })
   return run
 }
 
@@ -224,6 +226,11 @@ export function resumeWorkflowRun(target: string, options: WorkflowRunControlOpt
   }
   updateActiveSteps(run, 'recovering', now, options.reason)
   writeWorkflowRun(run)
+  appendWorkflowControlEvent(run, 'run_resume_requested', {
+    reason: options.reason,
+    policy: options.policy ?? 'continue-existing-session',
+    hasContinuationMessage: Boolean(options.continuationMessage?.trim())
+  })
   return run
 }
 
@@ -279,6 +286,33 @@ function resolveWorkflowRunDir(target: string, root: string): string {
 
 function writeWorkflowRun(run: WorkflowRunRecord): void {
   writeFileSync(join(run.runDir, 'run.json'), `${JSON.stringify(run, null, 2)}\n`, 'utf8')
+}
+
+function appendWorkflowControlEvent(
+  run: WorkflowRunRecord,
+  type: 'run_interrupted' | 'run_paused' | 'run_resume_requested',
+  fields: Record<string, unknown> = {}
+): void {
+  const sequence = scanCompleteEventFileStats(join(run.runDir, 'events.jsonl')).maxSequence + 1
+  const record = withoutUndefined({
+    timestamp: new Date().toISOString(),
+    runId: run.id,
+    rootWorkflowId: stringField(run.rootWorkflowId) ?? stringField(run.workflowId),
+    workflowId: stringField(run.workflowId) ?? stringField(run.rootWorkflowId),
+    commandName: stringField(run.commandName),
+    cwd: run.cwd,
+    parentSessionId: stringField(run.parentSessionId),
+    parentSessionFile: stringField(run.parentSessionFile),
+    runDir: run.runDir,
+    auditPath: stringField(run.auditPath),
+    type,
+    status: run.status,
+    ...fields,
+    workflowEventVersion: WORKFLOW_EVENT_ENVELOPE_VERSION,
+    sequence,
+    eventId: `${run.id}:${sequence}`
+  })
+  writeFileSync(join(run.runDir, 'events.jsonl'), `${JSON.stringify(record)}\n`, { encoding: 'utf8', flag: 'a' })
 }
 
 function updateActiveSteps(run: WorkflowRunRecord, status: string, now: string, reason?: string): void {
