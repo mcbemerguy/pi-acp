@@ -113,6 +113,76 @@ test('PiAcpSession: close interrupts attached running workflow runs before dispo
   }
 })
 
+test('PiAcpSession: close interrupts attached running workflow runs while a prompt is pending', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-close-pending-workflow-'))
+  const runDir = join(root, 'workflow-runs', 'run-close-pending-workflow')
+  mkdirSync(runDir, { recursive: true })
+  const runJson = join(runDir, 'run.json')
+  writeFileSync(
+    runJson,
+    `${JSON.stringify({
+      id: 'run-close-pending-workflow',
+      cwd: '/tmp/project',
+      runDir,
+      status: 'running',
+      workflowId: 'smoke',
+      startedAt: '2026-02-11T00:00:00.000Z'
+    })}\n`,
+    'utf8'
+  )
+  writeFileSync(
+    join(runDir, 'events.jsonl'),
+    `${JSON.stringify({
+      timestamp: '2026-02-11T00:00:00.000Z',
+      runId: 'run-close-pending-workflow',
+      workflowId: 'smoke',
+      cwd: '/tmp/project',
+      runDir,
+      type: 'run_start',
+      status: 'running',
+      sequence: 1,
+      eventId: 'run-close-pending-workflow:1'
+    })}\n`,
+    'utf8'
+  )
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const originalWorkflowControl = proc.workflowControl.bind(proc)
+  proc.workflowControl = async (action, target, opts = {}) => {
+    const result = await originalWorkflowControl(action, target, opts)
+    const run = JSON.parse(readFileSync(runJson, 'utf8'))
+    run.status = 'interrupted'
+    writeFileSync(runJson, `${JSON.stringify(run)}\n`, 'utf8')
+    return { run: { id: 'run-close-pending-workflow', cwd: '/tmp/project', runDir, status: 'interrupted' }, result }
+  }
+  const session = new PiAcpSession({
+    sessionId: 'attached-workflow-close-pending',
+    cwd: '/tmp/project',
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    cancelDrainTimeoutMs: 5
+  })
+
+  try {
+    await session.attachWorkflowRun({ id: 'run-close-pending-workflow', runDir }, 0)
+    const prompt = session.prompt('work')
+    await wait()
+
+    await session.close()
+
+    assert.equal(await prompt, 'cancelled')
+    assert.equal(proc.workflowControls.length, 1)
+    assert.equal(proc.workflowControls[0]?.action, 'interrupt')
+    assert.equal(proc.workflowControls[0]?.target, runDir)
+    assert.equal(JSON.parse(readFileSync(runJson, 'utf8')).status, 'interrupted')
+    assert.equal(proc.abortCount, 1)
+    assert.equal(proc.disposeCount, 1)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('PiAcpSession: close terminates even when outbound session updates are blocked', async () => {
   const conn = new FakeAgentSideConnection()
   conn.sessionUpdateBlocker = new Promise(() => {})

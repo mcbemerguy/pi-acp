@@ -482,8 +482,9 @@ export class PiAcpSession {
       })
     }
 
+    await this.interruptAttachedWorkflowRuns('ACP session cancellation requested.')
+
     if (!this.pendingTurn) {
-      await this.interruptAttachedWorkflowRuns('ACP session cancellation requested.')
       try {
         await this.withTimeout(this.proc.abort(), this.cancelAbortTimeoutMs, 'pi abort')
         if (this.workflowContinuationActive) {
