@@ -4,6 +4,8 @@ import { stripAnsi } from '../shared/ansi.js'
 
 export const PI_EXTENSION_UI_EVENT_METHOD = '_pi/extension_ui_event'
 const ASK_QUESTION_METHOD = 'cursor/ask_question'
+const PI_OTHER_ANSWER_LABEL = 'Other (type your own answer)'
+const PI_OTHER_CUSTOM_ANSWER_LABEL = `${PI_OTHER_ANSWER_LABEL} [custom answer]`
 const SELECTION_QUESTION_ID = 'selection'
 const INPUT_QUESTION_ID = 'value'
 const CONFIRM_QUESTION_ID = 'confirmed'
@@ -174,7 +176,8 @@ async function handleSelect(
     return
   }
 
-  const options = request.options.map((label, index) => ({ id: String(index), label }))
+  const optionLabels = filterPiGeneratedCustomAnswerOption(request.options)
+  const options = optionLabels.map((label, index) => ({ id: String(index), label }))
   const response = await conn.extMethod(ASK_QUESTION_METHOD, {
     toolCallId: request.id,
     title: request.title,
@@ -359,6 +362,16 @@ function normalizeAnswerToString(value: unknown): string | null {
   if (typeof value === 'number' || typeof value === 'boolean') return String(value)
 
   return null
+}
+
+function filterPiGeneratedCustomAnswerOption(options: string[]): string[] {
+  const filtered = options.filter(label => !isPiGeneratedCustomAnswerOption(label))
+  return filtered.length > 0 ? filtered : options
+}
+
+function isPiGeneratedCustomAnswerOption(label: string): boolean {
+  const normalized = label.trim()
+  return normalized === PI_OTHER_ANSWER_LABEL || normalized === PI_OTHER_CUSTOM_ANSWER_LABEL
 }
 
 function toOptionLabels(options: unknown): string[] {

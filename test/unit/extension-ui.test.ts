@@ -81,6 +81,38 @@ test('PiAcpSession: maps select answer ids back to option labels and preserves c
   ])
 })
 
+test('PiAcpSession: hides Pi generated Other option so T3Code composer custom answers resolve select dialogs', async () => {
+  const { conn, proc } = makeSession()
+  conn.queueExtensionResponse({ answers: { selection: 'Dragonfruit' } })
+
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'ui-custom-answer',
+    method: 'select',
+    title: 'Choose',
+    options: ['Apple', 'Banana', 'Other (type your own answer)']
+  })
+
+  await flushAsyncHandlers()
+
+  assert.deepEqual(conn.extensionRequests[0]!.params, {
+    toolCallId: 'ui-custom-answer',
+    title: 'Choose',
+    questions: [
+      {
+        id: 'selection',
+        prompt: 'Choose',
+        options: [
+          { id: '0', label: 'Apple' },
+          { id: '1', label: 'Banana' }
+        ],
+        allowMultiple: false
+      }
+    ]
+  })
+  assert.deepEqual(proc.extensionUiResponses, [{ id: 'ui-custom-answer', payload: { value: 'Dragonfruit' } }])
+})
+
 test('PiAcpSession: translates input extension UI requests to cursor/ask_question and returns text', async () => {
   const { conn, proc } = makeSession()
   conn.queueExtensionResponse({ answers: { value: 'custom answer' } })
